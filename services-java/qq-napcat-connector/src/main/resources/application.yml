@@ -1,0 +1,18 @@
+server:
+  port: 8091
+
+spring:
+  application:
+    name: qq-napcat-connector
+
+connector:
+  event-center:
+    forward-enabled: true
+    base-url: http://127.0.0.1:8093
+    ingest-path: /internal/events/ingest
+
+napcat:
+  api:
+    enabled: true
+    base-url: http://127.0.0.1:3011
+    token: "hDjKztJ_7hgNV.T9"

@@ -1,0 +1,45 @@
+# 这个文件的作用是忽略本地开发、构建和运行时产生的临时文件，避免脏文件被提交到 GitHub。
+
+# JetBrains / IDEA
+.idea/
+*.iml
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+env/
+
+# Python packaging
+*.egg-info/
+build/
+dist/
+
+# Java / Maven
+target/
+*.class
+
+# Logs
+*.log
+logs/
+
+# Local environment
+.env
+.env.*
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Runtime temp files
+*.tmp
+*.temp

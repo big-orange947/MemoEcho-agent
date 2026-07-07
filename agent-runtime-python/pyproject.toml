@@ -1,0 +1,18 @@
+[project]
+name = "memo-echo-agent-runtime"
+version = "0.1.0"
+description = "Python agent runtime for Memo Echo Agent"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115.0",
+  "httpx>=0.28.0",
+  "uvicorn>=0.30.0",
+  "pydantic>=2.8.0"
+]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["app"]

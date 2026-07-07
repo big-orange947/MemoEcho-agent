@@ -1,0 +1,26 @@
+{
+  "eventId": "evt-002",
+  "platform": "qq",
+  "scene": "work",
+  "eventType": "message",
+  "chatType": "group",
+  "chatId": "work-group-001",
+  "sender": {
+    "id": "10001",
+    "name": "project-owner",
+    "role": "admin"
+  },
+  "text": "这是今天的活动通知和报名表，请整理成今天的工作计划。",
+  "attachments": [
+    {
+      "file_id": "file-001",
+      "file_name": "activity_notice.xlsx",
+      "file_type": "xlsx",
+      "url": "http://example.local/file-001"
+    }
+  ],
+  "mentions": [],
+  "timestamp": "2026-07-06T11:00:00+08:00",
+  "rawPayload": {}
+}
+

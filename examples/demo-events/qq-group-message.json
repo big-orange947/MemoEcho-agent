@@ -1,0 +1,19 @@
+{
+  "eventId": "evt-001",
+  "platform": "qq",
+  "scene": "life",
+  "eventType": "message",
+  "chatType": "group",
+  "chatId": "138178088",
+  "sender": {
+    "id": "2597164807",
+    "name": "freeze",
+    "role": "owner"
+  },
+  "text": "Today at 14:00 in A01-N105 there will be a study sharing session.",
+  "attachments": [],
+  "mentions": [],
+  "timestamp": "2026-07-06T10:00:00+08:00",
+  "rawPayload": {}
+}
+

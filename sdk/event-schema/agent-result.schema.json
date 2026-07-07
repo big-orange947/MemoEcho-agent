@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AgentResult",
+  "type": "object",
+  "required": [
+    "task_id",
+    "agent",
+    "status"
+  ],
+  "properties": {
+    "task_id": {
+      "type": "string"
+    },
+    "agent": {
+      "type": "string"
+    },
+    "status": {
+      "type": "string"
+    },
+    "structured_result": {
+      "type": "object"
+    },
+    "reply_draft": {
+      "type": "string"
+    },
+    "tool_calls": {
+      "type": "array"
+    },
+    "next_actions": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "need_confirmation": {
+      "type": "boolean"
+    }
+  }
+}
+

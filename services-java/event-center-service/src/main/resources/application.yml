@@ -1,0 +1,13 @@
+server:
+  port: 8093
+
+spring:
+  application:
+    name: event-center-service
+
+event-center:
+  dispatch:
+    agent-runtime:
+      enabled: true
+      base-url: http://127.0.0.1:8000
+      handle-path: /v1/events/handle

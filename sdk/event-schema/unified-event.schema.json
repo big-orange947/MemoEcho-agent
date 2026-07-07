@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "UnifiedEvent",
+  "type": "object",
+  "required": [
+    "eventId",
+    "platform",
+    "eventType",
+    "chatType",
+    "chatId",
+    "sender",
+    "timestamp"
+  ],
+  "properties": {
+    "eventId": {
+      "type": "string"
+    },
+    "platform": {
+      "type": "string"
+    },
+    "scene": {
+      "type": "string"
+    },
+    "eventType": {
+      "type": "string"
+    },
+    "chatType": {
+      "type": "string"
+    },
+    "chatId": {
+      "type": "string"
+    },
+    "sender": {
+      "type": "object",
+      "required": ["id", "name"],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "role": {
+          "type": "string"
+        }
+      }
+    },
+    "text": {
+      "type": "string"
+    },
+    "attachments": {
+      "type": "array"
+    },
+    "mentions": {
+      "type": "array"
+    },
+    "timestamp": {
+      "type": "string"
+    },
+    "rawPayload": {
+      "type": "object"
+    }
+  }
+}
+
