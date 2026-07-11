@@ -1,0 +1,17 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Memo Echo",
+  "version": "0.1.0",
+  "identifier": "com.memoecho.desktop",
+  "build": {
+    "beforeDevCommand": "npm run vite",
+    "devUrl": "http://127.0.0.1:5173",
+    "beforeBuildCommand": "npm run vite:build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [{ "title": "Memo Echo", "width": 1240, "height": 820, "minWidth": 980, "minHeight": 680 }],
+    "security": { "csp": null }
+  },
+  "bundle": { "active": true, "targets": "nsis" }
+}

@@ -1,0 +1,18 @@
+{
+  "id": "work.project_manager",
+  "name": "项目经理工作规划",
+  "version": "1.0.0",
+  "type": "policy",
+  "description": "适合任务规划与待办梳理，强调优先级、执行顺序和交付结果。",
+  "applicableRoutes": ["task_plan"],
+  "promptFragments": {
+    "system": "输出工作计划时优先说明先做什么、为什么先做、今天怎么切时间推进。"
+  },
+  "toolPolicy": {
+    "allow": ["create_task", "list_tasks"]
+  },
+  "modelHints": {
+    "temperature": 0.3,
+    "maxTokens": 1024
+  }
+}

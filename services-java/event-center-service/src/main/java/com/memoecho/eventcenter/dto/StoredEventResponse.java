@@ -8,6 +8,20 @@ public record StoredEventResponse(
         String chatId,
         String text,
         String timestamp,
-        String receivedAt
+        String receivedAt,
+        String processingStatus,
+        String processingSummary,
+        String resolvedRoute,
+        String writeBackStatus,
+        boolean needHumanConfirmation,
+        String processedAt,
+        String replyDraft,
+        ExecutionTraceResponse executionTrace,
+        String lastAction,
+        String lastActionNote,
+        String lastActionAt,
+        String inboxStatus,
+        String inboxUpdatedAt,
+        String snoozedUntil
 ) {
 }

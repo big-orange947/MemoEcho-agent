@@ -1,0 +1,17 @@
+package com.memoecho.eventcenter.dto;
+
+import com.fasterxml.jackson.annotation.JsonFormat;
+
+import java.time.LocalDateTime;
+
+public record WorkspaceScheduleDigestResponse(
+        String id,
+        String title,
+        @JsonFormat(pattern = "yyyy-MM-dd HH:mm:ss")
+        LocalDateTime startTime,
+        @JsonFormat(pattern = "yyyy-MM-dd HH:mm:ss")
+        LocalDateTime endTime,
+        String location,
+        String content
+) {
+}

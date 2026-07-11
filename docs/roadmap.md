@@ -1,29 +1,12 @@
-﻿# 开发路线图
+# 开发路线图
 
-## Phase 1
+项目路线图已经迁移到根目录，便于作为对外展示文档统一维护：
 
-- 定义 `UnifiedEvent`
-- 定义 `AgentResult`
-- 搭建 Python Orchestrator 骨架
-- 实现 Inbox、Schedule、Work 三个核心 Agent
-- 增加最小可用的 Java 服务契约
+- [ROADMAP.md](../ROADMAP.md)
 
-## Phase 2
+如果你正在阅读 `docs/` 目录下的技术文档，建议回到根目录查看最新路线图，再结合下面这些设计文档一起理解项目演进方向：
 
-- 增加 File Agent 和附件处理链路
-- 接入 NapCat 对应的 connector-service
-- 增加持久化写入 Tool
-- 增加结构化查询 Tool
-
-## Phase 3
-
-- 增加 Social Agent 和 GroupOps Agent
-- 增加用户偏好和执行策略
-- 接入 Qdrant 语义检索
-- 增强可观测性、追踪和调试能力
-
-## Phase 4
-
-- 增加更多连接器
-- 增加确认流和安全自动执行模式
-- 增加插件与扩展能力
+- [架构设计](./architecture.md)
+- [协议设计](./protocols.md)
+- [Connector 设计](./connectors.md)
+- [工作流说明](./workflows.md)

@@ -4,10 +4,35 @@ server:
 spring:
   application:
     name: event-center-service
+  datasource:
+    url: jdbc:h2:file:./data/event-center-db;MODE=MySQL;DB_CLOSE_DELAY=-1;AUTO_SERVER=TRUE
+    driver-class-name: org.h2.Driver
+    username: sa
+    password:
+  sql:
+    init:
+      mode: always
 
 event-center:
+  security:
+    api-key-secret: ${EVENT_CENTER_API_KEY_SECRET:memo-echo-dev-secret-change-me}
+    jwt-secret: ${EVENT_CENTER_JWT_SECRET:memo-echo-jwt-dev-secret-change-me}
+    jwt-expires-seconds: ${EVENT_CENTER_JWT_EXPIRES_SECONDS:604800}
+    allow-legacy-user-header: ${EVENT_CENTER_ALLOW_LEGACY_USER_HEADER:false}
+    runtime-token: ${EVENT_CENTER_RUNTIME_TOKEN:}
+    allowed-origins: ${EVENT_CENTER_ALLOWED_ORIGINS:http://127.0.0.1:5173,http://tauri.localhost,tauri://localhost}
   dispatch:
     agent-runtime:
       enabled: true
       base-url: http://127.0.0.1:8000
       handle-path: /v1/events/handle
+  conversation-profiles:
+    seed-defaults: true
+  skills:
+    builtin-root: ../../agent-runtime-python/skills
+    installed-root: ../../agent-runtime-python/skills-installed
+    github-default-ref: main
+  downstream:
+    task-service-base-url: http://127.0.0.1:8094
+    schedule-service-base-url: http://127.0.0.1:8092
+    qq-connector-base-url: http://127.0.0.1:8091

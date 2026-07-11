@@ -1,12 +1,22 @@
 package com.memoecho.eventcenter;
 
 import com.memoecho.eventcenter.config.AgentRuntimeDispatchProperties;
+import com.memoecho.eventcenter.config.ConversationProfileSeedProperties;
+import com.memoecho.eventcenter.config.DownstreamServiceProperties;
+import com.memoecho.eventcenter.config.EventCenterSecurityProperties;
+import com.memoecho.eventcenter.config.SkillStoreProperties;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 
 @SpringBootApplication
-@EnableConfigurationProperties(AgentRuntimeDispatchProperties.class)
+@EnableConfigurationProperties({
+        AgentRuntimeDispatchProperties.class,
+        ConversationProfileSeedProperties.class,
+        DownstreamServiceProperties.class,
+        EventCenterSecurityProperties.class,
+        SkillStoreProperties.class
+})
 public class EventCenterServiceApplication {
 
     public static void main(String[] args) {

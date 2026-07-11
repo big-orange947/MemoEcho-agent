@@ -51,4 +51,6 @@ examples/                示例事件与工作流样例
 - [协议设计](./docs/protocols.md)
 - [Connector 设计](./docs/connectors.md)
 - [工作流说明](./docs/workflows.md)
-- [开发路线图](./docs/roadmap.md)
+- [会话设定集](./docs/conversation-profiles.md)
+- [Skill 管理](./docs/skill-management.md)
+- [开发路线图](./ROADMAP.md)

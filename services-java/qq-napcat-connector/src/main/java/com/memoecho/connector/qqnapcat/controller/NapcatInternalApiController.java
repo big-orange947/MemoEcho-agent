@@ -7,6 +7,7 @@ import com.memoecho.connector.qqnapcat.dto.NapcatStatusData;
 import com.memoecho.connector.qqnapcat.dto.SendGroupMessageRequest;
 import com.memoecho.connector.qqnapcat.dto.SendPrivateMessageRequest;
 import com.memoecho.connector.qqnapcat.service.NapcatGroupService;
+import com.memoecho.connector.qqnapcat.service.NapcatContactService;
 import com.memoecho.connector.qqnapcat.service.NapcatMessageService;
 import com.memoecho.connector.qqnapcat.service.NapcatSystemService;
 import jakarta.validation.Valid;
@@ -26,15 +27,18 @@ public class NapcatInternalApiController {
     private final NapcatMessageService messageService;
     private final NapcatSystemService systemService;
     private final NapcatGroupService groupService;
+    private final NapcatContactService contactService;
 
     public NapcatInternalApiController(
             NapcatMessageService messageService,
             NapcatSystemService systemService,
-            NapcatGroupService groupService
+            NapcatGroupService groupService,
+            NapcatContactService contactService
     ) {
         this.messageService = messageService;
         this.systemService = systemService;
         this.groupService = groupService;
+        this.contactService = contactService;
     }
 
     @GetMapping("/login-info")
@@ -66,6 +70,14 @@ public class NapcatInternalApiController {
     @GetMapping("/groups")
     public ResponseEntity<NapcatApiResponse<JsonNode>> getGroupList() {
         return ResponseEntity.ok(groupService.getGroupList());
+    }
+
+    /**
+     * 返回机器人账号的好友列表，供桌面端在设定集中搜索私聊对象。
+     */
+    @GetMapping("/friends")
+    public ResponseEntity<NapcatApiResponse<JsonNode>> getFriendList() {
+        return ResponseEntity.ok(contactService.getFriendList());
     }
 
     @GetMapping("/groups/{groupId}/members")

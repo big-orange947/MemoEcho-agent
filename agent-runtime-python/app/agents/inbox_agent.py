@@ -24,10 +24,13 @@ class InboxAgent(BaseAgent):
         next_actions: list[str] = []
 
         try:
-            recent_messages = await self.tools.get("get_recent_messages").execute(**query)
+            recent_messages = await self._get_tool(task_context, "get_recent_messages").execute(**query)
         except KeyError:
             recent_messages = []
             next_actions.append("get_recent_messages tool is not registered")
+        except PermissionError:
+            recent_messages = []
+            next_actions.append("get_recent_messages tool is not allowed")
         except Exception as exc:
             recent_messages = []
             next_actions.append(f"retry_recent_message_query:{exc}")

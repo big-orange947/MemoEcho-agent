@@ -18,6 +18,13 @@ public record ConversationMessageResponse(
         boolean processed,
         boolean replied,
         String route,
-        String dispatchMode
+        String dispatchMode,
+        String processingStatus,
+        String processingSummary,
+        String writeBackStatus,
+        boolean needHumanConfirmation,
+        String replyDraft,
+        String inboxStatus,
+        String snoozedUntil
 ) {
 }

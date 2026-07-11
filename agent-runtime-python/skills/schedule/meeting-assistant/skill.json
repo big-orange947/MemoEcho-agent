@@ -1,0 +1,18 @@
+{
+  "id": "schedule.meeting_assistant",
+  "name": "会议助理日程整理",
+  "version": "1.0.0",
+  "type": "prompt",
+  "description": "适合会议、活动、通知类日程整理，强调时间地点和关键信息确认。",
+  "applicableRoutes": ["schedule_extract"],
+  "promptFragments": {
+    "system": "整理日程时优先确认时间、地点、参与对象和是否已经落库，回复尽量利落明确。"
+  },
+  "toolPolicy": {
+    "allow": ["create_schedule"]
+  },
+  "modelHints": {
+    "temperature": 0.2,
+    "maxTokens": 768
+  }
+}

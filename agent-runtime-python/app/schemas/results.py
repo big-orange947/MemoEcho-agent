@@ -21,6 +21,23 @@ class AgentResult(BaseModel):
     need_confirmation: bool = False
 
 
+class NotificationDecision(BaseModel):
+    """
+    通知决策是 Agent 交给事件中心和工作台的稳定契约。
+
+    它只描述消息应如何展示和归并，不携带模型提示词、工具参数或用户密钥。
+    """
+
+    channel: str
+    priority: str
+    trigger_reason: str
+    notify_now: bool
+    aggregation_key: str
+    aggregation_status: str
+    buffered_count: int = 0
+    summary_candidate: str = ""
+
+
 class OrchestratorResult(BaseModel):
     execution_id: str
     status: str
@@ -29,4 +46,4 @@ class OrchestratorResult(BaseModel):
     results: list[AgentResult]
     final_reply: str
     write_back_actions: list[str] = []
-
+    notification: NotificationDecision | None = None

@@ -1,0 +1,17 @@
+[package]
+name = "memo-echo-desktop"
+version = "0.1.0"
+description = "Memo Echo desktop client"
+authors = ["Memo Echo Contributors"]
+edition = "2021"
+
+[lib]
+name = "memo_echo_desktop_lib"
+crate-type = ["cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+keyring = "3"
+tauri = { version = "2", features = [] }

@@ -1,0 +1,30 @@
+{
+  "name": "memo-echo-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Memo Echo desktop client",
+  "scripts": {
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "check": "tsc --noEmit",
+    "vite": "vite --host 127.0.0.1",
+    "vite:build": "vite build"
+  },
+  "dependencies": {
+    "@fontsource-variable/manrope": "^5.2.8",
+    "@fontsource/dm-mono": "^5.2.7",
+    "@phosphor-icons/react": "^2.1.10",
+    "@tauri-apps/api": "^2.0.0",
+    "@vitejs/plugin-react": "latest",
+    "react": "latest",
+    "react-dom": "latest",
+    "vite": "latest"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0",
+    "@types/node": "latest",
+    "@types/react": "latest",
+    "@types/react-dom": "latest",
+    "typescript": "latest"
+  }
+}

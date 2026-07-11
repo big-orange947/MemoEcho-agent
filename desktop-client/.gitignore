@@ -1,0 +1,7 @@
+# Node 依赖和 Vite 构建产物由 npm 重新生成。
+node_modules/
+dist/
+
+# Rust/Tauri 编译缓存和安装包由 cargo/tauri 重新生成。
+src-tauri/target/
+src-tauri/gen/

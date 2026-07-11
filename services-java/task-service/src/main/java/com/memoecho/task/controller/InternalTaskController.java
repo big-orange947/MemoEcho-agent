@@ -4,6 +4,7 @@ import com.memoecho.task.dto.CreateTaskRequest;
 import com.memoecho.task.dto.TaskItemResponse;
 import com.memoecho.task.service.TaskApplicationService;
 import jakarta.validation.Valid;
+import org.springframework.format.annotation.DateTimeFormat;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
@@ -11,6 +12,7 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.time.LocalDateTime;
 import java.util.List;
 
 @RestController
@@ -20,12 +22,13 @@ public class InternalTaskController {
     private final TaskApplicationService taskApplicationService;
 
     public InternalTaskController(TaskApplicationService taskApplicationService) {
+        // 这个构造函数的作用是注入任务应用服务，避免 Controller 直接持有仓储实现。
         this.taskApplicationService = taskApplicationService;
     }
 
     @PostMapping
     public TaskItemResponse createTask(@Valid @RequestBody CreateTaskRequest request) {
-        // Controller 只做参数接收和校验，业务规则继续放在 service 里。
+        // 这个函数的作用是接收任务创建请求，并把业务处理交给应用服务层。
         return taskApplicationService.create(request);
     }
 
@@ -34,10 +37,26 @@ public class InternalTaskController {
             @RequestParam(required = false) String chatId,
             @RequestParam(required = false) String senderId,
             @RequestParam(required = false) String sourceEventId,
-            @RequestParam(required = false) String status
+            @RequestParam(required = false) String status,
+            @RequestParam(required = false) String priority,
+            @RequestParam(required = false) Boolean todayOnly,
+            @RequestParam(required = false) Boolean onlyPending,
+            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE_TIME) LocalDateTime dueFrom,
+            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE_TIME) LocalDateTime dueTo,
+            @RequestParam(required = false) Integer limit
     ) {
-        // 这里目前只做筛选，不急着做分页和排序，
-        // 后面扩展时也不会影响创建接口契约。
-        return taskApplicationService.list(chatId, senderId, sourceEventId, status);
+        // 这个函数的作用是暴露任务查询入口，支持 todayOnly、onlyPending、优先级和时间范围筛选。
+        return taskApplicationService.list(
+                chatId,
+                senderId,
+                sourceEventId,
+                status,
+                priority,
+                Boolean.TRUE.equals(todayOnly),
+                Boolean.TRUE.equals(onlyPending),
+                dueFrom,
+                dueTo,
+                limit
+        );
     }
 }

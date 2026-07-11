@@ -54,6 +54,9 @@ class InternalConversationControllerTest {
                         "2026-07-07T07:43:00Z",
                         "schedule_extract",
                         "urgent",
+                        "NEEDS_CONFIRMATION",
+                        "CONFIRM_REQUIRED",
+                        true,
                         0,
                         1,
                         true,
@@ -96,7 +99,14 @@ class InternalConversationControllerTest {
                         false,
                         false,
                         "schedule_extract",
-                        "urgent"
+                        "urgent",
+                        "NEEDS_CONFIRMATION",
+                        "日程已经提取，等待用户确认。",
+                        "CONFIRM_REQUIRED",
+                        true,
+                        "你好，会议日程已经为你整理好了。",
+                        "NEW",
+                        null
                 )));
 
         mockMvc.perform(get("/internal/conversations/1098307542/messages")
@@ -107,7 +117,11 @@ class InternalConversationControllerTest {
                 .andExpect(jsonPath("$[0].eventId").value("qq:message:group:1"))
                 .andExpect(jsonPath("$[0].senderName").value("freeze"))
                 .andExpect(jsonPath("$[0].route").value("schedule_extract"))
-                .andExpect(jsonPath("$[0].dispatchMode").value("urgent"));
+                .andExpect(jsonPath("$[0].dispatchMode").value("urgent"))
+                .andExpect(jsonPath("$[0].processingStatus").value("NEEDS_CONFIRMATION"))
+                .andExpect(jsonPath("$[0].needHumanConfirmation").value(true))
+                .andExpect(jsonPath("$[0].replyDraft").value("你好，会议日程已经为你整理好了。"))
+                .andExpect(jsonPath("$[0].inboxStatus").value("NEW"));
 
         verify(applicationService).findConversationMessages("1098307542", "qq", "group", 20);
     }
