@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <!--
+        这个 POM 只负责聚合四个独立服务。
+        之前直接打开 services-java 目录时，IDEA 会创建一个普通 Java 模块，
+        使 event-center-service 的 dto、model 等同级源码包无法被正确识别。
+    -->
+    <groupId>com.memoecho</groupId>
+    <artifactId>memo-echo-services</artifactId>
+    <version>0.1.0-SNAPSHOT</version>
+    <packaging>pom</packaging>
+
+    <name>memo-echo-services</name>
+    <description>Memo Echo Java service aggregator</description>
+
+    <modules>
+        <module>event-center-service</module>
+        <module>qq-napcat-connector</module>
+        <module>schedule-service</module>
+        <module>task-service</module>
+    </modules>
+</project>

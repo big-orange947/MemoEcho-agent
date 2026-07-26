@@ -1,9 +1,11 @@
 from app.agents.file_agent import FileAgent
+from app.agents.context_review_agent import ContextReviewAgent
 from app.agents.groupops_agent import GroupOpsAgent
 from app.agents.inbox_agent import InboxAgent
 from app.agents.inbox_dispatch_agent import InboxDispatchAgent
 from app.agents.schedule_agent import ScheduleAgent
 from app.agents.social_agent import SocialAgent
+from app.agents.review_agent import ReviewAgent
 from app.agents.work_agent import WorkAgent
 from app.clients.llm_service import LlmServiceClient
 from app.services.slow_channel_buffer import SlowChannelBuffer
@@ -23,5 +25,7 @@ def build_agent_registry(
         "work": WorkAgent(tools, llm_client=llm_client),
         "file": FileAgent(tools),
         "social": SocialAgent(tools, llm_client=llm_client),
+        "context_review": ContextReviewAgent(tools, llm_client=llm_client),
+        "review": ReviewAgent(tools, llm_client=llm_client),
         "groupops": GroupOpsAgent(tools),
     }

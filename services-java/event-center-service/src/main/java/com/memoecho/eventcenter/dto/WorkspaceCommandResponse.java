@@ -13,6 +13,7 @@ public record WorkspaceCommandResponse(
         String finalReply,
         boolean needConfirmation,
         List<WorkspaceCommandAgentResponse> results,
+        DelegatedTaskResponse delegatedTask,
         String error
 ) {
 }

@@ -16,7 +16,7 @@ class ExtractFileTextToolTest(unittest.IsolatedAsyncioTestCase):
             file_path = Path(temp_dir) / "notice.txt"
             file_path.write_text("今天下午14:00开会，请准备项目演示。", encoding="utf-8")
 
-            result = await tool.execute(
+            result = await tool.extract(
                 attachments=[
                     {
                         "file_name": "notice.txt",
@@ -36,7 +36,7 @@ class ExtractFileTextToolTest(unittest.IsolatedAsyncioTestCase):
             file_path = Path(temp_dir) / "tasks.csv"
             file_path.write_text("任务,截止时间\n项目报告,2026-07-10 18:00\n", encoding="utf-8")
 
-            result = await tool.execute(
+            result = await tool.extract(
                 attachments=[
                     {
                         "file_name": "tasks.csv",
@@ -59,7 +59,7 @@ class ExtractFileTextToolTest(unittest.IsolatedAsyncioTestCase):
                 ["项目周报", "请在2026-07-10 18:00前提交最终版。"],
             )
 
-            result = await tool.execute(
+            result = await tool.extract(
                 attachments=[
                     {
                         "file_name": "notice.docx",
@@ -85,7 +85,7 @@ class ExtractFileTextToolTest(unittest.IsolatedAsyncioTestCase):
                 ],
             )
 
-            result = await tool.execute(
+            result = await tool.extract(
                 attachments=[
                     {
                         "file_name": "plan.xlsx",

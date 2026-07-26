@@ -1,0 +1,14 @@
+spring:
+  datasource:
+    url: jdbc:h2:mem:event-center-test;MODE=MySQL;DB_CLOSE_DELAY=-1;DATABASE_TO_LOWER=TRUE
+    driver-class-name: org.h2.Driver
+    username: sa
+    password:
+  sql:
+    init:
+      mode: always
+      schema-locations: classpath:schema.sql
+      encoding: UTF-8
+  flyway:
+    # 单元测试继续使用 H2 专用脚本，不执行 MySQL 方言迁移。
+    enabled: false

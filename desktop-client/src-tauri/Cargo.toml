@@ -14,4 +14,10 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 keyring = "3"
+# 使用 Windows 系统根证书，兼容校园网、企业代理和本机证书链；下载结果仍会做 SHA-256 校验。
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls-native-roots"] }
+rfd = "0.15"
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
 tauri = { version = "2", features = [] }
+zip = { version = "2", default-features = false, features = ["deflate"] }

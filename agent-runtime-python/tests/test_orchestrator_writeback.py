@@ -1,15 +1,20 @@
 from __future__ import annotations
 
 import unittest
+from types import SimpleNamespace
 
 from app.memory.manager import MemoryManager
 from app.orchestrator.service import OrchestratorService
 from app.planner.service import PlannerService
 from app.router.service import RouterService
 from app.schemas.events import Sender, UnifiedEvent
+from app.schemas.delegated_tasks import DelegatedTaskActionDecision
+from app.schemas.model_profiles import ResolvedUserModelProfile, UserModelProfileResolveResult
 from app.schemas.profiles import ConversationProfile, ConversationProfileMatchResult
+from app.schemas.results import AgentResult
 from app.services.slow_channel_buffer import SlowChannelBuffer
 from app.tools.registry import ToolRegistry
+from tool_test_utils import register_test_tool
 
 
 class DummySendQqMessageTool:
@@ -76,9 +81,21 @@ class DummyListTasksTool:
 class DummyEventCenterServiceClient:
     def __init__(self, match_result: ConversationProfileMatchResult | None = None) -> None:
         # 这个构造函数的作用是预置设定集匹配结果，便于测试不同自动回复策略。
-        self.match_result = match_result
+        self.match_result = match_result or ConversationProfileMatchResult(
+            matched=True,
+            active=True,
+            reason="测试默认允许自动回复",
+            profile=ConversationProfile(
+                id="test-auto-profile",
+                name="测试自动回复设定",
+                replyMode="AUTO_REPLY",
+                requireHumanConfirmation=False,
+            ),
+        )
         self.calls: list[dict] = []
         self.model_calls: list[dict] = []
+        self.active_delegated_task: dict | None = None
+        self.delegated_runtime_updates: list[dict] = []
 
     async def match_conversation_profile(self, event: UnifiedEvent, route: str) -> ConversationProfileMatchResult | None:
         # 这个函数的作用是模拟设定集匹配接口，并记录参与匹配的消息和预判 route。
@@ -89,6 +106,146 @@ class DummyEventCenterServiceClient:
         # 这个函数的作用是模拟模型配置解析接口；当前这组编排测试不关心模型细节，直接返回未命中。
         self.model_calls.append({"route": route, "userId": user_id, "profileId": profile_id})
         return None
+
+    async def get_active_delegated_task(self, event: UnifiedEvent) -> dict | None:
+        """模拟从 Java 持久层恢复当前会话唯一的活动委托任务。"""
+        return self.active_delegated_task
+
+    async def list_conversation_messages(self, chat_id: str, **kwargs) -> list[dict]:
+        """返回空的可信历史时间线，让测试聚焦任务恢复和状态回写。"""
+        return []
+
+    async def update_delegated_task_runtime(
+        self,
+        event: UnifiedEvent,
+        task_id: str,
+        **runtime_state,
+    ) -> dict:
+        """记录 LangGraph 状态回写，验证 Python 进程重启后进度仍可恢复。"""
+        update = {
+            "taskId": task_id,
+            "eventId": event.event_id,
+            "status": runtime_state.get("status"),
+            "progressSummary": runtime_state.get("progress_summary"),
+            "stateJson": runtime_state.get("state_json"),
+        }
+        self.delegated_runtime_updates.append(update)
+        return update
+
+
+class DummyDelegatedTaskRuntimeTool:
+    def __init__(self, event_center_client: DummyEventCenterServiceClient, status: str) -> None:
+        # 这个构造函数的作用是把委托任务状态工具绑定到测试用 event-center 客户端。
+        self.event_center_client = event_center_client
+        self.status = status
+        self.calls: list[dict] = []
+
+    async def execute(self, **kwargs):
+        # 这个函数的作用是模拟 LangChain 工具写回委托任务运行态。
+        self.calls.append(kwargs)
+        event = UnifiedEvent.model_validate(kwargs["event"])
+        return await self.event_center_client.update_delegated_task_runtime(
+            event,
+            kwargs["task_id"],
+            status=self.status,
+            progress_summary=kwargs.get("progress_summary", ""),
+            state_json=kwargs.get("state_json", "{}"),
+            last_event_id=kwargs.get("last_event_id", event.event_id),
+            completion_report=kwargs.get("completion_report", ""),
+        )
+
+
+def register_delegated_runtime_tools(
+    tools: ToolRegistry,
+    event_center_client: DummyEventCenterServiceClient,
+) -> None:
+    # 这个函数的作用是统一注册测试用委托任务状态工具，避免测试绕过 ToolRegistry。
+    register_test_tool(
+        tools,
+        "update_delegated_task",
+        DummyDelegatedTaskRuntimeTool(event_center_client, "ACTIVE"),
+    )
+    register_test_tool(
+        tools,
+        "complete_delegated_task",
+        DummyDelegatedTaskRuntimeTool(event_center_client, "COMPLETED"),
+    )
+
+
+class DummyVisionModelEventCenterClient(DummyEventCenterServiceClient):
+    """返回按 route 区分的模型配置，用于验证回复模型和视觉模型不会混用。"""
+
+    async def resolve_user_model_profile(self, route: str, user_id: str | None = None, profile_id: str | None = None):
+        """模拟 Event Center 的真实模型解析返回结构，并保留调用参数供断言。"""
+        self.model_calls.append({"route": route, "userId": user_id, "profileId": profile_id})
+        return UserModelProfileResolveResult(
+            matched=True,
+            profile=ResolvedUserModelProfile(
+                id=f"{route}-model",
+                userId="freeze",
+                name=route,
+                apiKey="key",
+                model=f"{route}-model",
+                supportedRoutes=[route] if route == "vision_analysis" else [],
+            ),
+        )
+
+
+class DummyConversationVisionPreferredEventCenterClient(DummyEventCenterServiceClient):
+    """模拟会话绑定 Qwen3-VL、但视觉 route 错误命中全局 DeepSeek 的真实配置。"""
+
+    def __init__(self) -> None:
+        # 这个构造函数的作用是让设定集显式绑定 Qwen，复现用户当前数据库里的模型优先级。
+        super().__init__(ConversationProfileMatchResult(
+            matched=True,
+            active=True,
+            reason="命中图片私聊设定",
+            profile=ConversationProfile(
+                id="qwen-private-profile",
+                name="Qwen 图片私聊",
+                replyMode="AUTO_REPLY",
+                modelProfileId="qwen-conversation-model",
+            ),
+        ))
+
+    async def resolve_user_model_profile(self, route: str, user_id: str | None = None, profile_id: str | None = None):
+        """分别返回会话 Qwen 和未声明视觉 route 的默认 DeepSeek，供优先级测试使用。"""
+        self.model_calls.append({"route": route, "userId": user_id, "profileId": profile_id})
+        if route == "social_reply":
+            return UserModelProfileResolveResult(
+                matched=True,
+                profile=ResolvedUserModelProfile(
+                    id="qwen-conversation-model",
+                    userId="freeze",
+                    name="Qwen3-VL Flash",
+                    apiKey="key",
+                    model="qwen3-vl-flash",
+                ),
+            )
+        return UserModelProfileResolveResult(
+            matched=True,
+            profile=ResolvedUserModelProfile(
+                id="deepseek-default-model",
+                userId="freeze",
+                name="DeepSeek Chat",
+                apiKey="key",
+                model="deepseek-v4-pro",
+                supportedRoutes=[],
+                isDefault=True,
+            ),
+        )
+
+
+class CaptureMediaAnalysisService:
+    """记录主链路传入的模型配置，避免真实调用视觉模型。"""
+
+    def __init__(self) -> None:
+        self.model_profile = None
+
+    async def analyze_event(self, event, model_profile=None):
+        """保存已解包的模型配置，并返回一个已识别图片结果。"""
+        self.model_profile = model_profile
+        return [{"status": "VISION_ANALYZED", "summary": "图片内容已识别", "extractedText": "会议通知"}]
 
 
 class DummySleeper:
@@ -101,7 +258,296 @@ class DummySleeper:
         self.calls.append(seconds)
 
 
+class SupersedingSleeper:
+    """在旧消息的防抖窗口内模拟收到同一任务的新入站消息。"""
+
+    def __init__(self, service: OrchestratorService, task_id: str, latest_event_id: str) -> None:
+        # 这个构造函数的作用是保存需要覆盖的任务版本，模拟真实并发入站事件。
+        self.service = service
+        self.task_id = task_id
+        self.latest_event_id = latest_event_id
+
+    async def __call__(self, seconds: int) -> None:
+        # 这个函数的作用是在旧事件等待发送前推进版本号，使旧轮推理失效。
+        self.service._delegated_inbound_versions[self.task_id] = (
+            self.service._delegated_inbound_versions.get(self.task_id, 0) + 1
+        )
+        self.service._delegated_inbound_latest_event_ids[self.task_id] = self.latest_event_id
+
+
+class DummyApprovedSocialLlm:
+    """同时模拟社交回复模型和强制审批模型，审批步骤明确返回 APPROVE。"""
+
+    def is_enabled(self, model_profile=None):
+        return True
+
+    async def generate_reply(self, system_prompt, user_message, temperature=0.7, model_profile=None):
+        if "ContextReviewAgent" in system_prompt:
+            return (
+                '{"decision":"APPROVE","reason":"候选回复有上下文依据","checks":{'
+                '"contextCoherent":true,"personaAligned":true,"speakerConsistent":true,'
+                '"worldKnowledgeConsistent":true,"naturalConversation":true,'
+                '"answersLatestMessage":true,"currentStateGrounded":true},'
+                '"unsupportedPersonalClaims":[],"entityConflicts":[]}'
+            )
+        if "审批" in system_prompt:
+            return '{"decision":"APPROVE","reason":"候选回复有上下文依据"}'
+        return "可以"
+
+
 class OrchestratorWriteBackTest(unittest.IsolatedAsyncioTestCase):
+    async def test_should_supersede_old_delegated_inbound_when_new_message_arrives(self) -> None:
+        """同一会话连续来信时，旧消息在发送前必须让位给最新消息。"""
+        service = OrchestratorService(
+            router=RouterService(),
+            planner=PlannerService(),
+            tools=ToolRegistry(),
+            memory=MemoryManager(),
+            slow_channel_buffer=SlowChannelBuffer(window_seconds=600, max_messages=10),
+            event_center_client=DummyEventCenterServiceClient(),
+        )
+        task = {"id": "delegated-task-burst"}
+        old_event = UnifiedEvent(
+            eventId="qq:message:private:burst-old",
+            platform="qq",
+            scene="social",
+            eventType="message",
+            chatType="private",
+            chatId="3807050597",
+            sender=Sender(id="3807050597", name="friend", role=None),
+            text="第一条",
+            attachments=[],
+            mentions=[],
+            timestamp="2026-07-24T10:00:00+08:00",
+            rawPayload={"messageOrigin": "EXTERNAL"},
+        )
+        service.sleeper = SupersedingSleeper(
+            service,
+            task["id"],
+            "qq:message:private:burst-new",
+        )
+
+        should_continue = await service._wait_for_latest_delegated_inbound(old_event, task)
+
+        self.assertFalse(should_continue)
+        self.assertFalse(service._is_latest_delegated_inbound(old_event, task))
+    async def test_delegated_task_start_should_proactively_send_once(self) -> None:
+        """主控台创建委托后应立即调用 QQ 发送工具，持久化开场状态后不得因重试重复发送。"""
+        event_center_client = DummyEventCenterServiceClient()
+        event_center_client.active_delegated_task = {
+            "id": "delegated-task-kickoff",
+            "status": "ACTIVE",
+            "platform": "qq",
+            "chatType": "private",
+            "chatId": "3807050597",
+            "targetName": "km",
+            "originalCommand": "帮我和 km 预约明天晚上的课程",
+            "objective": "预约明天晚上的家教课程",
+            "successCriteria": "对方明确确认或拒绝课程时间",
+            "deadlineText": "明天晚上",
+            "progressSummary": "任务已创建，准备联系对方",
+            "stateJson": "{}",
+        }
+        tools = ToolRegistry()
+        send_tool = DummySendQqMessageTool()
+        register_test_tool(tools, "send_qq_message", send_tool)
+        register_delegated_runtime_tools(tools, event_center_client)
+        service = OrchestratorService(
+            router=RouterService(),
+            planner=PlannerService(),
+            tools=tools,
+            memory=MemoryManager(),
+            slow_channel_buffer=SlowChannelBuffer(window_seconds=600, max_messages=10),
+            event_center_client=event_center_client,
+            llm_client=DummyApprovedSocialLlm(),
+            sleeper=DummySleeper(),
+        )
+
+        first_event = UnifiedEvent(
+            eventId="delegated:start:kickoff-1",
+            platform="qq",
+            scene="social",
+            eventType="delegated_task_started",
+            chatType="private",
+            chatId="3807050597",
+            sender=Sender(id="system", name="Memo Echo", role="system"),
+            text="",
+            attachments=[],
+            mentions=[],
+            timestamp="2026-07-22T10:00:00+08:00",
+            direction="INTERNAL",
+            actorType="SYSTEM",
+            rawPayload={"userId": "freeze", "messageOrigin": "INTERNAL", "controlEvent": True},
+        )
+
+        first_result = await service.handle_event(first_event)
+
+        self.assertEqual("social_reply", first_result.route)
+        self.assertEqual(1, len(send_tool.calls))
+        self.assertTrue(any(action.startswith("qq_write_back_sent:") for action in first_result.write_back_actions))
+        self.assertEqual(1, len(event_center_client.delegated_runtime_updates))
+        persisted_state = event_center_client.delegated_runtime_updates[0]["stateJson"]
+        # 首发结果统一由运行时写回状态记录，避免维护独立的 kickoff 状态分支。
+        self.assertIn('"lastWriteBackStatus": "SENT"', persisted_state)
+
+        # 模拟 Java 已保存上轮状态后重新投递启动事件；动作图只能返回 WAIT。
+        event_center_client.active_delegated_task["stateJson"] = persisted_state
+        retry_event = first_event.model_copy(
+            update={"event_id": "delegated:start:kickoff-2"}
+        )
+        retry_result = await service.handle_event(retry_event)
+
+        self.assertEqual(1, len(send_tool.calls))
+        self.assertIn("delegated_task_action:wait", retry_result.write_back_actions)
+
+    async def test_should_restore_active_delegated_task_and_persist_runtime_progress(self) -> None:
+        """活动委托必须覆盖普通路由，并兼容缺少 direction 的真实 NapCat 入站事件。"""
+        event_center_client = DummyEventCenterServiceClient()
+        event_center_client.active_delegated_task = {
+            "id": "delegated-task-001",
+            "status": "ACTIVE",
+            "platform": "qq",
+            "chatType": "private",
+            "chatId": "3807050597",
+            "targetName": "km",
+            "originalCommand": "帮我问 km 明天下午是否有空",
+            "objective": "确认 km 明天下午是否有空",
+            "successCriteria": "对方明确接受、拒绝或提出其他时间",
+            "deadlineText": "明天下午",
+            "progressSummary": "已发起询问，等待对方回复",
+            "stateJson": '{"knownFacts":[],"pendingConditions":["等待对方回复"]}',
+        }
+        tools = ToolRegistry()
+        send_tool = DummySendQqMessageTool()
+        register_test_tool(tools, "send_qq_message", send_tool)
+        register_delegated_runtime_tools(tools, event_center_client)
+        service = OrchestratorService(
+            router=RouterService(),
+            planner=PlannerService(),
+            tools=tools,
+            memory=MemoryManager(),
+            slow_channel_buffer=SlowChannelBuffer(window_seconds=600, max_messages=10),
+            event_center_client=event_center_client,
+            llm_client=DummyApprovedSocialLlm(),
+            sleeper=DummySleeper(),
+        )
+        event = UnifiedEvent(
+            eventId="qq:message:private:delegated-001",
+            platform="qq",
+            scene="social",
+            eventType="message",
+            chatType="private",
+            chatId="3807050597",
+            sender=Sender(id="3807050597", name="km", role=None),
+            text="下午行吗",
+            attachments=[],
+            mentions=[],
+            timestamp="2026-07-22T14:00:00+08:00",
+            # 线上事件目前只稳定保留 EXTERNAL 来源，direction 和 actorType 可能均缺失。
+            rawPayload={"userId": "freeze", "messageOrigin": "EXTERNAL"},
+        )
+
+        result = await service.handle_event(event)
+
+        self.assertEqual("social_reply", result.route)
+        self.assertEqual("delegated-task-001", result.execution_id)
+        self.assertEqual(1, len(send_tool.calls))
+        self.assertEqual(1, len(event_center_client.delegated_runtime_updates))
+        self.assertEqual("delegated-task-001", event_center_client.delegated_runtime_updates[0]["taskId"])
+        self.assertTrue(
+            any(action.startswith("delegated_task_runtime_updated:") for action in result.write_back_actions)
+        )
+
+    def test_should_collect_unique_verified_memory_ids_for_audit(self) -> None:
+        """验证执行结果只暴露本轮注入的非空记忆 ID，并保持首次出现顺序。"""
+        memories = [
+            SimpleNamespace(id="memory-001"),
+            SimpleNamespace(id=" memory-002 "),
+            SimpleNamespace(id="memory-001"),
+            SimpleNamespace(id=""),
+        ]
+
+        memory_ids = OrchestratorService._collect_verified_memory_ids(memories)
+
+        self.assertEqual(["memory-001", "memory-002"], memory_ids)
+
+    async def test_should_use_dedicated_vision_route_before_image_analysis(self) -> None:
+        """验证图片链路优先使用视觉 route，且附件服务只拿到已解包的内部模型配置。"""
+        media_service = CaptureMediaAnalysisService()
+        service = OrchestratorService(
+            router=RouterService(),
+            planner=PlannerService(),
+            tools=ToolRegistry(),
+            memory=MemoryManager(),
+            slow_channel_buffer=SlowChannelBuffer(window_seconds=600, max_messages=10),
+            event_center_client=DummyVisionModelEventCenterClient(),
+            media_analysis_service=media_service,
+        )
+        event = UnifiedEvent(
+            eventId="qq:message:private:image-model-001",
+            platform="qq",
+            scene="social",
+            eventType="message",
+            chatType="private",
+            chatId="10001",
+            sender=Sender(id="10001", name="friend", role=None),
+            text="[图片]",
+            attachments=[{"fileId": "image-1", "fileName": "notice.png", "fileType": "image"}],
+            mentions=[],
+            timestamp="2026-07-13T10:00:00+08:00",
+            rawPayload={},
+        )
+
+        result = await service.handle_event(event)
+
+        self.assertEqual("social_reply", result.route)
+        self.assertIsInstance(media_service.model_profile, ResolvedUserModelProfile)
+        self.assertEqual("vision_analysis-model", media_service.model_profile.model)
+        self.assertEqual("social_reply", service.event_center_client.model_calls[0]["route"])
+        self.assertEqual("vision_analysis", service.event_center_client.model_calls[1]["route"])
+        self.assertIsNone(service.event_center_client.model_calls[1]["profileId"])
+
+    async def test_should_keep_conversation_qwen_when_default_model_does_not_declare_vision_route(self) -> None:
+        """全局默认文本模型不能覆盖设定集显式选择的 Qwen3-VL，否则图片会被错误发给 DeepSeek。"""
+        media_service = CaptureMediaAnalysisService()
+        service = OrchestratorService(
+            router=RouterService(),
+            planner=PlannerService(),
+            tools=ToolRegistry(),
+            memory=MemoryManager(),
+            slow_channel_buffer=SlowChannelBuffer(window_seconds=600, max_messages=10),
+            event_center_client=DummyConversationVisionPreferredEventCenterClient(),
+            media_analysis_service=media_service,
+        )
+        event = UnifiedEvent(
+            eventId="qq:message:private:image-model-conversation",
+            platform="qq",
+            scene="social",
+            eventType="message",
+            chatType="private",
+            chatId="10001",
+            sender=Sender(id="10001", name="friend", role=None),
+            text="[图片]",
+            attachments=[{"fileId": "image-1", "fileName": "notice.png", "fileType": "image"}],
+            mentions=[],
+            timestamp="2026-07-13T16:35:00+08:00",
+            rawPayload={},
+        )
+
+        await service.handle_event(event)
+
+        self.assertIsNotNone(media_service.model_profile)
+        self.assertEqual("qwen3-vl-flash", media_service.model_profile.model)
+        self.assertNotEqual("deepseek-v4-pro", media_service.model_profile.model)
+
+    async def test_should_fail_closed_when_profile_is_unavailable(self) -> None:
+        # 这个测试函数的作用是验证设定查询失败时绝不自动发送，避免认证故障绕过 DRAFT_ONLY。
+        self.assertFalse(OrchestratorService._should_auto_write_back(None))
+        self.assertEqual(
+            ["qq_write_back_skipped:profile_unavailable"],
+            OrchestratorService._build_write_back_skip_actions(None),
+        )
+
     async def test_should_resolve_model_with_desktop_event_user(self) -> None:
         # 这个测试函数的作用是验证桌面命令使用当前登录用户的模型配置，而不是共享默认环境用户。
         event_center_client = DummyEventCenterServiceClient()
@@ -135,9 +581,9 @@ class OrchestratorWriteBackTest(unittest.IsolatedAsyncioTestCase):
     async def test_should_intersect_profile_tools_with_skill_tool_policy(self) -> None:
         # 这个测试函数的作用是验证会话 profile 的工具白名单会和 skill 自带的工具白名单取交集，避免暴露越权工具。
         tools = ToolRegistry()
-        tools.register("send_qq_message", DummySendQqMessageTool())
-        tools.register("create_task", DummyCreateTaskTool())
-        tools.register("list_tasks", DummyListTasksTool())
+        register_test_tool(tools, "send_qq_message", DummySendQqMessageTool())
+        register_test_tool(tools, "create_task", DummyCreateTaskTool())
+        register_test_tool(tools, "list_tasks", DummyListTasksTool())
         service = OrchestratorService(
             router=RouterService(),
             planner=PlannerService(),
@@ -168,11 +614,94 @@ class OrchestratorWriteBackTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resolved_skills[0].id, "work.project_manager")
         self.assertEqual(allowed_tools, ["create_task"])
 
-    async def test_should_send_group_summary_when_slow_channel_flushes(self) -> None:
-        # 这个测试函数的作用是验证普通群消息在慢通道触发汇总时会回写群摘要。
+    async def test_privileged_group_tool_is_an_incremental_profile_grant(self) -> None:
+        # 这个测试函数的作用是验证群管理授权只增加特权工具，不会误删默认普通工具。
+        tools = ToolRegistry()
+        register_test_tool(tools, "send_qq_message", DummySendQqMessageTool())
+        register_test_tool(tools, "query_qq_group", DummyListTasksTool())
+        register_test_tool(tools, "manage_qq_group", DummySendQqMessageTool())
+        service = OrchestratorService(
+            router=RouterService(),
+            planner=PlannerService(),
+            tools=tools,
+            memory=MemoryManager(),
+            slow_channel_buffer=SlowChannelBuffer(window_seconds=600, max_messages=10),
+            event_center_client=DummyEventCenterServiceClient(),
+        )
+        profile_match = ConversationProfileMatchResult(
+            matched=True,
+            active=True,
+            reason="命中群管理设定",
+            profile=ConversationProfile(
+                id="profile-group-001",
+                name="群管理",
+                chatType="group",
+                allowedTools=["manage_qq_group"],
+            ),
+        )
+
+        allowed_tools = service._resolve_allowed_tools(profile_match, [])
+
+        # 工具注册表会按名称稳定排序；权限测试只关心授权集合，不把展示顺序当成安全语义。
+        self.assertSetEqual(
+            set(allowed_tools),
+            {"send_qq_message", "query_qq_group", "manage_qq_group"},
+        )
+
+    async def test_conversation_profile_cannot_receive_delegated_task_state_tools(self) -> None:
+        """验证设定集无法获得主控台委托的更新和自主结束工具。"""
+        tools = ToolRegistry()
+        register_test_tool(tools, "send_qq_message", DummySendQqMessageTool())
+        register_test_tool(tools, "update_delegated_task", DummyListTasksTool())
+        register_test_tool(tools, "complete_delegated_task", DummyListTasksTool())
+        service = OrchestratorService(
+            router=RouterService(),
+            planner=PlannerService(),
+            tools=tools,
+            memory=MemoryManager(),
+            slow_channel_buffer=SlowChannelBuffer(window_seconds=600, max_messages=10),
+            event_center_client=DummyEventCenterServiceClient(),
+        )
+        profile_match = ConversationProfileMatchResult(
+            matched=True,
+            active=True,
+            reason="命中长期私聊设定",
+            profile=ConversationProfile(
+                id="profile-private-001",
+                name="长期私聊代理",
+                allowedTools=[
+                    "send_qq_message",
+                    "update_delegated_task",
+                    "complete_delegated_task",
+                ],
+            ),
+        )
+
+        allowed_tools = service._resolve_allowed_tools(profile_match, [])
+
+        self.assertEqual(["send_qq_message"], allowed_tools)
+
+        # 数据库中若只残留旧版委托工具名，也应按无效授权忽略，而不是让设定集
+        # 获得结束能力或意外失去全部普通聊天工具。
+        stale_profile_match = ConversationProfileMatchResult(
+            matched=True,
+            reason="旧版设定集残留了主控台工具",
+            profile=ConversationProfile(
+                id="profile-private-stale",
+                name="旧版长期私聊代理",
+                allowedTools=["update_delegated_task", "complete_delegated_task"],
+            ),
+        )
+
+        stale_allowed_tools = service._resolve_allowed_tools(stale_profile_match, [])
+
+        self.assertEqual(["send_qq_message"], stale_allowed_tools)
+
+    async def test_should_not_echo_group_summary_when_slow_channel_flushes(self) -> None:
+        # 这个测试函数的作用是验证慢通道摘要只进入工作台，不会回声发送到原群。
         tools = ToolRegistry()
         send_tool = DummySendQqMessageTool()
-        tools.register("send_qq_message", send_tool)
+        register_test_tool(tools, "send_qq_message", send_tool)
         service = OrchestratorService(
             router=RouterService(),
             planner=PlannerService(),
@@ -200,17 +729,16 @@ class OrchestratorWriteBackTest(unittest.IsolatedAsyncioTestCase):
         result = await service.handle_event(event)
 
         self.assertEqual(result.route, "message_dispatch")
-        self.assertEqual(len(send_tool.calls), 1)
-        self.assertEqual(send_tool.calls[0]["chat_type"], "group")
-        self.assertEqual(send_tool.calls[0]["chat_id"], "138178088")
-        self.assertIn("过去一段时间群里主要提到：", send_tool.calls[0]["message"])
-        self.assertIn("qq_write_back_sent:ok", result.write_back_actions)
+        self.assertEqual(send_tool.calls, [])
+        self.assertEqual(result.write_back_actions, [])
+        self.assertIsNotNone(result.notification)
+        self.assertEqual(result.notification.aggregation_status, "SUMMARY_READY")
 
     async def test_should_send_at_reply_back_to_group_when_message_mentions_self(self) -> None:
         # 这个测试函数的作用是验证被 @ 后生成的回复会以 at + 文本分段形式回写群聊。
         tools = ToolRegistry()
         send_tool = DummySendQqMessageTool()
-        tools.register("send_qq_message", send_tool)
+        register_test_tool(tools, "send_qq_message", send_tool)
         service = OrchestratorService(
             router=RouterService(),
             planner=PlannerService(),
@@ -253,9 +781,9 @@ class OrchestratorWriteBackTest(unittest.IsolatedAsyncioTestCase):
         send_tool = DummySendQqMessageTool()
         extract_tool = DummyExtractFileTextTool()
         create_task_tool = DummyCreateTaskTool()
-        tools.register("send_qq_message", send_tool)
-        tools.register("extract_file_text", extract_tool)
-        tools.register("create_task", create_task_tool)
+        register_test_tool(tools, "send_qq_message", send_tool)
+        register_test_tool(tools, "extract_file_text", extract_tool)
+        register_test_tool(tools, "create_task", create_task_tool)
         service = OrchestratorService(
             router=RouterService(),
             planner=PlannerService(),
@@ -297,8 +825,8 @@ class OrchestratorWriteBackTest(unittest.IsolatedAsyncioTestCase):
         tools = ToolRegistry()
         send_tool = DummySendQqMessageTool()
         list_tool = DummyListTasksTool()
-        tools.register("send_qq_message", send_tool)
-        tools.register("list_tasks", list_tool)
+        register_test_tool(tools, "send_qq_message", send_tool)
+        register_test_tool(tools, "list_tasks", list_tool)
         service = OrchestratorService(
             router=RouterService(),
             planner=PlannerService(),
@@ -338,7 +866,7 @@ class OrchestratorWriteBackTest(unittest.IsolatedAsyncioTestCase):
         # 这个测试函数的作用是验证命中“只生成草稿”的设定后，私聊也不会自动回写到 QQ。
         tools = ToolRegistry()
         send_tool = DummySendQqMessageTool()
-        tools.register("send_qq_message", send_tool)
+        register_test_tool(tools, "send_qq_message", send_tool)
         profile_match = ConversationProfileMatchResult(
             matched=True,
             active=True,
@@ -381,12 +909,51 @@ class OrchestratorWriteBackTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(send_tool.calls), 0)
         self.assertEqual(result.write_back_actions, ["qq_write_back_skipped:draft_only"])
 
+    async def test_should_create_multiple_private_write_back_payloads_for_social_bubbles(self) -> None:
+        # 这个函数的作用是验证私聊社交回复的两条气泡会变成两次 QQ 发送，而群聊和非社交消息不会进入该分支。
+        payload = {
+            "chat_type": "private",
+            "chat_id": "2597164807",
+            "message": "先别急\n晚点说",
+        }
+
+        payloads = OrchestratorService._build_message_payloads(payload, ["先别急", "晚点说"])
+
+        self.assertEqual(len(payloads), 2)
+        self.assertEqual(payloads[0]["message"], "先别急")
+        self.assertEqual(payloads[1]["message"], "晚点说")
+
+    def test_should_prefer_review_message_parts_after_auto_rewrite(self) -> None:
+        """审查纠偏后必须发送新分段，不能继续使用 SocialAgent 审查前的旧草稿。"""
+        results = [
+            AgentResult(
+                task_id="task-1",
+                agent="social",
+                status="success",
+                structured_result={"messageParts": ["旧草稿"]},
+            ),
+            AgentResult(
+                task_id="task-1",
+                agent="review",
+                status="approved",
+                structured_result={
+                    "reviewDecision": "APPROVE",
+                    "approvedDraft": "还卖\n一个月15",
+                    "messageParts": ["还卖", "一个月15"],
+                },
+            ),
+        ]
+
+        parts = OrchestratorService._extract_social_message_parts(results, "还卖\n一个月15")
+
+        self.assertEqual(parts, ["还卖", "一个月15"])
+
     async def test_should_delay_auto_reply_when_profile_configures_reply_window(self) -> None:
         # 这个测试函数的作用是验证命中延迟回复策略后，orchestrator 会先执行延迟再发送消息。
         tools = ToolRegistry()
         send_tool = DummySendQqMessageTool()
         sleeper = DummySleeper()
-        tools.register("send_qq_message", send_tool)
+        register_test_tool(tools, "send_qq_message", send_tool)
         profile_match = ConversationProfileMatchResult(
             matched=True,
             active=True,
@@ -409,6 +976,7 @@ class OrchestratorWriteBackTest(unittest.IsolatedAsyncioTestCase):
             memory=MemoryManager(),
             slow_channel_buffer=SlowChannelBuffer(window_seconds=600, max_messages=10),
             event_center_client=DummyEventCenterServiceClient(profile_match),
+            llm_client=DummyApprovedSocialLlm(),
             sleeper=sleeper,
         )
 
@@ -437,6 +1005,138 @@ class OrchestratorWriteBackTest(unittest.IsolatedAsyncioTestCase):
             result.write_back_actions,
             ["qq_write_back_delayed:2s", "qq_write_back_sent:ok"],
         )
+
+    async def test_should_complete_delegated_task_only_after_closing_message_is_sent(self) -> None:
+        """主控台任务选择“发送并结束”后，必须等 QQ 确认发送成功才提交 COMPLETED。"""
+        event_center_client = DummyEventCenterServiceClient()
+        tools = ToolRegistry()
+        register_delegated_runtime_tools(tools, event_center_client)
+        service = OrchestratorService(
+            router=RouterService(),
+            planner=PlannerService(),
+            tools=tools,
+            memory=MemoryManager(),
+            slow_channel_buffer=SlowChannelBuffer(window_seconds=600, max_messages=10),
+            event_center_client=event_center_client,
+        )
+        event = UnifiedEvent(
+            eventId="qq:message:private:cross-day-confirm",
+            platform="qq",
+            scene="life",
+            eventType="message",
+            chatType="private",
+            chatId="3807050597",
+            selfId="3969785168",
+            sender=Sender(id="3807050597", name="km", role=None),
+            text="好的 那就这么定了",
+            attachments=[],
+            mentions=[],
+            timestamp="2026-07-23T12:33:00+08:00",
+            rawPayload={"self_id": 3969785168, "user_id": 3807050597},
+        )
+        decision = DelegatedTaskActionDecision(
+            action="SEND_AND_COMPLETE",
+            reason="联系人已明确确认安排",
+            progressSummary="今晚七点到九点的课程已经确认",
+            messageInstruction="回复今晚见",
+            stateJson='{"resolvedTimeText":"2026-07-23晚上七点到九点"}',
+            lastEventId=event.event_id,
+            completionReport="已约定今晚七点到九点上课",
+            evidence=["对方明确确认"],
+            requestedTool="complete_delegated_task",
+        )
+
+        response = await service._update_delegated_task_runtime(
+            event=event,
+            task={"id": "delegated-cross-day"},
+            delegated_action=decision,
+            history_context=[],
+            final_reply="今晚见",
+            write_back_actions=["qq_write_back_sent:ok"],
+            model_profile=None,
+            results=[],
+        )
+
+        self.assertIsNotNone(response)
+        self.assertEqual("COMPLETED", response["status"])
+        self.assertEqual("COMPLETED", event_center_client.delegated_runtime_updates[-1]["status"])
+
+    async def test_should_keep_delegated_task_active_when_closing_message_send_fails(self) -> None:
+        """收尾消息发送失败时不得误结束任务，而应保存为 ACTIVE 等待下一轮重试。"""
+        event_center_client = DummyEventCenterServiceClient()
+        tools = ToolRegistry()
+        register_delegated_runtime_tools(tools, event_center_client)
+        service = OrchestratorService(
+            router=RouterService(),
+            planner=PlannerService(),
+            tools=tools,
+            memory=MemoryManager(),
+            slow_channel_buffer=SlowChannelBuffer(window_seconds=600, max_messages=10),
+            event_center_client=event_center_client,
+        )
+
+        class RuntimeRecorder:
+            """提供稳定的运行图回落结果，避免测试依赖外部模型配置。"""
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def evaluate_runtime(self, runtime_input, model_profile=None):
+                """记录发送失败后的重新评估，并返回继续等待的 ACTIVE 决策。"""
+                self.calls += 1
+                return DelegatedTaskActionDecision(
+                    action="WAIT",
+                    reason="收尾消息尚未发送成功",
+                    progressSummary="等待重试收尾消息",
+                    stateJson=runtime_input.task.get("stateJson", "{}"),
+                    lastEventId=runtime_input.event.get("eventId", ""),
+                    requestedTool="update_delegated_task",
+                )
+
+        runtime_recorder = RuntimeRecorder()
+        service.delegated_task_workflow = runtime_recorder
+        event = UnifiedEvent(
+            eventId="qq:message:private:cross-day-send-failed",
+            platform="qq",
+            scene="life",
+            eventType="message",
+            chatType="private",
+            chatId="3807050597",
+            selfId="3969785168",
+            sender=Sender(id="3807050597", name="km", role=None),
+            text="好的 那就这么定了",
+            attachments=[],
+            mentions=[],
+            timestamp="2026-07-23T12:33:00+08:00",
+            rawPayload={"self_id": 3969785168, "user_id": 3807050597},
+        )
+        decision = DelegatedTaskActionDecision(
+            action="SEND_AND_COMPLETE",
+            reason="联系人已明确确认安排",
+            progressSummary="今晚七点到九点的课程已经确认",
+            messageInstruction="回复今晚见",
+            stateJson='{"resolvedTimeText":"2026-07-23晚上七点到九点"}',
+            lastEventId=event.event_id,
+            completionReport="已约定今晚七点到九点上课",
+            evidence=["对方明确确认"],
+            requestedTool="complete_delegated_task",
+        )
+
+        response = await service._update_delegated_task_runtime(
+            event=event,
+            task={"id": "delegated-cross-day"},
+            delegated_action=decision,
+            history_context=[],
+            final_reply="今晚见",
+            write_back_actions=["qq_write_back_failed:connector_timeout"],
+            model_profile=None,
+            results=[],
+        )
+
+        self.assertEqual(1, runtime_recorder.calls)
+        self.assertIsNotNone(response)
+        self.assertEqual("ACTIVE", response["status"])
+        self.assertEqual("ACTIVE", event_center_client.delegated_runtime_updates[-1]["status"])
 
 
 if __name__ == "__main__":

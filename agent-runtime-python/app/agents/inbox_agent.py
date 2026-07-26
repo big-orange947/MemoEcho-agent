@@ -6,10 +6,39 @@ from typing import Any
 from app.agents.base import BaseAgent
 from app.schemas.results import AgentResult, ToolCallRecord
 from app.schemas.tasks import AgentTaskContext
+from app.services.slow_channel_buffer import SlowChannelFlush
 
 
 class InboxAgent(BaseAgent):
     name = "inbox"
+
+    async def summarize_slow_channel_batch(self, flush: SlowChannelFlush) -> dict[str, str]:
+        """将慢通道的一批消息转换为消息空间稳定的三段式摘要。"""
+        lines = [line.strip() for line in flush.transcript.splitlines() if line.strip()]
+        unique_lines = list(dict.fromkeys(lines))
+        happened = "；".join(unique_lines[:3]) or "这段时间没有可读的文本消息。"
+        action_lines = [
+            line for line in unique_lines
+            if any(keyword in line.lower() for keyword in (
+                "通知", "截止", "报名", "会议", "开会", "作业", "提交", "@", "deadline", "meeting"
+            ))
+        ]
+        action_items = "；".join(action_lines[:3]) or "暂未识别到必须立即处理的事项。"
+        next_step = (
+            "优先查看包含通知、截止时间或明确指派的内容。"
+            if action_lines else "有空时浏览本批次摘要即可。"
+        )
+        summary = "\n".join((
+            f"离开期间发生了什么：{happened}",
+            f"需要处理什么：{action_items}",
+            f"建议下一步：{next_step}",
+        ))
+        return {
+            "summary": summary,
+            "happened": happened,
+            "actionItems": action_items,
+            "nextStep": next_step,
+        }
 
     async def run(self, task_context: AgentTaskContext, action: str) -> AgentResult:
         # 这个函数的作用是读取当前会话最近消息，并生成可直接回写平台的文本摘要。
@@ -24,7 +53,7 @@ class InboxAgent(BaseAgent):
         next_actions: list[str] = []
 
         try:
-            recent_messages = await self._get_tool(task_context, "get_recent_messages").execute(**query)
+            recent_messages = await self._invoke_tool(task_context, "get_recent_messages", query)
         except KeyError:
             recent_messages = []
             next_actions.append("get_recent_messages tool is not registered")

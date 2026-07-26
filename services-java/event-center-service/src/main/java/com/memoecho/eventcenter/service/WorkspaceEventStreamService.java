@@ -24,9 +24,8 @@ public class WorkspaceEventStreamService {
         emitter.onError(ignored -> remove(accountKey, emitter));
         try {
             emitter.send(SseEmitter.event().name("connected").data("connected"));
-        } catch (IOException exception) {
+        } catch (IOException | IllegalStateException exception) {
             remove(accountKey, emitter);
-            emitter.completeWithError(exception);
         }
         return emitter;
     }
@@ -41,9 +40,9 @@ public class WorkspaceEventStreamService {
         for (SseEmitter emitter : emitters) {
             try {
                 emitter.send(SseEmitter.event().name(event.type()).data(event));
-            } catch (IOException exception) {
+            } catch (IOException | IllegalStateException exception) {
+                // 浏览器关闭 SSE 后只移除订阅者；推送失败不能打断消息入库和 Agent 派发。
                 remove(accountKey, emitter);
-                emitter.completeWithError(exception);
             }
         }
     }

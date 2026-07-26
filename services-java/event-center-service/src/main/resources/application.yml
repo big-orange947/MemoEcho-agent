@@ -5,13 +5,25 @@ spring:
   application:
     name: event-center-service
   datasource:
-    url: jdbc:h2:file:./data/event-center-db;MODE=MySQL;DB_CLOSE_DELAY=-1;AUTO_SERVER=TRUE
-    driver-class-name: org.h2.Driver
-    username: sa
-    password:
+    url: ${EVENT_CENTER_DB_URL:jdbc:mysql://127.0.0.1:3306/memo_echo_event_center?createDatabaseIfNotExist=true&useUnicode=true&characterEncoding=UTF-8&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&useSSL=false}
+    driver-class-name: ${EVENT_CENTER_DB_DRIVER:com.mysql.cj.jdbc.Driver}
+    username: ${EVENT_CENTER_DB_USERNAME:root}
+    password: ${EVENT_CENTER_DB_PASSWORD}
+    hikari:
+      maximum-pool-size: ${EVENT_CENTER_DB_MAX_POOL_SIZE:15}
+      minimum-idle: ${EVENT_CENTER_DB_MIN_IDLE:2}
+      connection-timeout: ${EVENT_CENTER_DB_CONNECTION_TIMEOUT_MS:5000}
   sql:
     init:
-      mode: always
+      # 生产环境的结构变更统一交给 Flyway，避免两套初始化机制重复执行。
+      mode: never
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    # 已存在但尚未接入 Flyway 的数据库先登记为版本 0，再执行幂等的 V1 建表脚本。
+    baseline-on-migrate: true
+    baseline-version: 0
+    validate-on-migrate: true
 
 event-center:
   security:
@@ -19,19 +31,34 @@ event-center:
     jwt-secret: ${EVENT_CENTER_JWT_SECRET:memo-echo-jwt-dev-secret-change-me}
     jwt-expires-seconds: ${EVENT_CENTER_JWT_EXPIRES_SECONDS:604800}
     allow-legacy-user-header: ${EVENT_CENTER_ALLOW_LEGACY_USER_HEADER:false}
-    runtime-token: ${EVENT_CENTER_RUNTIME_TOKEN:}
+    # 本地开发默认令牌与 Python Runtime 保持一致；正式部署必须通过环境变量覆盖。
+    runtime-token: ${EVENT_CENTER_RUNTIME_TOKEN:memo-echo-local-runtime-token}
     allowed-origins: ${EVENT_CENTER_ALLOWED_ORIGINS:http://127.0.0.1:5173,http://tauri.localhost,tauri://localhost}
   dispatch:
     agent-runtime:
       enabled: true
       base-url: http://127.0.0.1:8000
       handle-path: /v1/events/handle
+      progress-path: /v1/conversations/progress
+    retry:
+      enabled: ${EVENT_CENTER_DISPATCH_RETRY_ENABLED:true}
+      # 包含首次同步派发；默认最多再自动尝试三次。
+      max-attempts: ${EVENT_CENTER_DISPATCH_MAX_ATTEMPTS:4}
+      initial-delay-seconds: ${EVENT_CENTER_DISPATCH_INITIAL_DELAY_SECONDS:3}
+      max-delay-seconds: ${EVENT_CENTER_DISPATCH_MAX_DELAY_SECONDS:60}
+      poll-interval-ms: ${EVENT_CENTER_DISPATCH_POLL_INTERVAL_MS:1000}
+      batch-size: ${EVENT_CENTER_DISPATCH_RETRY_BATCH_SIZE:20}
   conversation-profiles:
     seed-defaults: true
   skills:
     builtin-root: ../../agent-runtime-python/skills
     installed-root: ../../agent-runtime-python/skills-installed
     github-default-ref: main
+    # 个人 Skill 只有在样本量、历史跨度和综合可信度同时达标后才会出现在可选列表中。
+    personal-min-samples: 500
+    personal-min-confidence: 0.80
+    personal-min-history-span-days: 30
+    personal-evaluation-interval-ms: 60000
   downstream:
     task-service-base-url: http://127.0.0.1:8094
     schedule-service-base-url: http://127.0.0.1:8092

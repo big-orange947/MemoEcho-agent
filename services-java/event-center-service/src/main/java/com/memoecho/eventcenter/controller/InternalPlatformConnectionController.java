@@ -1,9 +1,11 @@
 package com.memoecho.eventcenter.controller;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.memoecho.eventcenter.dto.PlatformConnectionResponse;
 import com.memoecho.eventcenter.dto.PlatformConnectionUpsertRequest;
 import com.memoecho.eventcenter.service.PlatformConnectionApplicationService;
 import com.memoecho.eventcenter.service.LocalUserContextResolver;
+import com.memoecho.eventcenter.service.QqConnectorMessageClient;
 import jakarta.validation.Valid;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -25,14 +27,51 @@ public class InternalPlatformConnectionController {
 
     private final PlatformConnectionApplicationService applicationService;
     private final LocalUserContextResolver userContextResolver;
+    private final QqConnectorMessageClient qqConnectorMessageClient;
 
     public InternalPlatformConnectionController(
             PlatformConnectionApplicationService applicationService,
-            LocalUserContextResolver userContextResolver
+            LocalUserContextResolver userContextResolver,
+            QqConnectorMessageClient qqConnectorMessageClient
     ) {
         // 这个构造函数的作用是注入连接状态查询服务，使 Controller 不接触平台凭据。
         this.applicationService = applicationService;
         this.userContextResolver = userContextResolver;
+        this.qqConnectorMessageClient = qqConnectorMessageClient;
+    }
+
+    /** 启动当前用户的 QQ 扫码登录。 */
+    @PostMapping("/qq/qr-login")
+    public ResponseEntity<JsonNode> startQqQrLogin(
+            @RequestHeader(name = "Authorization", required = false) String authorization,
+            @RequestHeader(name = "X-Memo-Echo-User-Id", defaultValue = "local-user") String userId
+    ) {
+        userContextResolver.resolve(authorization, userId);
+        return ResponseEntity.ok(qqConnectorMessageClient.startQrLogin());
+    }
+
+    /** 读取当前用户的 QQ 扫码状态，并在成功后刷新连接档案。 */
+    @GetMapping("/qq/qr-login/status")
+    public ResponseEntity<JsonNode> getQqQrLoginStatus(
+            @RequestHeader(name = "Authorization", required = false) String authorization,
+            @RequestHeader(name = "X-Memo-Echo-User-Id", defaultValue = "local-user") String userId
+    ) {
+        String resolvedUserId = userContextResolver.resolve(authorization, userId);
+        JsonNode response = qqConnectorMessageClient.fetchQrLoginStatus();
+        if (response != null && "CONNECTED".equals(response.path("state").asText())) {
+            applicationService.refreshLocalQqConnection(resolvedUserId);
+        }
+        return ResponseEntity.ok(response);
+    }
+
+    /** 刷新当前用户看到的 QQ 登录二维码。 */
+    @PostMapping("/qq/qr-login/refresh")
+    public ResponseEntity<JsonNode> refreshQqQrLogin(
+            @RequestHeader(name = "Authorization", required = false) String authorization,
+            @RequestHeader(name = "X-Memo-Echo-User-Id", defaultValue = "local-user") String userId
+    ) {
+        userContextResolver.resolve(authorization, userId);
+        return ResponseEntity.ok(qqConnectorMessageClient.refreshQrLogin());
     }
 
     @GetMapping

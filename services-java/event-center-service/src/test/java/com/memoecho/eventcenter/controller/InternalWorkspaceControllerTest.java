@@ -1,5 +1,7 @@
 package com.memoecho.eventcenter.controller;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.memoecho.eventcenter.dto.WorkspaceBriefingOverviewResponse;
 import com.memoecho.eventcenter.dto.WorkspaceBriefingResponse;
 import com.memoecho.eventcenter.dto.WorkspaceConversationDigestResponse;
@@ -10,6 +12,9 @@ import com.memoecho.eventcenter.dto.WorkspaceSuggestedActionResponse;
 import com.memoecho.eventcenter.dto.WorkspaceTaskDigestResponse;
 import com.memoecho.eventcenter.service.WorkspaceBriefingApplicationService;
 import com.memoecho.eventcenter.service.WorkspaceInboxApplicationService;
+import com.memoecho.eventcenter.service.LocalUserContextResolver;
+import com.memoecho.eventcenter.service.AgentRuntimeDispatchClient;
+import com.memoecho.eventcenter.service.EventCenterApplicationService;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
@@ -22,8 +27,10 @@ import java.util.List;
 import static org.mockito.BDDMockito.given;
 import static org.mockito.Mockito.verify;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
+import static org.springframework.http.MediaType.APPLICATION_JSON;
 
 @WebMvcTest(InternalWorkspaceController.class)
 class InternalWorkspaceControllerTest {
@@ -36,6 +43,18 @@ class InternalWorkspaceControllerTest {
 
     @MockBean
     private WorkspaceInboxApplicationService workspaceInboxApplicationService;
+
+    @MockBean
+    private LocalUserContextResolver localUserContextResolver;
+
+    @MockBean
+    private AgentRuntimeDispatchClient agentRuntimeDispatchClient;
+
+    @MockBean
+    private EventCenterApplicationService eventCenterApplicationService;
+
+    @Autowired
+    private ObjectMapper objectMapper;
 
     @Test
     void shouldReturnWorkspaceBriefing() throws Exception {
@@ -75,11 +94,27 @@ class InternalWorkspaceControllerTest {
                 )),
                 List.of(new WorkspaceScheduleDigestResponse(
                         "schedule-001",
+                        "qq:message:group:10001",
+                        "qq",
+                        "1098307542",
+                        "2597164807",
                         "项目例会",
                         LocalDateTime.of(2026, 7, 8, 14, 0),
                         LocalDateTime.of(2026, 7, 8, 15, 0),
                         "A01-N105",
                         "项目周会"
+                )),
+                List.of(new WorkspaceScheduleDigestResponse(
+                        "schedule-002",
+                        "qq:message:group:10002",
+                        "qq",
+                        "1098307542",
+                        "88880001",
+                        "明天答辩彩排",
+                        LocalDateTime.of(2026, 7, 9, 10, 0),
+                        LocalDateTime.of(2026, 7, 9, 11, 0),
+                        "A02-201",
+                        "答辩彩排"
                 )),
                 List.of(new WorkspaceSuggestedActionResponse(
                         "task",
@@ -103,6 +138,9 @@ class InternalWorkspaceControllerTest {
                 .andExpect(jsonPath("$.importantConversations[0].actionRequired").value(true))
                 .andExpect(jsonPath("$.pendingTasks[0].title").value("完成项目周报"))
                 .andExpect(jsonPath("$.todaySchedules[0].title").value("项目例会"))
+                .andExpect(jsonPath("$.todaySchedules[0].platform").value("qq"))
+                .andExpect(jsonPath("$.todaySchedules[0].chatId").value("1098307542"))
+                .andExpect(jsonPath("$.upcomingSchedules[0].title").value("明天答辩彩排"))
                 .andExpect(jsonPath("$.suggestedActions[0].type").value("task"));
 
         verify(workspaceBriefingApplicationService).buildBriefing("freeze", "2597164807", 480, 5, 5, 5);
@@ -141,7 +179,8 @@ class InternalWorkspaceControllerTest {
                 ))
         );
 
-        given(workspaceInboxApplicationService.buildInbox("NEW", 20)).willReturn(response);
+        given(localUserContextResolver.resolve(null, "local-user")).willReturn("user-001");
+        given(workspaceInboxApplicationService.buildInbox("user-001", "NEW", 20)).willReturn(response);
 
         mockMvc.perform(get("/internal/workspace/inbox")
                         .param("inboxStatus", "NEW")
@@ -153,6 +192,37 @@ class InternalWorkspaceControllerTest {
                 .andExpect(jsonPath("$.items[0].replyDraft").value("好的，下午两点见。"))
                 .andExpect(jsonPath("$.items[0].actionRequired").value(true));
 
-        verify(workspaceInboxApplicationService).buildInbox("NEW", 20);
+        verify(workspaceInboxApplicationService).buildInbox("user-001", "NEW", 20);
+    }
+
+    @Test
+    void shouldRejectGroupOperationApprovalForForeignEvent() throws Exception {
+        // 这个测试函数验证对象级鉴权：即使知道事件 ID，也不能读取其他本地账户的审批单。
+        given(localUserContextResolver.resolve(null, "local-user")).willReturn("user-001");
+        given(eventCenterApplicationService.isEventOwnedBy("user-001", "event-foreign")).willReturn(false);
+
+        mockMvc.perform(get("/internal/workspace/group-operations/event-foreign"))
+                .andExpect(status().isNotFound());
+    }
+
+    @Test
+    void shouldApproveOwnedGroupOperationAndCompleteInboxItem() throws Exception {
+        // 这个测试函数验证确认短语只会代理到 Runtime，且只有 Runtime 明确返回 success 才完成收件箱事项。
+        ObjectNode runtimeResult = objectMapper.createObjectNode();
+        runtimeResult.put("status", "success");
+        runtimeResult.put("action", "mute_member");
+        given(localUserContextResolver.resolve(null, "local-user")).willReturn("user-001");
+        given(eventCenterApplicationService.isEventOwnedBy("user-001", "event-owned")).willReturn(true);
+        given(agentRuntimeDispatchClient.approveGroupOperation("event-owned", "确认执行"))
+                .willReturn(runtimeResult);
+
+        mockMvc.perform(post("/internal/workspace/group-operations/event-owned/approve")
+                        .contentType(APPLICATION_JSON)
+                        .content("{\"confirmationText\":\"确认执行\"}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("success"))
+                .andExpect(jsonPath("$.action").value("mute_member"));
+
+        verify(eventCenterApplicationService).markInboxDone("event-owned");
     }
 }

@@ -68,8 +68,12 @@ class WorkAgent(BaseAgent):
             }
             tool_calls.append(ToolCallRecord(tool="create_task", arguments=payload))
             try:
-                create_task_tool = self._get_tool(task_context, "create_task")
-                persistence_result = await create_task_tool.execute(payload=payload)
+                persistence_result = await self._invoke_tool(
+                    task_context,
+                    "create_task",
+                    {"payload": payload},
+                    idempotency_key=f"task:{task_context.event.event_id}:{candidate.title}",
+                )
                 plan["persisted_task"] = persistence_result
             except KeyError:
                 next_actions.append("create_task tool is not registered")
@@ -113,8 +117,7 @@ class WorkAgent(BaseAgent):
         query_error: str | None = None
 
         try:
-            list_tasks_tool = self._get_tool(task_context, "list_tasks")
-            tasks = await list_tasks_tool.execute(params=query_params)
+            tasks = await self._invoke_tool(task_context, "list_tasks", {"params": query_params})
         except KeyError:
             next_actions.append("list_tasks tool is not registered")
             query_error = "list_tasks tool is not registered"

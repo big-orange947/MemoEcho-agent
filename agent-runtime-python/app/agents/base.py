@@ -7,6 +7,7 @@ from app.schemas.model_profiles import ResolvedUserModelProfile
 from app.schemas.results import AgentResult
 from app.schemas.skills import SkillDescriptor
 from app.schemas.tasks import AgentTaskContext
+from app.tools.base import ToolExecutionContext
 from app.tools.registry import ToolRegistry
 
 
@@ -27,6 +28,36 @@ class BaseAgent(ABC):
         if allowed_tools and name not in allowed_tools:
             raise PermissionError(f"tool '{name}' is not allowed in current context")
         return self.tools.get(name)
+
+    def _tool_execution_context(self, task_context: AgentTaskContext) -> ToolExecutionContext:
+        # 这个函数的作用是把 AgentTaskContext 转换为工具注册表可校验的调用上下文。
+        # 用户标识优先使用当前登录 QQ，避免把聊天对方误当成工具操作的所有者。
+        event = task_context.event
+        user_id = str(event.self_id or event.sender.id or "")
+        return ToolExecutionContext(
+            user_id=user_id,
+            event_id=event.event_id,
+            task_id=task_context.task_id,
+            allowed_tools=frozenset(task_context.allowed_tools),
+            trusted_internal=not bool(task_context.allowed_tools),
+        )
+
+    async def _invoke_tool(
+        self,
+        task_context: AgentTaskContext,
+        name: str,
+        arguments: dict[str, Any],
+        *,
+        idempotency_key: str = "",
+    ) -> Any:
+        # 这个函数的作用是让所有 Agent 统一经由 LangChain BaseTool.ainvoke 调用能力。
+        # 注册表在这里负责授权、幂等和审计边界，Agent 不直接访问底层 HTTP 客户端或旧 execute 协议。
+        return await self.tools.ainvoke(
+            name,
+            context=self._tool_execution_context(task_context),
+            idempotency_key=idempotency_key,
+            arguments=arguments,
+        )
 
     def _extract_profile(self, task_context: AgentTaskContext) -> dict[str, Any]:
         # 这个函数的作用是从运行时上下文里提取命中的会话设定，供各类 Agent 复用。

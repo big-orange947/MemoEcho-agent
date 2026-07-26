@@ -8,8 +8,15 @@ import java.util.List;
 public record SendPrivateMessageRequest(
         @NotNull Long userId,
         String message,
-        List<MessageSegmentPayload> segments
+        List<MessageSegmentPayload> segments,
+        String clientMessageId,
+        String correlationId
 ) {
+
+    /** 兼容旧客户端的三参数构造方式。 */
+    public SendPrivateMessageRequest(Long userId, String message, List<MessageSegmentPayload> segments) {
+        this(userId, message, segments, null, null);
+    }
 
     @AssertTrue(message = "message 和 segments 必须二选一且至少提供一个")
     public boolean hasValidMessageBody() {

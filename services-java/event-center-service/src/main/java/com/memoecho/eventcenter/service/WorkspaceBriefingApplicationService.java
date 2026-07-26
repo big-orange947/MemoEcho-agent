@@ -58,7 +58,8 @@ public class WorkspaceBriefingApplicationService {
                 safeLookbackMinutes
         );
         List<TaskServiceTaskResponse> tasks = taskServiceQueryClient.listPendingTasks(senderId, safeTaskLimit);
-        List<ScheduleServiceScheduleResponse> schedules = scheduleServiceQueryClient.listSchedules(senderId);
+        // senderId 是消息发布者而非日程所有者；本地工作台需要聚合所有会话中已提取的日程。
+        List<ScheduleServiceScheduleResponse> schedules = scheduleServiceQueryClient.listWorkspaceSchedules();
 
         List<WorkspaceConversationDigestResponse> importantConversations = selectImportantConversations(conversations, safeConversationLimit);
         List<WorkspaceTaskDigestResponse> pendingTasks = tasks.stream()
@@ -66,6 +67,7 @@ public class WorkspaceBriefingApplicationService {
                 .map(this::toTaskDigest)
                 .toList();
         List<WorkspaceScheduleDigestResponse> todaySchedules = selectTodaySchedules(schedules, safeScheduleLimit);
+        List<WorkspaceScheduleDigestResponse> upcomingSchedules = selectUpcomingSchedules(schedules, safeScheduleLimit);
         int actionRequiredCount = (int) importantConversations.stream()
                 .filter(WorkspaceConversationDigestResponse::actionRequired)
                 .count();
@@ -87,6 +89,7 @@ public class WorkspaceBriefingApplicationService {
                 importantConversations,
                 pendingTasks,
                 todaySchedules,
+                upcomingSchedules,
                 suggestedActions
         );
     }
@@ -114,6 +117,20 @@ public class WorkspaceBriefingApplicationService {
         LocalDate today = LocalDate.now();
         return schedules.stream()
                 .filter(item -> item.startTime() != null && item.startTime().toLocalDate().isEqual(today))
+                .sorted(Comparator.comparing(ScheduleServiceScheduleResponse::startTime))
+                .limit(limit)
+                .map(this::toScheduleDigest)
+                .toList();
+    }
+
+    private List<WorkspaceScheduleDigestResponse> selectUpcomingSchedules(
+            List<ScheduleServiceScheduleResponse> schedules,
+            int limit
+    ) {
+        // 这个函数的作用是筛选从今天开始的近期日程，让客户端能展示明天、后天和指定日期的安排。
+        LocalDate today = LocalDate.now();
+        return schedules.stream()
+                .filter(item -> item.startTime() != null && !item.startTime().toLocalDate().isBefore(today))
                 .sorted(Comparator.comparing(ScheduleServiceScheduleResponse::startTime))
                 .limit(limit)
                 .map(this::toScheduleDigest)
@@ -215,6 +232,10 @@ public class WorkspaceBriefingApplicationService {
         // 这个函数的作用是把日程记录映射成前端工作台当日日程卡片。
         return new WorkspaceScheduleDigestResponse(
                 schedule.id(),
+                schedule.sourceEventId(),
+                schedule.platform(),
+                schedule.chatId(),
+                schedule.senderId(),
                 schedule.title(),
                 schedule.startTime(),
                 schedule.endTime(),

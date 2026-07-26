@@ -26,6 +26,12 @@ class SlowChannelFlush:
     source_event_ids: list[str]
     message_count: int
     summary: str
+    period_started_at: float = 0.0
+    period_ended_at: float = 0.0
+    transcript: str = ""
+    happened: str = ""
+    action_items: str = ""
+    next_step: str = ""
 
 
 class SlowChannelBuffer:
@@ -96,9 +102,24 @@ class SlowChannelBuffer:
             }
 
         flushed_messages = self._buffers.pop(aggregation_key, [])
-        self._source_events.pop(aggregation_key, None)
+        source_event = self._source_events.pop(aggregation_key, None)
         self._cancel_timer(aggregation_key)
         summary = self._build_summary(flushed_messages)
+        if source_event is not None and self.on_flush is not None:
+            flush = SlowChannelFlush(
+                aggregation_key=aggregation_key,
+                source_event=source_event,
+                source_event_ids=[item.event_id for item in flushed_messages],
+                message_count=len(flushed_messages),
+                summary=summary,
+                period_started_at=flushed_messages[0].buffered_at,
+                period_ended_at=flushed_messages[-1].buffered_at,
+                transcript=self._build_transcript(flushed_messages),
+            )
+            try:
+                asyncio.get_running_loop().create_task(self.on_flush(flush))
+            except RuntimeError:
+                pass
         return {
             "buffered": True,
             "bufferedCount": len(flushed_messages),
@@ -133,6 +154,9 @@ class SlowChannelBuffer:
                 source_event_ids=[message.event_id for message in messages],
                 message_count=len(messages),
                 summary=self._build_summary(messages),
+                period_started_at=messages[0].buffered_at,
+                period_ended_at=messages[-1].buffered_at,
+                transcript=self._build_transcript(messages),
             ))
         except asyncio.CancelledError:
             raise
@@ -169,3 +193,8 @@ class SlowChannelBuffer:
 
         lines.append(f"共缓冲 {len(messages)} 条消息。")
         return "\n".join(lines)
+
+    def _build_transcript(self, messages: list[BufferedMessage]) -> str:
+        """将本批消息整理为模型输入，并限制长度避免异常刷屏耗尽上下文。"""
+        lines = [f"{item.sender_name}: {item.text or '[非文本消息]'}" for item in messages]
+        return "\n".join(lines)[:30000]

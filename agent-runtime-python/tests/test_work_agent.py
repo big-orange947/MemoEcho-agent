@@ -7,6 +7,7 @@ from app.agents.work_agent import WorkAgent
 from app.schemas.events import Sender, UnifiedEvent
 from app.schemas.tasks import AgentTaskContext
 from app.tools.registry import ToolRegistry
+from tool_test_utils import register_test_tool
 
 
 class DummyCreateTaskTool:
@@ -86,7 +87,7 @@ class WorkAgentTest(unittest.IsolatedAsyncioTestCase):
         # 这个测试函数的作用是验证 WorkAgent 在任务创建模式下会落库并生成今日计划。
         registry = ToolRegistry()
         tool = DummyCreateTaskTool()
-        registry.register("create_task", tool)
+        register_test_tool(registry, "create_task", tool)
         agent = WorkAgent(registry)
 
         event = UnifiedEvent(
@@ -130,7 +131,7 @@ class WorkAgentTest(unittest.IsolatedAsyncioTestCase):
         # 这个测试函数的作用是验证 WorkAgent 会复用 FileAgent 的分析结果补强任务提取。
         registry = ToolRegistry()
         tool = DummyCreateTaskTool()
-        registry.register("create_task", tool)
+        register_test_tool(registry, "create_task", tool)
         agent = WorkAgent(registry)
 
         event = UnifiedEvent(
@@ -178,8 +179,8 @@ class WorkAgentTest(unittest.IsolatedAsyncioTestCase):
         registry = ToolRegistry()
         create_tool = DummyCreateTaskTool()
         list_tool = DummyListTasksTool()
-        registry.register("create_task", create_tool)
-        registry.register("list_tasks", list_tool)
+        register_test_tool(registry, "create_task", create_tool)
+        register_test_tool(registry, "list_tasks", list_tool)
         agent = WorkAgent(registry)
 
         event = UnifiedEvent(
@@ -222,7 +223,7 @@ class WorkAgentTest(unittest.IsolatedAsyncioTestCase):
         # 这个测试函数的作用是验证 WorkAgent 在命中用户模型配置时会优先使用大模型回复。
         registry = ToolRegistry()
         tool = DummyCreateTaskTool()
-        registry.register("create_task", tool)
+        register_test_tool(registry, "create_task", tool)
         llm_client = DummyLlmClient()
         agent = WorkAgent(registry, llm_client=llm_client)
 
@@ -293,7 +294,7 @@ class WorkAgentTest(unittest.IsolatedAsyncioTestCase):
         # 这个测试函数的作用是验证会话工具白名单未放行 create_task 时，WorkAgent 不会继续落库。
         registry = ToolRegistry()
         tool = DummyCreateTaskTool()
-        registry.register("create_task", tool)
+        register_test_tool(registry, "create_task", tool)
         agent = WorkAgent(registry)
 
         event = UnifiedEvent(

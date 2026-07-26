@@ -146,8 +146,8 @@ class SkillResolver:
 
     def _parse_github_reference(self, reference: str) -> tuple[str, str, str, str] | None:
         # 这个函数的作用是解析 GitHub skill 引用的关键组成部分。
-        # 当前支持两种写法：
-        # - `github://owner/repo/path/to/skill-dir`
+        # 当前同时支持仓库根目录和子目录两种写法：
+        # - `github://owner/repo@main`
         # - `github://owner/repo@main/path/to/skill-dir`
         normalized = str(reference or "").strip()
         if not normalized.startswith("github://"):
@@ -155,13 +155,17 @@ class SkillResolver:
 
         without_scheme = normalized.removeprefix("github://")
         segments = without_scheme.split("/", 3)
-        if len(segments) < 3:
+        if len(segments) < 2:
             return None
 
         owner = segments[0].strip()
         repository_with_ref = segments[1].strip()
-        descriptor_path = segments[2].strip() if len(segments) == 3 else f"{segments[2].strip()}/{segments[3].strip()}"
-        if not owner or not repository_with_ref or not descriptor_path:
+        descriptor_path = ""
+        if len(segments) == 3:
+            descriptor_path = segments[2].strip()
+        elif len(segments) == 4:
+            descriptor_path = f"{segments[2].strip()}/{segments[3].strip()}"
+        if not owner or not repository_with_ref:
             return None
 
         repository = repository_with_ref

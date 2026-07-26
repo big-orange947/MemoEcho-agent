@@ -6,6 +6,7 @@ import com.memoecho.eventcenter.dto.GithubSkillInstallRequest;
 import com.memoecho.eventcenter.dto.SkillInstallResponse;
 import com.memoecho.eventcenter.dto.SkillResolvePreviewRequest;
 import com.memoecho.eventcenter.dto.SkillResolvePreviewResponse;
+import com.memoecho.eventcenter.model.GithubSkillReference;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -105,8 +106,90 @@ class SkillCatalogApplicationServiceTest {
         assertTrue(Files.exists(installedRoot.resolve("github/demo-owner/demo-repo/main/personas/reliable-assistant/skill.json")));
         assertEquals(1, previewResponse.resolvedSkills().size());
         assertTrue(previewResponse.unresolvedSkillReferences().isEmpty());
-        assertEquals("github://demo-owner/demo-repo/personas/reliable-assistant", previewResponse.resolvedSkills().get(0).reference());
+        assertEquals("github://demo-owner/demo-repo@main/personas/reliable-assistant", previewResponse.resolvedSkills().get(0).reference());
         assertFalse(previewResponse.resolvedSkills().get(0).applicableRoutes().isEmpty());
+    }
+
+    @Test
+    void shouldInstallRootSkillMarkdownFromGithubWebUrl() {
+        // 这个测试函数的作用是验证普通 GitHub URL 在没有 skill.json 时会回退解析仓库根目录的 SKILL.md。
+        Path builtinRoot = tempDir.resolve("skills");
+        Path installedRoot = tempDir.resolve("skills-installed");
+        GithubSkillDescriptorDownloader downloader = new GithubSkillDescriptorDownloader() {
+            @Override
+            public String downloadSkillDescriptor(GithubSkillReference reference) {
+                throw new org.springframework.web.server.ResponseStatusException(
+                        org.springframework.http.HttpStatus.BAD_REQUEST,
+                        "skill.json 不存在"
+                );
+            }
+
+            @Override
+            public String downloadSkillMarkdown(GithubSkillReference reference) {
+                return """
+                        ---
+                        name: 张雪峰风格助手
+                        description: |
+                          用于模拟鲜明直接的表达风格。
+                          只允许使用已有事实。
+                        ---
+                        回复时观点明确，但不得编造事实。
+                        """;
+            }
+        };
+        SkillCatalogApplicationService service = buildService(builtinRoot, installedRoot, downloader);
+
+        SkillInstallResponse response = service.installGithubSkill(
+                new GithubSkillInstallRequest("https://github.com/alchaincyf/zhangxuefeng-skill", null)
+        );
+        SkillResolvePreviewResponse preview = service.previewResolve(
+                new SkillResolvePreviewRequest(List.of(response.installedReference()), "social_reply")
+        );
+
+        assertEquals("github://alchaincyf/zhangxuefeng-skill@main", response.installedReference());
+        assertTrue(Files.exists(installedRoot.resolve("github/alchaincyf/zhangxuefeng-skill/main/root/skill.json")));
+        assertEquals(1, preview.resolvedSkills().size());
+        assertEquals("张雪峰风格助手", preview.resolvedSkills().get(0).name());
+        assertTrue(preview.resolvedSkills().get(0).description().contains("只允许使用已有事实"));
+        assertTrue(preview.resolvedSkills().get(0).promptFragments().system().contains("不得编造事实"));
+        assertTrue(preview.resolvedSkills().get(0).toolPolicy().allow().isEmpty());
+    }
+
+    @Test
+    void shouldResolveGeneratedPersonalSkillFromInstalledRoot() throws IOException {
+        // 该测试验证自动生成的 personal 引用会从已安装目录解析，而不会被错误地只拿到内置目录查找。
+        Path builtinRoot = tempDir.resolve("skills");
+        Path installedRoot = tempDir.resolve("skills-installed");
+        writeSkill(
+                installedRoot.resolve("personal/user-1/friends-style/skill.json"),
+                """
+                        {
+                          "id": "personal.user-1.friends-style",
+                          "name": "我的表达风格 · 朋友聊天",
+                          "type": "persona",
+                          "source": "personal",
+                          "rawReference": "personal/user-1/friends-style",
+                          "applicableRoutes": ["social_reply"],
+                          "promptFragments": { "system": "只模仿表达形式。" },
+                          "toolPolicy": { "allow": [] },
+                          "modelHints": { "temperature": 0.7, "maxTokens": 256 }
+                        }
+                        """
+        );
+        SkillCatalogApplicationService service = buildService(
+                builtinRoot,
+                installedRoot,
+                reference -> ""
+        );
+
+        SkillResolvePreviewResponse preview = service.previewResolve(
+                new SkillResolvePreviewRequest(List.of("personal/user-1/friends-style"), "social_reply")
+        );
+
+        assertEquals(1, preview.resolvedSkills().size());
+        assertTrue(preview.unresolvedSkillReferences().isEmpty());
+        assertEquals("personal", preview.resolvedSkills().getFirst().sourceType());
+        assertEquals("personal/user-1/friends-style", preview.resolvedSkills().getFirst().reference());
     }
 
     private SkillCatalogApplicationService buildService(

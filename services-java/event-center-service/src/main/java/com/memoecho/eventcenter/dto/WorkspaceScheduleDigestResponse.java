@@ -6,6 +6,10 @@ import java.time.LocalDateTime;
 
 public record WorkspaceScheduleDigestResponse(
         String id,
+        String sourceEventId,
+        String platform,
+        String chatId,
+        String senderId,
         String title,
         @JsonFormat(pattern = "yyyy-MM-dd HH:mm:ss")
         LocalDateTime startTime,

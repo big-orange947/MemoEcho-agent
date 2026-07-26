@@ -1,0 +1,28 @@
+-- 长期记忆只保存结构化事实和来源事件；未经用户确认的候选不能提供给 Runtime。
+CREATE TABLE IF NOT EXISTS memory_candidate (
+    id VARCHAR(64) NOT NULL,
+    user_id VARCHAR(128) NOT NULL,
+    subject VARCHAR(255) NOT NULL,
+    predicate_name VARCHAR(128) NOT NULL,
+    fact_value LONGTEXT NOT NULL,
+    scope_type VARCHAR(32) NOT NULL,
+    platform VARCHAR(64) NOT NULL DEFAULT '',
+    scene VARCHAR(64) NOT NULL DEFAULT '',
+    chat_type VARCHAR(32) NOT NULL DEFAULT '',
+    chat_id VARCHAR(255) NOT NULL DEFAULT '',
+    source_event_ids_json LONGTEXT NOT NULL,
+    source_actor_type VARCHAR(32) NOT NULL,
+    fact_authority VARCHAR(32) NOT NULL,
+    confidence DOUBLE NOT NULL,
+    status VARCHAR(32) NOT NULL,
+    rejection_reason VARCHAR(2000) NOT NULL DEFAULT '',
+    first_seen_at DATETIME(6) NOT NULL,
+    last_seen_at DATETIME(6) NOT NULL,
+    expires_at DATETIME(6),
+    created_at DATETIME(6) NOT NULL,
+    updated_at DATETIME(6) NOT NULL,
+    PRIMARY KEY (id),
+    KEY idx_memory_user_status_updated (user_id, status, updated_at),
+    KEY idx_memory_user_scope (user_id, scope_type, platform, chat_type, chat_id),
+    KEY idx_memory_user_expires (user_id, expires_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

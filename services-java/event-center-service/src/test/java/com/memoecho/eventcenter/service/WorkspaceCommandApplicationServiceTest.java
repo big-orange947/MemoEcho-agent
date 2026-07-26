@@ -27,7 +27,7 @@ class WorkspaceCommandApplicationServiceTest {
 
     @Test
     void shouldCreateDesktopEventAndReturnRuntimeResult() throws Exception {
-        // 这个测试函数的作用是验证桌面命令会携带可信用户和显式路由进入标准事件链路。
+        // 验证桌面命令会携带可信用户、显式路由，并进入标准事件链路。
         JsonNode runtimeBody = objectMapper.readTree("""
                 {
                   "status": "success",
@@ -65,6 +65,7 @@ class WorkspaceCommandApplicationServiceTest {
         assertThat(event.eventType()).isEqualTo("desktop_command");
         assertThat(event.rawPayload().path("userId").asText()).isEqualTo("user-001");
         assertThat(event.rawPayload().path("requestedRoute").asText()).isEqualTo("task_plan");
+        assertThat(event.rawPayload().path("allowTaskCreation").asBoolean()).isTrue();
         assertThat(response.status()).isEqualTo("success");
         assertThat(response.route()).isEqualTo("task_plan");
         assertThat(response.finalReply()).isEqualTo("今天先完成项目周报。");
@@ -73,7 +74,7 @@ class WorkspaceCommandApplicationServiceTest {
 
     @Test
     void shouldReturnReadableFailureWhenRuntimeIsUnavailable() {
-        // 这个测试函数的作用是验证 Runtime 连接失败会被转换成客户端可展示的失败响应。
+        // Runtime 不可用时，服务层要返回客户端可展示的失败信息，而不是抛出内部异常。
         when(eventCenterApplicationService.ingest(any())).thenReturn(new EventIngestResponse(
                 "ignored-by-service",
                 true,
@@ -89,5 +90,38 @@ class WorkspaceCommandApplicationServiceTest {
 
         assertThat(response.status()).isEqualTo("failed");
         assertThat(response.error()).contains("Connection refused");
+    }
+
+    @Test
+    void shouldLetRuntimeCreateDelegatedTasksFromWorkspaceCommand() throws Exception {
+        // 委托任务创建由 Runtime/LangGraph 决策；Java 侧只负责放行桌面命令和标记允许创建任务。
+        JsonNode runtimeBody = objectMapper.readTree("""
+                {
+                  "status": "success",
+                  "route": "auto_route",
+                  "summary": "Delegated task accepted",
+                  "final_reply": "",
+                  "results": []
+                }
+                """);
+        when(eventCenterApplicationService.ingest(any())).thenReturn(new EventIngestResponse(
+                "ignored-by-service",
+                true,
+                false,
+                new DispatchResult(true, 200, runtimeBody, null),
+                "accepted"
+        ));
+
+        service.execute(
+                "user-001",
+                new WorkspaceCommandRequest("帮我和km约一下明天下午的课程", "")
+        );
+
+        ArgumentCaptor<UnifiedEventPayload> eventCaptor = ArgumentCaptor.forClass(UnifiedEventPayload.class);
+        verify(eventCenterApplicationService).ingest(eventCaptor.capture());
+        UnifiedEventPayload event = eventCaptor.getValue();
+        assertThat(event.eventType()).isEqualTo("desktop_command");
+        assertThat(event.text()).isEqualTo("帮我和km约一下明天下午的课程");
+        assertThat(event.rawPayload().path("allowTaskCreation").asBoolean()).isTrue();
     }
 }

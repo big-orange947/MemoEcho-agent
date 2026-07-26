@@ -10,6 +10,7 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.text.Normalizer;
 import java.util.List;
 import java.util.Locale;
 
@@ -43,9 +44,9 @@ public class InternalQqContactController {
             @RequestHeader(name = "X-Memo-Echo-User-Id", defaultValue = "local-user") String userId,
             @RequestParam(required = false) String keyword
     ) {
-        userContextResolver.resolve(authorization, userId);
-        String normalizedKeyword = keyword == null ? "" : keyword.trim().toLowerCase(Locale.ROOT);
-        return ResponseEntity.ok(contactClient.listContacts().stream()
+        String resolvedUserId = userContextResolver.resolve(authorization, userId);
+        String normalizedKeyword = normalizeLookupText(keyword);
+        return ResponseEntity.ok(contactClient.listContacts(resolvedUserId).stream()
                 .filter(contact -> matchesKeyword(contact, normalizedKeyword))
                 .toList());
     }
@@ -57,8 +58,15 @@ public class InternalQqContactController {
         if (keyword.isBlank()) {
             return true;
         }
-        return contact.id().toLowerCase(Locale.ROOT).contains(keyword)
-                || contact.name().toLowerCase(Locale.ROOT).contains(keyword)
-                || contact.remark().toLowerCase(Locale.ROOT).contains(keyword);
+        return normalizeLookupText(contact.id()).contains(keyword)
+                || normalizeLookupText(contact.name()).contains(keyword)
+                || normalizeLookupText(contact.remark()).contains(keyword);
+    }
+
+    /** 将 QQ 兼容字符、大小写和首尾空白统一后再检索，原始联系人名称保持不变。 */
+    private String normalizeLookupText(String value) {
+        return Normalizer.normalize(value == null ? "" : value, Normalizer.Form.NFKC)
+                .trim()
+                .toLowerCase(Locale.ROOT);
     }
 }

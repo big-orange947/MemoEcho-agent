@@ -4,10 +4,13 @@ import com.memoecho.eventcenter.dto.ConversationMessageResponse;
 import com.memoecho.eventcenter.dto.ConversationOverviewResponse;
 import com.memoecho.eventcenter.dto.ConversationSummaryResponse;
 import com.memoecho.eventcenter.service.EventCenterApplicationService;
+import com.memoecho.eventcenter.service.LocalUserContextResolver;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
@@ -18,9 +21,14 @@ import java.util.List;
 public class InternalConversationController {
 
     private final EventCenterApplicationService applicationService;
+    private final ObjectProvider<LocalUserContextResolver> userContextResolverProvider;
 
-    public InternalConversationController(EventCenterApplicationService applicationService) {
+    public InternalConversationController(
+            EventCenterApplicationService applicationService,
+            ObjectProvider<LocalUserContextResolver> userContextResolverProvider
+    ) {
         this.applicationService = applicationService;
+        this.userContextResolverProvider = userContextResolverProvider;
     }
 
     @GetMapping("/overview")
@@ -52,9 +60,29 @@ public class InternalConversationController {
             @PathVariable String chatId,
             @RequestParam(required = false) String platform,
             @RequestParam(required = false) String chatType,
-            @RequestParam(defaultValue = "50") Integer limit
+            @RequestParam(defaultValue = "50") Integer limit,
+            @RequestParam(required = false) String before,
+            @RequestParam(required = false) String after,
+            @RequestHeader(name = "Authorization", required = false) String authorization,
+            @RequestHeader(name = "X-Memo-Echo-User-Id", defaultValue = "default") String userId,
+            @RequestHeader(name = "X-Memo-Echo-Runtime-Token", required = false) String runtimeToken
     ) {
         // 会话详情接口按 chatId 取消息，并允许额外带平台和类型做消歧。
-        return ResponseEntity.ok(applicationService.findConversationMessages(chatId, platform, chatType, limit));
+        LocalUserContextResolver userContextResolver = userContextResolverProvider.getIfAvailable();
+        if (userContextResolver == null) {
+            // WebMvcTest 等最小上下文不加载认证服务时，继续兼容旧的会话查询行为。
+            return ResponseEntity.ok(applicationService.findConversationMessages(
+                    chatId, platform, chatType, limit, before, after));
+        }
+        String resolvedUserId = authorization != null && !authorization.isBlank()
+                ? userContextResolver.resolve(authorization, userId)
+                : userContextResolver.resolveRuntimeUser(runtimeToken, userId);
+        try {
+            return ResponseEntity.ok(applicationService.findConversationMessages(
+                    resolvedUserId, chatId, platform, chatType, limit, before, after));
+        } catch (Exception exception) {
+            // 历史上下文是可选能力，数据库中存在旧记录异常时不能阻塞私聊主链路。
+            return ResponseEntity.ok(List.of());
+        }
     }
 }

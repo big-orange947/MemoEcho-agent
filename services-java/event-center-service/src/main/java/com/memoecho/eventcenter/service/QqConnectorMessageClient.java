@@ -59,6 +59,68 @@ public class QqConnectorMessageClient {
         }
     }
 
+    /** 获取指定好友会话中由当前登录 QQ 发出的历史消息。 */
+    public JsonNode fetchOwnPrivateHistory(String userId, int count) {
+        try {
+            return restClient.get()
+                    .uri(properties.getQqConnectorBaseUrl()
+                            + "/internal/napcat/friends/" + userId + "/history/own?count=" + count)
+                    .retrieve()
+                    .body(JsonNode.class);
+        } catch (RestClientException ex) {
+            throw new IllegalStateException("调用 QQ Connector 获取私聊历史失败：" + ex.getMessage(), ex);
+        }
+    }
+
+    /** 获取授权私聊的完整最近历史，用于本地上下文存档而不是风格训练。 */
+    public JsonNode fetchPrivateHistory(String userId, int count) {
+        try {
+            return restClient.get()
+                    .uri(properties.getQqConnectorBaseUrl()
+                            + "/internal/napcat/friends/" + userId + "/history?count=" + count)
+                    .retrieve()
+                    .body(JsonNode.class);
+        } catch (RestClientException ex) {
+            throw new IllegalStateException("调用 QQ Connector 获取私聊历史失败：" + ex.getMessage(), ex);
+        }
+    }
+
+    /** 启动 NapCat 二维码登录；WebUI 鉴权细节完全由 Connector 管理。 */
+    public JsonNode startQrLogin() {
+        return callQrLogin("/internal/napcat/qr-login/start", true);
+    }
+
+    /** 获取当前扫码状态，供桌面端轮询。 */
+    public JsonNode fetchQrLoginStatus() {
+        return callQrLogin("/internal/napcat/qr-login/status", false);
+    }
+
+    /** 刷新过期二维码。 */
+    public JsonNode refreshQrLogin() {
+        return callQrLogin("/internal/napcat/qr-login/refresh", true);
+    }
+
+    /**
+     * 统一代理二维码接口，避免 Controller 重复拼接 QQ Connector 地址和异常信息。
+     */
+    private JsonNode callQrLogin(String path, boolean post) {
+        try {
+            if (post) {
+                return restClient.post()
+                        .uri(properties.getQqConnectorBaseUrl() + path)
+                        .body(Map.of())
+                        .retrieve()
+                        .body(JsonNode.class);
+            }
+            return restClient.get()
+                    .uri(properties.getQqConnectorBaseUrl() + path)
+                    .retrieve()
+                    .body(JsonNode.class);
+        } catch (RestClientException exception) {
+            throw new IllegalStateException("调用 QQ Connector 扫码登录接口失败：" + exception.getMessage(), exception);
+        }
+    }
+
     private void applyMessageBody(Map<String, Object> request, UnifiedEventPayload event, String message) {
         // 这个函数的作用是还原群聊 @ 触发时的回复上下文；普通私聊或群聊仍然使用纯文本发送。
         boolean shouldMentionSender = "group".equalsIgnoreCase(event.chatType())

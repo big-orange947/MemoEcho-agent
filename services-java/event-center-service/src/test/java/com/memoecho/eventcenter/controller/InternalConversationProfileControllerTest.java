@@ -5,11 +5,13 @@ import com.memoecho.eventcenter.dto.ConversationProfileMatchRequest;
 import com.memoecho.eventcenter.dto.ConversationProfileMatchResponse;
 import com.memoecho.eventcenter.dto.ConversationProfileResponse;
 import com.memoecho.eventcenter.dto.ConversationProfileUpsertRequest;
+import com.memoecho.eventcenter.dto.ConversationProxyTaskStateResponse;
 import com.memoecho.eventcenter.dto.SkillDescriptorResponse;
 import com.memoecho.eventcenter.dto.SkillModelHintsResponse;
 import com.memoecho.eventcenter.dto.SkillPromptFragmentsResponse;
 import com.memoecho.eventcenter.dto.SkillToolPolicyResponse;
 import com.memoecho.eventcenter.service.ConversationProfileApplicationService;
+import com.memoecho.eventcenter.service.ConversationProxyTaskStateService;
 import com.memoecho.eventcenter.service.LocalUserContextResolver;
 import com.memoecho.eventcenter.service.SkillCatalogApplicationService;
 import org.junit.jupiter.api.Test;
@@ -50,6 +52,9 @@ class InternalConversationProfileControllerTest {
 
     @MockBean
     private LocalUserContextResolver userContextResolver;
+
+    @MockBean
+    private ConversationProxyTaskStateService taskStateService;
 
     @BeforeEach
     void setUpUserContext() {
@@ -205,6 +210,42 @@ class InternalConversationProfileControllerTest {
         verify(applicationService).updateProfile(eq("user-001"), eq("profile-001"), any(ConversationProfileUpsertRequest.class));
     }
 
+    @Test
+    void shouldListPendingTaskCompletions() throws Exception {
+        // 这个测试函数的作用是验证客户端可以读取等待用户确认的结束代理申请。
+        given(taskStateService.listPending("user-001")).willReturn(List.of(taskStateResponse("COMPLETION_REQUESTED")));
+
+        mockMvc.perform(get("/internal/conversation-profiles/task-completion/pending"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$[0].profileId").value("profile-001"))
+                .andExpect(jsonPath("$[0].chatId").value("2597164807"))
+                .andExpect(jsonPath("$[0].status").value("COMPLETION_REQUESTED"))
+                .andExpect(jsonPath("$[0].completionEvidence[0]").value("好的，明晚七点见"));
+
+        verify(taskStateService).listPending("user-001");
+    }
+
+    @Test
+    void shouldRejectTaskCompletionAndContinueProxying() throws Exception {
+        // 这个测试函数的作用是验证用户选择继续后，待审批任务会恢复 ACTIVE 而不是丢失进度。
+        given(taskStateService.decide("user-001", "profile-001", "2597164807", false))
+                .willReturn(taskStateResponse("ACTIVE"));
+
+        mockMvc.perform(post("/internal/conversation-profiles/profile-001/task-completion/decision")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {
+                                  "chatId": "2597164807",
+                                  "approved": false
+                                }
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("ACTIVE"))
+                .andExpect(jsonPath("$.completionSummary").value("老师已同意约定"));
+
+        verify(taskStateService).decide("user-001", "profile-001", "2597164807", false);
+    }
+
     private ConversationProfileResponse profileResponse() {
         // 这个函数的作用是统一构造一个带 skill、工具白名单和模型配置绑定的 profile 响应，供多个测试复用。
         return new ConversationProfileResponse(
@@ -254,6 +295,24 @@ class InternalConversationProfileControllerTest {
                 new SkillModelHintsResponse(0.4, 512),
                 true,
                 "agent-runtime-python/skills/personas/reliable-assistant"
+        );
+    }
+
+    private ConversationProxyTaskStateResponse taskStateResponse(String status) {
+        // 这个函数的作用是统一构造任务状态响应，供待审批列表和用户决定接口复用。
+        return new ConversationProxyTaskStateResponse(
+                "profile-001",
+                "约老师打游戏",
+                "qq",
+                "private",
+                "2597164807",
+                status,
+                "老师已同意约定",
+                "对方明确确认了时间",
+                List.of("好的，明晚七点见"),
+                Instant.parse("2026-07-21T04:00:00Z"),
+                null,
+                Instant.parse("2026-07-21T04:00:00Z")
         );
     }
 }

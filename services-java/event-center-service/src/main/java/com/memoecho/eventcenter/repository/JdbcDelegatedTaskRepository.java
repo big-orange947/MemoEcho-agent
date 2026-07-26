@@ -1,0 +1,154 @@
+package com.memoecho.eventcenter.repository;
+
+import com.memoecho.eventcenter.model.DelegatedTask;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.core.RowMapper;
+import org.springframework.stereotype.Repository;
+
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.sql.Timestamp;
+import java.util.List;
+import java.util.Optional;
+
+/** 使用参数化 SQL 保存委托任务，兼容 MySQL 与测试环境 H2。 */
+@Repository
+public class JdbcDelegatedTaskRepository {
+
+    private final JdbcTemplate jdbcTemplate;
+    private final RowMapper<DelegatedTask> rowMapper = new DelegatedTaskRowMapper();
+
+    /** 注入 JDBC 访问器。 */
+    public JdbcDelegatedTaskRepository(JdbcTemplate jdbcTemplate) {
+        this.jdbcTemplate = jdbcTemplate;
+    }
+
+    /** 新建任务；更新必须走明确的状态方法，避免误覆盖原始意图。 */
+    public DelegatedTask insert(DelegatedTask task) {
+        jdbcTemplate.update("""
+                        INSERT INTO delegated_task (
+                            id, user_id, task_type, status, original_command, target_query,
+                            platform, chat_type, chat_id, target_name, objective, success_criteria,
+                            deadline_text, confidence, clarification_question, requires_confirmation,
+                            execution_mode, progress_summary, state_json, last_event_id, started_at,
+                            completed_at, completion_report, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                task.id(), task.userId(), task.taskType(), task.status(), task.originalCommand(),
+                task.targetQuery(), task.platform(), task.chatType(), task.chatId(), task.targetName(),
+                task.objective(), task.successCriteria(), task.deadlineText(), task.confidence(),
+                task.clarificationQuestion(), task.requiresConfirmation(), task.executionMode(),
+                task.progressSummary(), task.stateJson(), task.lastEventId(), timestamp(task.startedAt()),
+                timestamp(task.completedAt()), task.completionReport(), Timestamp.from(task.createdAt()),
+                Timestamp.from(task.updatedAt()));
+        return task;
+    }
+
+    /** 按用户读取最近任务，防止跨账号查看任务。 */
+    public List<DelegatedTask> findRecentByUserId(String userId, int limit) {
+        int safeLimit = Math.min(Math.max(limit, 1), 100);
+        return jdbcTemplate.query("""
+                        SELECT * FROM delegated_task
+                        WHERE user_id = ?
+                        ORDER BY created_at DESC
+                        LIMIT ?
+                        """, rowMapper, userId, safeLimit);
+    }
+
+    /** 按任务 ID 和用户 ID 读取，作为确认、取消等写操作的所有权校验。 */
+    public Optional<DelegatedTask> findByIdAndUserId(String id, String userId) {
+        return jdbcTemplate.query(
+                "SELECT * FROM delegated_task WHERE id = ? AND user_id = ?",
+                rowMapper,
+                id,
+                userId
+        ).stream().findFirst();
+    }
+
+    /** 更新生命周期状态并返回最新对象。 */
+    public Optional<DelegatedTask> updateStatus(String id, String userId, String status, boolean requiresConfirmation) {
+        jdbcTemplate.update("""
+                UPDATE delegated_task
+                SET status = ?, requires_confirmation = ?, updated_at = ?
+                WHERE id = ? AND user_id = ?
+                """, status, requiresConfirmation, Timestamp.from(java.time.Instant.now()), id, userId);
+        return findByIdAndUserId(id, userId);
+    }
+
+    /**
+     * 为旧的待选联系人任务补写唯一匹配的真实会话。
+     * WHERE 中限制原状态，避免刷新页面覆盖已经被其他线程处理或取消的任务。
+     */
+    public Optional<DelegatedTask> bindWaitingTarget(String id, String userId, DelegatedTask resolved) {
+        java.time.Instant now = java.time.Instant.now();
+        jdbcTemplate.update("""
+                UPDATE delegated_task
+                SET status = 'ACTIVE', target_query = ?, platform = ?, chat_type = ?, chat_id = ?,
+                    target_name = ?, clarification_question = '', requires_confirmation = FALSE,
+                    progress_summary = ?, started_at = COALESCE(started_at, ?), updated_at = ?
+                WHERE id = ? AND user_id = ? AND status = 'WAITING_TARGET'
+                """, resolved.targetQuery(), resolved.platform(), resolved.chatType(), resolved.chatId(),
+                resolved.targetName(), "已重新识别联系人，任务已启动",
+                Timestamp.from(now), Timestamp.from(now), id, userId);
+        return findByIdAndUserId(id, userId);
+    }
+
+    /** 查询某个会话唯一的活动委托，重启后 Runtime 通过它恢复稳定任务 ID 和图状态。 */
+    public Optional<DelegatedTask> findActiveByConversation(
+            String userId, String platform, String chatType, String chatId
+    ) {
+        return jdbcTemplate.query("""
+                SELECT * FROM delegated_task
+                WHERE user_id = ? AND platform = ? AND chat_type = ? AND chat_id = ? AND status = 'ACTIVE'
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """, rowMapper, userId, platform, chatType, chatId).stream().findFirst();
+    }
+
+    /** 幂等更新 LangGraph 运行态；完成时间只在进入终态时写入。 */
+    public Optional<DelegatedTask> updateRuntimeState(
+            String id, String userId, String status, String progressSummary, String stateJson,
+            String lastEventId, String completionReport
+    ) {
+        java.time.Instant now = java.time.Instant.now();
+        boolean terminal = "COMPLETED".equals(status) || "FAILED".equals(status) || "CANCELLED".equals(status);
+        jdbcTemplate.update("""
+                UPDATE delegated_task
+                SET status = ?, progress_summary = ?, state_json = ?, last_event_id = ?,
+                    completion_report = ?, started_at = COALESCE(started_at, ?),
+                    completed_at = CASE WHEN ? THEN COALESCE(completed_at, ?) ELSE completed_at END,
+                    requires_confirmation = FALSE, updated_at = ?
+                WHERE id = ? AND user_id = ?
+                """, status, progressSummary, stateJson, lastEventId, completionReport,
+                Timestamp.from(now), terminal, Timestamp.from(now), Timestamp.from(now), id, userId);
+        return findByIdAndUserId(id, userId);
+    }
+
+    /** 将数据库行恢复成领域对象。 */
+    private static final class DelegatedTaskRowMapper implements RowMapper<DelegatedTask> {
+        @Override
+        public DelegatedTask mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new DelegatedTask(
+                    rs.getString("id"), rs.getString("user_id"), rs.getString("task_type"),
+                    rs.getString("status"), rs.getString("original_command"), rs.getString("target_query"),
+                    rs.getString("platform"), rs.getString("chat_type"), rs.getString("chat_id"),
+                    rs.getString("target_name"), rs.getString("objective"), rs.getString("success_criteria"),
+                    rs.getString("deadline_text"), rs.getDouble("confidence"),
+                    rs.getString("clarification_question"), rs.getBoolean("requires_confirmation"),
+                    rs.getString("execution_mode"), rs.getString("progress_summary"),
+                    rs.getString("state_json"), rs.getString("last_event_id"),
+                    instant(rs.getTimestamp("started_at")), instant(rs.getTimestamp("completed_at")),
+                    rs.getString("completion_report"),
+                    rs.getTimestamp("created_at").toInstant(), rs.getTimestamp("updated_at").toInstant()
+            );
+        }
+    }
+
+    private static Timestamp timestamp(java.time.Instant value) {
+        return value == null ? null : Timestamp.from(value);
+    }
+
+    private static java.time.Instant instant(Timestamp value) {
+        return value == null ? null : value.toInstant();
+    }
+}

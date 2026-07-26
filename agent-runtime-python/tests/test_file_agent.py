@@ -6,6 +6,7 @@ from app.agents.file_agent import FileAgent
 from app.schemas.events import Attachment, Sender, UnifiedEvent
 from app.schemas.tasks import AgentTaskContext
 from app.tools.registry import ToolRegistry
+from tool_test_utils import register_test_tool
 
 
 class DummyExtractFileTextTool:
@@ -28,7 +29,7 @@ class FileAgentTest(unittest.IsolatedAsyncioTestCase):
     async def test_should_extract_attachment_metadata_via_tool(self) -> None:
         registry = ToolRegistry()
         tool = DummyExtractFileTextTool()
-        registry.register("extract_file_text", tool)
+        register_test_tool(registry, "extract_file_text", tool)
         agent = FileAgent(registry)
 
         event = UnifiedEvent(

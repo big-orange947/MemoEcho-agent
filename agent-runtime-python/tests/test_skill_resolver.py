@@ -97,6 +97,37 @@ class SkillResolverTest(unittest.TestCase):
         self.assertEqual(resolved_skills, [])
         self.assertEqual(unresolved, ["github://demo/repo/skills/reliable-assistant@main"])
 
+    def test_should_resolve_installed_github_skill_from_repository_root(self) -> None:
+        # 这个测试函数的作用是验证标准 Agent Skills 仓库根目录安装后，可通过不带子路径的规范引用加载。
+        install_dir = self.installed_root / "github" / "demo-owner" / "root-skill" / "main" / "root"
+        install_dir.mkdir(parents=True, exist_ok=True)
+        (install_dir / "skill.json").write_text(
+            json.dumps(
+                {
+                    "id": "github.demo.root_skill",
+                    "name": "仓库根目录 Skill",
+                    "version": "1.0.0",
+                    "type": "prompt",
+                    "source": "github",
+                    "applicableRoutes": ["social_reply"],
+                    "promptFragments": {"system": "只使用已知信息回复。"},
+                    "toolPolicy": {"allow": []},
+                    "modelHints": {},
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        resolved_skills, unresolved = self.resolver.resolve_references(
+            ["github://demo-owner/root-skill@main"],
+            route="social_reply",
+        )
+
+        self.assertEqual(unresolved, [])
+        self.assertEqual(len(resolved_skills), 1)
+        self.assertEqual(resolved_skills[0].name, "仓库根目录 Skill")
+
 
 if __name__ == "__main__":
     unittest.main()

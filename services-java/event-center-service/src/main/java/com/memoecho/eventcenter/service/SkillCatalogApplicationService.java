@@ -20,6 +20,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.web.server.ResponseStatusException;
 
 import java.io.IOException;
+import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
@@ -33,6 +34,8 @@ import java.util.stream.Stream;
 
 @Service
 public class SkillCatalogApplicationService {
+
+    private static final int MAX_SKILL_MARKDOWN_CHARS = 80_000;
 
     private static final List<String> SUPPORTED_PLATFORMS = List.of("qq", "wechat", "telegram", "discord");
     private static final List<String> SUPPORTED_SCENES = List.of("life", "work");
@@ -106,11 +109,26 @@ public class SkillCatalogApplicationService {
     }
 
     public SkillInstallResponse installGithubSkill(GithubSkillInstallRequest request) {
-        // 这个函数的作用是把 github:// 风格的 skill 引用下载到本地缓存目录，并写成 runtime 可直接解析的 skill.json。
+        // 这个函数的作用是优先安装 Memo Echo skill.json；不存在时把通用 SKILL.md 转换为 Runtime 可解析的本地描述符。
         GithubSkillReference reference = parseGithubReference(request.reference(), request.gitRef());
-        String rawDescriptor = downloader.downloadSkillDescriptor(reference);
-        JsonNode descriptorNode = parseJson(rawDescriptor);
-        ObjectNode normalizedDescriptor = normalizeDescriptor(descriptorNode, reference);
+        ObjectNode normalizedDescriptor;
+        String sourceFormat = "skill.json";
+        try {
+            String rawDescriptor = downloader.downloadSkillDescriptor(reference);
+            JsonNode descriptorNode = parseJson(rawDescriptor);
+            normalizedDescriptor = normalizeDescriptor(descriptorNode, reference);
+        } catch (ResponseStatusException descriptorError) {
+            String skillMarkdown = downloader.downloadSkillMarkdown(reference);
+            if (skillMarkdown == null || skillMarkdown.isBlank()) {
+                throw new ResponseStatusException(
+                        HttpStatus.BAD_REQUEST,
+                        "仓库中未找到可解析的 skill.json 或 SKILL.md",
+                        descriptorError
+                );
+            }
+            normalizedDescriptor = normalizeSkillMarkdown(skillMarkdown, reference);
+            sourceFormat = "SKILL.md";
+        }
 
         Path installDirectory = resolveInstalledRoot().resolve(reference.installSubdirectory()).normalize();
         try {
@@ -121,7 +139,7 @@ public class SkillCatalogApplicationService {
             );
             Files.writeString(
                     installDirectory.resolve("origin.json"),
-                    objectMapper.writerWithDefaultPrettyPrinter().writeValueAsString(buildOriginMetadata(reference))
+                    objectMapper.writerWithDefaultPrettyPrinter().writeValueAsString(buildOriginMetadata(reference, sourceFormat))
             );
         } catch (IOException ex) {
             throw new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR, "写入已安装 skill 缓存失败", ex);
@@ -129,15 +147,15 @@ public class SkillCatalogApplicationService {
 
         SkillDescriptorResponse descriptorResponse = toSkillDescriptorResponse(
                 normalizedDescriptor,
-                request.reference().trim(),
+                reference.runtimeReference(),
                 "github",
                 true,
                 installDirectory.toString()
         );
         return new SkillInstallResponse(
                 "installed",
-                request.reference().trim(),
-                request.reference().trim(),
+                reference.runtimeReference(),
+                reference.runtimeReference(),
                 "github",
                 installDirectory.toString(),
                 descriptorResponse
@@ -178,8 +196,9 @@ public class SkillCatalogApplicationService {
         // 这个函数的作用是读取单个 skill.json，并补齐前端展示需要的 reference、来源和目录位置信息。
         try {
             JsonNode node = objectMapper.readTree(Files.readString(descriptorPath));
-            String reference = detectReference(node, descriptorPath, root, sourceType);
-            return toSkillDescriptorResponse(node, reference, sourceType, installed, descriptorPath.getParent().toString());
+            String effectiveSourceType = readText(node, "source").isBlank() ? sourceType : readText(node, "source");
+            String reference = detectReference(node, descriptorPath, root, effectiveSourceType);
+            return toSkillDescriptorResponse(node, reference, effectiveSourceType, installed, descriptorPath.getParent().toString());
         } catch (IOException ex) {
             throw new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR, "读取 skill 描述文件失败", ex);
         }
@@ -205,10 +224,12 @@ public class SkillCatalogApplicationService {
         if (descriptorPath == null || !Files.exists(descriptorPath)) {
             return null;
         }
+        Path installedRoot = resolveInstalledRoot();
+        boolean installedSkill = descriptorPath.startsWith(installedRoot);
         SkillDescriptorResponse descriptor = readDescriptor(
                 descriptorPath,
-                rawReference.startsWith("github://") ? resolveInstalledRoot() : resolveBuiltinRoot(),
-                rawReference.startsWith("github://") ? "github" : "builtin",
+                installedSkill ? installedRoot : resolveBuiltinRoot(),
+                rawReference.startsWith("github://") ? "github" : (installedSkill ? "installed" : "builtin"),
                 true
         );
         if (!route.isBlank() && !descriptor.applicableRoutes().isEmpty() && descriptor.applicableRoutes().stream().noneMatch(route::equalsIgnoreCase)) {
@@ -236,28 +257,41 @@ public class SkillCatalogApplicationService {
             normalized = normalized.substring("skills/".length());
         }
 
-        Path base = resolveBuiltinRoot().resolve(normalized).normalize();
-        if (base.toString().endsWith(".json")) {
-            return base;
+        Path builtinCandidate = descriptorCandidate(resolveBuiltinRoot(), normalized);
+        if (Files.exists(builtinCandidate)) {
+            return builtinCandidate;
         }
-        return base.resolve("skill.json");
+        Path installedCandidate = descriptorCandidate(resolveInstalledRoot(), normalized);
+        return Files.exists(installedCandidate) ? installedCandidate : builtinCandidate;
+    }
+
+    /**
+     * 把相对 Skill 引用转换成描述文件候选路径，统一兼容目录引用和直接 JSON 文件引用。
+     */
+    private Path descriptorCandidate(Path root, String normalizedReference) {
+        Path base = root.resolve(normalizedReference).normalize();
+        return base.toString().endsWith(".json") ? base : base.resolve("skill.json");
     }
 
     private GithubSkillReference parseGithubReference(String rawReference, String explicitGitRef) {
-        // 这个函数的作用是解析 github://owner/repo/path 或 github://owner/repo@ref/path 这两种常用写法，统一生成下载和安装所需的结构化引用。
+        // 这个函数的作用是统一解析 github:// 引用和浏览器复制的 GitHub 仓库/tree/blob URL。
         String reference = normalizeText(rawReference);
+        if (reference.startsWith("https://github.com/") || reference.startsWith("http://github.com/")) {
+            return parseGithubWebUrl(reference, explicitGitRef);
+        }
         if (!reference.startsWith("github://")) {
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "只支持 github:// 开头的 skill 引用");
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "请输入 GitHub 仓库 URL 或 github://owner/repo/path 引用");
         }
         String withoutScheme = reference.substring("github://".length());
         String[] segments = withoutScheme.split("/", 4);
-        if (segments.length < 3) {
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "GitHub skill 引用格式不正确，应为 github://owner/repo/path");
+        if (segments.length < 2) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "GitHub skill 引用格式不正确，应为 github://owner/repo[/path]");
         }
 
         String owner = segments[0].trim();
         String repositoryWithRef = segments[1].trim();
-        String path = segments.length == 3 ? segments[2].trim() : (segments[2] + "/" + segments[3]).trim();
+        String path = segments.length < 3 ? "" : (segments.length == 3 ? segments[2].trim() : (segments[2] + "/" + segments[3]).trim());
+        path = stripSkillFileName(path);
 
         String repository = repositoryWithRef;
         String gitRef = normalizeText(explicitGitRef);
@@ -268,8 +302,8 @@ public class SkillCatalogApplicationService {
                 gitRef = repositoryWithRef.substring(refSeparatorIndex + 1).trim();
             }
         }
-        if (owner.isBlank() || repository.isBlank() || path.isBlank()) {
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "GitHub skill 引用缺少 owner、repo 或 path");
+        if (owner.isBlank() || repository.isBlank()) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "GitHub skill 引用缺少 owner 或 repo");
         }
         if (gitRef.isBlank()) {
             gitRef = normalizeText(properties.getGithubDefaultRef());
@@ -282,6 +316,130 @@ public class SkillCatalogApplicationService {
                 gitRef,
                 path.replace('\\', '/')
         );
+    }
+
+    private GithubSkillReference parseGithubWebUrl(String rawReference, String explicitGitRef) {
+        // 这个函数的作用是把 https://github.com/owner/repo、tree 和 blob URL 转换成统一的安装引用。
+        try {
+            URI uri = URI.create(rawReference);
+            String[] segments = uri.getPath().replaceFirst("^/", "").split("/");
+            if (segments.length < 2) {
+                throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "GitHub 仓库 URL 缺少 owner 或 repo");
+            }
+            String owner = segments[0].trim();
+            String repository = segments[1].replaceFirst("\\.git$", "").trim();
+            String gitRef = normalizeText(explicitGitRef);
+            String path = "";
+            if (segments.length >= 4 && ("tree".equals(segments[2]) || "blob".equals(segments[2]))) {
+                if (gitRef.isBlank()) {
+                    gitRef = segments[3].trim();
+                }
+                if (segments.length > 4) {
+                    path = String.join("/", java.util.Arrays.copyOfRange(segments, 4, segments.length));
+                }
+            }
+            if (gitRef.isBlank()) {
+                gitRef = normalizeText(properties.getGithubDefaultRef());
+            }
+            return new GithubSkillReference(rawReference, owner, repository, gitRef, stripSkillFileName(path));
+        } catch (IllegalArgumentException ex) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "GitHub 仓库 URL 格式不正确", ex);
+        }
+    }
+
+    private String stripSkillFileName(String path) {
+        // 这个函数把指向 skill.json 或 SKILL.md 文件本身的 URL 归一化为 Skill 所在目录。
+        String normalized = normalizeText(path).replace('\\', '/').replaceAll("^/+|/+$", "");
+        if (normalized.equalsIgnoreCase("skill.json") || normalized.equalsIgnoreCase("SKILL.md")) {
+            return "";
+        }
+        if (normalized.toLowerCase(Locale.ROOT).endsWith("/skill.json")) {
+            return normalized.substring(0, normalized.length() - "/skill.json".length());
+        }
+        if (normalized.toLowerCase(Locale.ROOT).endsWith("/skill.md")) {
+            return normalized.substring(0, normalized.length() - "/skill.md".length());
+        }
+        return normalized;
+    }
+
+    private ObjectNode normalizeSkillMarkdown(String markdown, GithubSkillReference reference) {
+        // 这个函数的作用是把 Agent Skills 的 YAML frontmatter + Markdown 正文转换成只读 Prompt Skill。
+        String normalized = markdown == null ? "" : markdown.replace("\r\n", "\n").trim();
+        if (normalized.isBlank()) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "SKILL.md 内容为空");
+        }
+        if (normalized.length() > MAX_SKILL_MARKDOWN_CHARS) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "SKILL.md 过大，最大允许 80000 个字符");
+        }
+
+        String name = reference.repository();
+        String description = "从通用 Agent Skills SKILL.md 导入";
+        String body = normalized;
+        if (normalized.startsWith("---\n")) {
+            int closing = normalized.indexOf("\n---\n", 4);
+            if (closing > 0) {
+                String frontmatter = normalized.substring(4, closing);
+                String[] frontmatterLines = frontmatter.split("\n");
+                for (int index = 0; index < frontmatterLines.length; index++) {
+                    String line = frontmatterLines[index];
+                    int separator = line.indexOf(':');
+                    if (separator <= 0) {
+                        continue;
+                    }
+                    String key = line.substring(0, separator).trim();
+                    String value = stripYamlScalar(line.substring(separator + 1));
+                    if ("description".equalsIgnoreCase(key) && ("|".equals(value) || ">".equals(value))) {
+                        StringBuilder multilineDescription = new StringBuilder();
+                        while (index + 1 < frontmatterLines.length) {
+                            String nextLine = frontmatterLines[index + 1];
+                            if (!nextLine.isBlank() && !Character.isWhitespace(nextLine.charAt(0))) {
+                                break;
+                            }
+                            index++;
+                            String fragment = nextLine.trim();
+                            if (!fragment.isBlank()) {
+                                if (!multilineDescription.isEmpty()) {
+                                    multilineDescription.append(' ');
+                                }
+                                multilineDescription.append(fragment);
+                            }
+                        }
+                        value = multilineDescription.toString();
+                    }
+                    if ("name".equalsIgnoreCase(key) && !value.isBlank()) {
+                        name = value;
+                    } else if ("description".equalsIgnoreCase(key) && !value.isBlank()) {
+                        description = value;
+                    }
+                }
+                body = normalized.substring(closing + 5).trim();
+            }
+        }
+        if (body.isBlank()) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "SKILL.md 没有可执行的正文内容");
+        }
+
+        ObjectNode descriptor = objectMapper.createObjectNode();
+        descriptor.put("id", buildFallbackId(reference));
+        descriptor.put("name", name);
+        descriptor.put("description", description);
+        descriptor.put("version", "1.0.0");
+        descriptor.put("type", "prompt");
+        descriptor.putArray("applicableRoutes").add("social_reply");
+        descriptor.putObject("promptFragments").put("system", body);
+        descriptor.putObject("toolPolicy").putArray("allow");
+        descriptor.putObject("modelHints");
+        descriptor.put("importFormat", "agent-skills-markdown");
+        return normalizeDescriptor(descriptor, reference);
+    }
+
+    private String stripYamlScalar(String value) {
+        // 这个函数只读取安全的一行 YAML 标量，不尝试执行标签、引用或复杂 YAML 结构。
+        String normalized = normalizeText(value);
+        if (normalized.length() >= 2 && ((normalized.startsWith("\"") && normalized.endsWith("\"")) || (normalized.startsWith("'") && normalized.endsWith("'")))) {
+            return normalized.substring(1, normalized.length() - 1).trim();
+        }
+        return normalized;
     }
 
     private ObjectNode normalizeDescriptor(JsonNode sourceNode, GithubSkillReference reference) {
@@ -306,7 +464,7 @@ public class SkillCatalogApplicationService {
             descriptor.put("description", "");
         }
         descriptor.put("source", "github");
-        descriptor.put("rawReference", reference.originalReference());
+        descriptor.put("rawReference", reference.runtimeReference());
         if (!descriptor.has("applicableRoutes")) {
             descriptor.putArray("applicableRoutes");
         }
@@ -330,15 +488,17 @@ public class SkillCatalogApplicationService {
         return descriptor;
     }
 
-    private ObjectNode buildOriginMetadata(GithubSkillReference reference) {
+    private ObjectNode buildOriginMetadata(GithubSkillReference reference, String sourceFormat) {
         // 这个函数的作用是把安装来源记录到 origin.json，便于后续前端展示、排障和升级已安装 skill。
         ObjectNode node = objectMapper.createObjectNode();
         node.put("reference", reference.originalReference());
+        node.put("runtimeReference", reference.runtimeReference());
         node.put("owner", reference.owner());
         node.put("repository", reference.repository());
         node.put("gitRef", reference.gitRef());
         node.put("path", reference.path());
         node.put("rawDescriptorUrl", reference.rawDescriptorUrl());
+        node.put("sourceFormat", sourceFormat);
         node.put("installedAt", Instant.now().toString());
         return node;
     }
@@ -382,12 +542,39 @@ public class SkillCatalogApplicationService {
 
     private Path resolveBuiltinRoot() {
         // 这个函数的作用是统一解析内置 skill 根目录，避免后续多个方法重复处理相对路径。
-        return Path.of(properties.getBuiltinRoot()).toAbsolutePath().normalize();
+        return resolveSkillRoot(properties.getBuiltinRoot(), "skills");
     }
 
     private Path resolveInstalledRoot() {
         // 这个函数的作用是统一解析已安装 skill 缓存目录，并保证目录不存在时也能被后续安装流程创建。
-        return Path.of(properties.getInstalledRoot()).toAbsolutePath().normalize();
+        return resolveSkillRoot(properties.getInstalledRoot(), "skills-installed");
+    }
+
+    private Path resolveSkillRoot(String configuredRoot, String folderName) {
+        // 绝对路径完全尊重用户配置；默认相对路径则优先锚定到实际仓库根目录。
+        Path configuredPath = Path.of(configuredRoot);
+        if (configuredPath.isAbsolute()) {
+            return configuredPath.normalize();
+        }
+        Path repositoryRoot = findRepositoryRoot(Path.of("").toAbsolutePath().normalize());
+        String normalizedConfig = configuredRoot.replace('\\', '/');
+        if (repositoryRoot != null && normalizedConfig.contains("agent-runtime-python")) {
+            return repositoryRoot.resolve("agent-runtime-python").resolve(folderName).normalize();
+        }
+        return configuredPath.toAbsolutePath().normalize();
+    }
+
+    private Path findRepositoryRoot(Path startDirectory) {
+        // 从当前工作目录逐级向上查找同时包含 Java 服务与 Python Runtime 的仓库根目录。
+        Path current = startDirectory;
+        while (current != null) {
+            if (Files.isDirectory(current.resolve("services-java"))
+                    && Files.isDirectory(current.resolve("agent-runtime-python"))) {
+                return current;
+            }
+            current = current.getParent();
+        }
+        return null;
     }
 
     private List<String> normalizeList(List<String> values) {

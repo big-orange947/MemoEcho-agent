@@ -2,21 +2,32 @@ package com.memoecho.eventcenter.controller;
 
 import com.memoecho.eventcenter.dto.WorkspaceCommandRequest;
 import com.memoecho.eventcenter.dto.WorkspaceCommandResponse;
+import com.memoecho.eventcenter.dto.ConversationSummaryResponse;
+import com.memoecho.eventcenter.dto.DelegatedTaskResponse;
+import com.memoecho.eventcenter.dto.DelegatedTaskRuntimeCreateRequest;
+import com.memoecho.eventcenter.dto.DelegatedTaskRuntimeUpdateRequest;
+import com.memoecho.eventcenter.service.DelegatedTaskApplicationService;
 import com.memoecho.eventcenter.service.LocalUserContextResolver;
 import com.memoecho.eventcenter.service.WorkspaceCommandApplicationService;
 import jakarta.validation.Valid;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
+
+import java.util.List;
 
 @RestController
 @RequestMapping("/internal/workspace/commands")
 public class InternalWorkspaceCommandController {
 
     private final WorkspaceCommandApplicationService applicationService;
+    private final DelegatedTaskApplicationService delegatedTaskApplicationService;
     private final LocalUserContextResolver userContextResolver;
 
     /**
@@ -24,9 +35,11 @@ public class InternalWorkspaceCommandController {
      */
     public InternalWorkspaceCommandController(
             WorkspaceCommandApplicationService applicationService,
+            DelegatedTaskApplicationService delegatedTaskApplicationService,
             LocalUserContextResolver userContextResolver
     ) {
         this.applicationService = applicationService;
+        this.delegatedTaskApplicationService = delegatedTaskApplicationService;
         this.userContextResolver = userContextResolver;
     }
 
@@ -41,5 +54,131 @@ public class InternalWorkspaceCommandController {
     ) {
         String resolvedUserId = userContextResolver.resolve(authorization, userId);
         return ResponseEntity.ok(applicationService.execute(resolvedUserId, request));
+    }
+
+    /** 查询当前用户最近创建的委托任务，供客户端恢复任务状态。 */
+    @GetMapping("/delegated")
+    public ResponseEntity<List<DelegatedTaskResponse>> listDelegatedTasks(
+            @RequestHeader(name = "Authorization", required = false) String authorization,
+            @RequestHeader(name = "X-Memo-Echo-User-Id", defaultValue = "local-user") String userId,
+            @RequestParam(defaultValue = "20") int limit
+    ) {
+        String resolvedUserId = userContextResolver.resolve(authorization, userId);
+        return ResponseEntity.ok(delegatedTaskApplicationService.list(resolvedUserId, limit));
+    }
+
+    /** Python Runtime 按会话恢复活动委托；服务令牌和用户归属必须同时通过校验。 */
+    /** 读取当前用户拥有的单个委托任务详情。 */
+    @GetMapping("/delegated/{taskId}")
+    public ResponseEntity<DelegatedTaskResponse> getDelegatedTask(
+            @RequestHeader(name = "Authorization", required = false) String authorization,
+            @RequestHeader(name = "X-Memo-Echo-User-Id", defaultValue = "local-user") String userId,
+            @PathVariable String taskId
+    ) {
+        String resolvedUserId = userContextResolver.resolve(authorization, userId);
+        return ResponseEntity.ok(delegatedTaskApplicationService.get(resolvedUserId, taskId));
+    }
+
+    @GetMapping("/delegated/active")
+    public ResponseEntity<DelegatedTaskResponse> findActiveDelegatedTask(
+            @RequestHeader("X-Memo-Echo-Runtime-Token") String runtimeToken,
+            @RequestHeader("X-Memo-Echo-User-Id") String userId,
+            @RequestParam String platform,
+            @RequestParam String chatType,
+            @RequestParam String chatId
+    ) {
+        String resolvedUserId = userContextResolver.resolveRuntimeUser(runtimeToken, userId);
+        return delegatedTaskApplicationService.findActive(resolvedUserId, platform, chatType, chatId)
+                .map(ResponseEntity::ok)
+                .orElseGet(() -> ResponseEntity.notFound().build());
+    }
+
+    /** Python Runtime 提交 LangGraph 进度或终态，客户端不能通过该接口伪造执行结果。 */
+    @PostMapping("/delegated/{taskId}/runtime")
+    public ResponseEntity<DelegatedTaskResponse> updateDelegatedTaskRuntime(
+            @RequestHeader("X-Memo-Echo-Runtime-Token") String runtimeToken,
+            @RequestHeader("X-Memo-Echo-User-Id") String userId,
+            @PathVariable String taskId,
+            @RequestBody DelegatedTaskRuntimeUpdateRequest request
+    ) {
+        String resolvedUserId = userContextResolver.resolveRuntimeUser(runtimeToken, userId);
+        return ResponseEntity.ok(delegatedTaskApplicationService.updateRuntime(resolvedUserId, taskId, request));
+    }
+
+    /** Runtime 编译主控台命令前读取联系人白名单，客户端不能绕过该接口直接给模型任意联系人。 */
+    @GetMapping("/delegated/candidates")
+    public ResponseEntity<List<ConversationSummaryResponse>> listDelegatedTaskCandidates(
+            @RequestHeader("X-Memo-Echo-Runtime-Token") String runtimeToken,
+            @RequestHeader("X-Memo-Echo-User-Id") String userId
+    ) {
+        String resolvedUserId = userContextResolver.resolveRuntimeUser(runtimeToken, userId);
+        return ResponseEntity.ok(delegatedTaskApplicationService.listAuthorizedConversationCandidates(resolvedUserId));
+    }
+
+    /** Runtime 提交 LangGraph 编译后的任务，Java 负责白名单校验、状态初始化和持久化。 */
+    @PostMapping("/delegated/runtime-create")
+    public ResponseEntity<DelegatedTaskResponse> createDelegatedTaskFromRuntime(
+            @RequestHeader("X-Memo-Echo-Runtime-Token") String runtimeToken,
+            @RequestHeader("X-Memo-Echo-User-Id") String userId,
+            @Valid @RequestBody DelegatedTaskRuntimeCreateRequest request
+    ) {
+        String resolvedUserId = userContextResolver.resolveRuntimeUser(runtimeToken, userId);
+        return ResponseEntity.ok(delegatedTaskApplicationService.createCompiled(
+                resolvedUserId, request.command(), request.compilation()));
+    }
+
+    /** 用户确认任务后仅进入待执行队列，不在 HTTP 请求中直接发送外部消息。 */
+    @PostMapping("/delegated/{taskId}/confirm")
+    public ResponseEntity<DelegatedTaskResponse> confirmDelegatedTask(
+            @RequestHeader(name = "Authorization", required = false) String authorization,
+            @RequestHeader(name = "X-Memo-Echo-User-Id", defaultValue = "local-user") String userId,
+            @PathVariable String taskId
+    ) {
+        String resolvedUserId = userContextResolver.resolve(authorization, userId);
+        return ResponseEntity.ok(delegatedTaskApplicationService.confirm(resolvedUserId, taskId));
+    }
+
+    /** 取消尚未完成的委托任务。 */
+    @PostMapping("/delegated/{taskId}/cancel")
+    public ResponseEntity<DelegatedTaskResponse> cancelDelegatedTask(
+            @RequestHeader(name = "Authorization", required = false) String authorization,
+            @RequestHeader(name = "X-Memo-Echo-User-Id", defaultValue = "local-user") String userId,
+            @PathVariable String taskId
+    ) {
+        String resolvedUserId = userContextResolver.resolve(authorization, userId);
+        return ResponseEntity.ok(delegatedTaskApplicationService.cancel(resolvedUserId, taskId));
+    }
+
+    /** 暂停正在执行的委托，暂停期间 Runtime 不会再按会话恢复该任务。 */
+    @PostMapping("/delegated/{taskId}/pause")
+    public ResponseEntity<DelegatedTaskResponse> pauseDelegatedTask(
+            @RequestHeader(name = "Authorization", required = false) String authorization,
+            @RequestHeader(name = "X-Memo-Echo-User-Id", defaultValue = "local-user") String userId,
+            @PathVariable String taskId
+    ) {
+        String resolvedUserId = userContextResolver.resolve(authorization, userId);
+        return ResponseEntity.ok(delegatedTaskApplicationService.pause(resolvedUserId, taskId));
+    }
+
+    /** 继续已暂停的委托，并复用暂停前保存的 LangGraph 状态。 */
+    @PostMapping("/delegated/{taskId}/resume")
+    public ResponseEntity<DelegatedTaskResponse> resumeDelegatedTask(
+            @RequestHeader(name = "Authorization", required = false) String authorization,
+            @RequestHeader(name = "X-Memo-Echo-User-Id", defaultValue = "local-user") String userId,
+            @PathVariable String taskId
+    ) {
+        String resolvedUserId = userContextResolver.resolve(authorization, userId);
+        return ResponseEntity.ok(delegatedTaskApplicationService.resume(resolvedUserId, taskId));
+    }
+
+    /** 用户主动结束委托并阻止后续消息继续触发代理。 */
+    @PostMapping("/delegated/{taskId}/complete")
+    public ResponseEntity<DelegatedTaskResponse> completeDelegatedTask(
+            @RequestHeader(name = "Authorization", required = false) String authorization,
+            @RequestHeader(name = "X-Memo-Echo-User-Id", defaultValue = "local-user") String userId,
+            @PathVariable String taskId
+    ) {
+        String resolvedUserId = userContextResolver.resolve(authorization, userId);
+        return ResponseEntity.ok(delegatedTaskApplicationService.complete(resolvedUserId, taskId));
     }
 }

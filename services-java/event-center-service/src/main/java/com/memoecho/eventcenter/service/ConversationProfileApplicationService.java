@@ -5,8 +5,12 @@ import com.memoecho.eventcenter.dto.ConversationProfileMatchResponse;
 import com.memoecho.eventcenter.dto.ConversationProfileResponse;
 import com.memoecho.eventcenter.dto.ConversationProfileUpsertRequest;
 import com.memoecho.eventcenter.model.ConversationProfile;
+import com.memoecho.eventcenter.model.ConversationProfileContext;
 import com.memoecho.eventcenter.repository.ConversationProfileRepository;
 import org.springframework.http.HttpStatus;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 import org.springframework.web.server.ResponseStatusException;
 
@@ -20,6 +24,8 @@ import java.util.UUID;
 @Service
 public class ConversationProfileApplicationService {
 
+    private static final Logger log = LoggerFactory.getLogger(ConversationProfileApplicationService.class);
+
     private static final String DEFAULT_USER = "default";
 
     private static final String TRIGGER_ALWAYS = "ALWAYS";
@@ -31,10 +37,26 @@ public class ConversationProfileApplicationService {
     private static final String NOTIFICATION_AUTO = "AUTO";
 
     private final ConversationProfileRepository repository;
+    private ConversationHistoryTrainingService historyTrainingService;
+    private ConversationProxyTaskStateService taskStateService;
 
     public ConversationProfileApplicationService(ConversationProfileRepository repository) {
         // 这个构造函数的作用是注入设定集仓储，统一管理设定集的增删改查和命中逻辑。
         this.repository = repository;
+    }
+
+    /**
+     * 仅在完整应用上下文中注入历史同步服务；纯设定集单元测试无需启动 QQ Connector。
+     */
+    @Autowired(required = false)
+    public void setHistoryTrainingService(ConversationHistoryTrainingService historyTrainingService) {
+        this.historyTrainingService = historyTrainingService;
+    }
+
+    /** 完整应用中注入任务状态服务；纯内存单元测试继续兼容无数据库状态模式。 */
+    @Autowired(required = false)
+    public void setTaskStateService(ConversationProxyTaskStateService taskStateService) {
+        this.taskStateService = taskStateService;
     }
 
     /**
@@ -110,9 +132,21 @@ public class ConversationProfileApplicationService {
                 normalizeKeywordList(request.notificationKeywords()),
                 normalizeDigestWindowSeconds(request.digestWindowSeconds()),
                 normalizeDigestMaxMessages(request.digestMaxMessages()),
-                request.includeUrgentInDigest() != null && request.includeUrgentInDigest()
+                request.includeUrgentInDigest() != null && request.includeUrgentInDigest(),
+                normalizeMaxReplyChars(request.maxReplyChars()),
+                request.splitLongReply() == null || request.splitLongReply(),
+                normalizeSplitReplyChancePercent(request.splitReplyChancePercent()),
+                request.privateHistoryEnabled() != null && request.privateHistoryEnabled(),
+                normalizeHistoryMaxMessages(request.historyMaxMessages()),
+                normalizeHistoryMaxChars(request.historyMaxChars()),
+                request.historyTrainingEnabled() != null && request.historyTrainingEnabled(),
+                normalizeReviewMode(request.reviewMode()),
+                normalizeKnowledgeBaseSources(request.knowledgeBaseSources()),
+                normalizeProfileContext(request.profileContext())
         );
-        return toResponse(repository.save(profile));
+        ConversationProfile savedProfile = repository.save(profile);
+        syncPrivateHistoryAfterSave(savedProfile);
+        return toResponse(savedProfile);
     }
 
     /**
@@ -169,9 +203,34 @@ public class ConversationProfileApplicationService {
                 normalizeKeywordList(request.notificationKeywords()),
                 normalizeDigestWindowSeconds(request.digestWindowSeconds()),
                 normalizeDigestMaxMessages(request.digestMaxMessages()),
-                request.includeUrgentInDigest() != null && request.includeUrgentInDigest()
+                request.includeUrgentInDigest() != null && request.includeUrgentInDigest(),
+                normalizeMaxReplyChars(request.maxReplyChars()),
+                request.splitLongReply() == null || request.splitLongReply(),
+                normalizeSplitReplyChancePercent(request.splitReplyChancePercent()),
+                request.privateHistoryEnabled() != null && request.privateHistoryEnabled(),
+                normalizeHistoryMaxMessages(request.historyMaxMessages()),
+                normalizeHistoryMaxChars(request.historyMaxChars()),
+                request.historyTrainingEnabled() != null && request.historyTrainingEnabled(),
+                normalizeReviewMode(request.reviewMode()),
+                normalizeKnowledgeBaseSources(request.knowledgeBaseSources()),
+                normalizeProfileContext(request.profileContext())
         );
-        return toResponse(repository.save(updated));
+        ConversationProfile savedProfile = repository.save(updated);
+        syncPrivateHistoryAfterSave(savedProfile);
+        return toResponse(savedProfile);
+    }
+
+    /** 保存后立即同步授权私聊的最新记录；Connector 暂不可用不能导致设定保存失败。 */
+    private void syncPrivateHistoryAfterSave(ConversationProfile profile) {
+        if (historyTrainingService == null || !profile.privateHistoryEnabled()) {
+            return;
+        }
+        try {
+            historyTrainingService.syncContextAfterProfileSave(profile);
+        } catch (Exception exception) {
+            // 同步服务本身已降级处理，这一层额外兜底防止未来实现变更影响配置保存。
+            log.warn("设定集已保存，但历史同步未完成：profileId={}, error={}", profile.id(), exception.getMessage());
+        }
     }
 
     /**
@@ -188,6 +247,43 @@ public class ConversationProfileApplicationService {
             throw new ResponseStatusException(HttpStatus.NOT_FOUND, "会话设定不存在");
         }
         repository.deleteByIdAndUserId(profileId, normalizedUserId);
+    }
+
+    /**
+     * 按用户选择暂停当前会话的自动代理；系统消息监控规则不受影响。
+     * continueAgent=true 时不修改原设定，避免错误覆盖原本的草稿或静默策略。
+     */
+    public int updateConversationAgentState(String userId, String platform, String chatType, String chatId, boolean continueAgent) {
+        if (continueAgent) {
+            return 0;
+        }
+        List<ConversationProfile> matched = repository.findAllByUserId(normalizeUserId(userId)).stream()
+                .filter(ConversationProfile::enabled)
+                .filter(profile -> !"__MESSAGE_MONITORING__".equals(profile.description()))
+                .filter(profile -> matchesOptional(profile.platform(), platform))
+                .filter(profile -> matchesOptional(profile.chatType(), chatType))
+                .filter(profile -> matchesList(profile.chatIds(), chatId))
+                .toList();
+        matched.forEach(profile -> repository.save(copyWithEnabled(profile, false)));
+        return matched.size();
+    }
+
+    /** 复制完整设定，仅修改 enabled，避免暂停操作丢失人格、Skill 或摘要参数。 */
+    private ConversationProfile copyWithEnabled(ConversationProfile profile, boolean enabled) {
+        return new ConversationProfile(
+                profile.id(), profile.userId(), profile.name(), profile.description(), enabled,
+                profile.platform(), profile.accountId(), profile.scene(), profile.chatType(), profile.chatIds(),
+                profile.targetUserIds(), profile.supportedRoutes(), profile.triggerMode(), profile.triggerKeywords(),
+                profile.personaMode(), profile.systemPrompt(), profile.skillReference(), profile.skillReferences(),
+                profile.modelProfileId(), profile.preferredRoute(), profile.replyMode(), profile.replyDelaySecondsMin(),
+                profile.replyDelaySecondsMax(), profile.allowedTools(), profile.requireHumanConfirmation(),
+                profile.priority(), profile.createdAt(), Instant.now(), profile.notificationMode(),
+                profile.notificationKeywords(), profile.digestWindowSeconds(), profile.digestMaxMessages(),
+                profile.includeUrgentInDigest(), profile.maxReplyChars(), profile.splitLongReply(),
+                profile.splitReplyChancePercent(), profile.privateHistoryEnabled(), profile.historyMaxMessages(),
+                profile.historyMaxChars(), profile.historyTrainingEnabled(), profile.reviewMode(),
+                profile.knowledgeBaseSources(), profile.profileContext()
+        );
     }
 
     /**
@@ -213,8 +309,17 @@ public class ConversationProfileApplicationService {
 
         ConversationProfile profile = bestProfile.get();
         boolean active = matchesTrigger(profile, request);
+        var taskState = taskStateService == null ? null : taskStateService.resolve(profile, request.chatId());
+        if (taskState != null && ConversationProxyTaskStateService.COMPLETED.equals(taskState.status())) {
+            return new ConversationProfileMatchResponse(
+                    true, false, "会话任务已经由用户批准结束，当前代理已停止", toResponse(profile), taskState
+            );
+        }
         String reason = active ? "命中会话范围且满足触发条件" : "命中会话范围，但当前消息未满足触发条件";
-        return new ConversationProfileMatchResponse(true, active, reason, toResponse(profile));
+        if (taskState != null && ConversationProxyTaskStateService.COMPLETION_REQUESTED.equals(taskState.status())) {
+            reason = "任务已申请结束并等待用户审批，审批前继续代理但不得重复已完成目标";
+        }
+        return new ConversationProfileMatchResponse(true, active, reason, toResponse(profile), taskState);
     }
 
     /** 清理并校验设定集 owner 标识。 */
@@ -326,8 +431,145 @@ public class ConversationProfileApplicationService {
                 profile.notificationKeywords(),
                 profile.digestWindowSeconds(),
                 profile.digestMaxMessages(),
-                profile.includeUrgentInDigest()
+                profile.includeUrgentInDigest(),
+                profile.maxReplyChars(),
+                profile.splitLongReply(),
+                profile.splitReplyChancePercent(),
+                profile.privateHistoryEnabled(),
+                profile.historyMaxMessages(),
+                profile.historyMaxChars(),
+                profile.historyTrainingEnabled(),
+                profile.reviewMode(),
+                profile.knowledgeBaseSources(),
+                profile.profileContext()
+          );
+      }
+
+    /**
+     * 清理 Conversation Profile 2.0 的结构化上下文。
+     * 该层只处理长度、空值和枚举，不把业务目标转换成工具权限。
+     */
+    private ConversationProfileContext normalizeProfileContext(ConversationProfileContext context) {
+        if (context == null) {
+            return ConversationProfileContext.empty();
+        }
+        ConversationProfileContext.Identity identity = context.identity() == null
+                ? ConversationProfileContext.Identity.empty()
+                : context.identity();
+        ConversationProfileContext.Counterparty counterparty = context.counterparty() == null
+                ? ConversationProfileContext.Counterparty.empty()
+                : context.counterparty();
+        ConversationProfileContext.Background background = context.background() == null
+                ? ConversationProfileContext.Background.empty()
+                : context.background();
+        ConversationProfileContext.Task task = context.task() == null
+                ? ConversationProfileContext.Task.empty()
+                : context.task();
+        ConversationProfileContext.BusinessRules businessRules = context.businessRules() == null
+                ? ConversationProfileContext.BusinessRules.empty()
+                : context.businessRules();
+        ConversationProfileContext.MemoryPolicy memoryPolicy = context.memoryPolicy() == null
+                ? ConversationProfileContext.MemoryPolicy.empty()
+                : context.memoryPolicy();
+
+        return new ConversationProfileContext(
+                2,
+                new ConversationProfileContext.Identity(
+                        defaultContextText(identity.representedPerson(), "本人", 500),
+                        defaultContextText(identity.role(), "本人", 1000),
+                        normalizeContextText(identity.speakingStyle(), 2000),
+                        normalizeContextList(identity.forbiddenExpressions(), 30, 200)
+                ),
+                new ConversationProfileContext.Counterparty(
+                        normalizeContextText(counterparty.name(), 255),
+                        normalizeContextText(counterparty.identity(), 1000),
+                        normalizeContextText(counterparty.relationship(), 500),
+                        normalizeContextText(counterparty.preferredAddress(), 100),
+                        normalizeContextList(counterparty.knownFacts(), 50, 500),
+                        normalizeTrustLevel(counterparty.trustLevel()),
+                        normalizeContextText(counterparty.communicationPreference(), 1000)
+                ),
+                new ConversationProfileContext.Background(
+                        normalizeContextText(background.origin(), 2000),
+                        normalizeContextText(background.previousEvents(), 4000),
+                        normalizeContextText(background.currentProgress(), 2000)
+                ),
+                new ConversationProfileContext.Task(
+                        normalizeContextText(task.objective(), 2000),
+                        normalizeContextList(task.successCriteria(), 30, 500),
+                        normalizeContextText(task.deadline(), 255),
+                        normalizeContextList(task.prohibitedActions(), 30, 500)
+                ),
+                new ConversationProfileContext.BusinessRules(
+                        normalizeContextText(businessRules.pricingPolicy(), 2000),
+                        normalizeContextText(businessRules.minimumPrice(), 500),
+                        normalizeContextText(businessRules.refundPolicy(), 2000),
+                        normalizeContextText(businessRules.deliveryConditions(), 2000),
+                        normalizeContextList(businessRules.hardConstraints(), 30, 500)
+                ),
+                new ConversationProfileContext.MemoryPolicy(memoryPolicy.extractionEnabled()),
+                normalizeAssetReferences(context.assets())
         );
+    }
+
+    /** 会话设定没有显式填写身份时使用安全默认值，减少创建普通私聊规则所需的手工字段。 */
+    private String defaultContextText(String value, String fallback, int maxLength) {
+        String normalized = normalizeContextText(value, maxLength);
+        return normalized.isBlank() ? fallback : normalized;
+    }
+
+    /** 只保留资产引用和使用条件，限制数量并过滤没有标识的无效资产。 */
+    private List<ConversationProfileContext.AssetReference> normalizeAssetReferences(
+            List<ConversationProfileContext.AssetReference> assets
+    ) {
+        if (assets == null) {
+            return List.of();
+        }
+        return assets.stream()
+                .filter(asset -> asset != null)
+                .map(asset -> new ConversationProfileContext.AssetReference(
+                        normalizeContextText(asset.assetId(), 255),
+                        normalizeContextText(asset.type(), 64).toUpperCase(Locale.ROOT),
+                        normalizeContextText(asset.name(), 255),
+                        normalizeContextText(asset.description(), 1000),
+                        normalizeContextText(asset.usageCondition(), 1000)
+                ))
+                .filter(asset -> !asset.assetId().isBlank() || !asset.name().isBlank())
+                .limit(20)
+                .toList();
+    }
+
+    /** 清理结构化上下文中的列表字段，并限制单项长度与总数量。 */
+    private List<String> normalizeContextList(List<String> values, int maxItems, int maxLength) {
+        if (values == null) {
+            return List.of();
+        }
+        return values.stream()
+                .map(value -> normalizeContextText(value, maxLength))
+                .filter(value -> !value.isBlank())
+                .distinct()
+                .limit(maxItems)
+                .toList();
+    }
+
+    /** 清理结构化文本并截断异常大输入，避免整个文档被误填入单个字段。 */
+    private String normalizeContextText(String value, int maxLength) {
+        String normalized = normalizeText(value);
+        return normalized.length() <= maxLength ? normalized : normalized.substring(0, maxLength);
+    }
+
+    /** 对方可信度只接受四档稳定枚举，未知输入回退 UNKNOWN。 */
+    private String normalizeTrustLevel(String value) {
+        String normalized = normalizeText(value).toUpperCase(Locale.ROOT);
+        return switch (normalized) {
+            case "LOW", "MEDIUM", "HIGH" -> normalized;
+            default -> "UNKNOWN";
+        };
+    }
+
+    /** 审批模式只允许严格接管或自动纠偏，未知值一律回退严格模式。 */
+    private String normalizeReviewMode(String value) {
+        return "AUTO_REWRITE".equalsIgnoreCase(normalizeText(value)) ? "AUTO_REWRITE" : "STRICT_HANDOFF";
     }
 
     /**
@@ -444,6 +686,23 @@ public class ConversationProfileApplicationService {
     }
 
     /**
+     * 限制单个会话可绑定的知识库来源数量和长度，避免将任意大文本直接写入设定集。
+     * 实际读取只发生在 Python Runtime，并且会再次限制协议、响应体和检索片段大小。
+     */
+    private List<String> normalizeKnowledgeBaseSources(List<String> values) {
+        if (values == null) {
+            return List.of();
+        }
+        return values.stream()
+                .filter(value -> value != null && !value.isBlank())
+                .map(String::trim)
+                .filter(value -> value.length() <= 2048)
+                .distinct()
+                .limit(8)
+                .toList();
+    }
+
+    /**
      * 这个函数的作用是把可选文本字段统一整理成非 null 字符串。
      */
     private String normalizeText(String value) {
@@ -482,6 +741,46 @@ public class ConversationProfileApplicationService {
             return null;
         }
         return Math.max(value, 0);
+    }
+
+    /**
+     * 这个函数的作用是限制单条私聊气泡最大字符数，防止模型配置意外把整段内容直接发送出去。
+     */
+    private Integer normalizeMaxReplyChars(Integer value) {
+        if (value == null) {
+            return 24;
+        }
+        return Math.min(Math.max(value, 8), 80);
+    }
+
+    /**
+     * 这个函数的作用是把分段概率限制在 0 到 100，0 表示永不拆分，100 表示长回复总是拆分。
+     */
+    private Integer normalizeSplitReplyChancePercent(Integer value) {
+        if (value == null) {
+            return 33;
+        }
+        return Math.min(Math.max(value, 0), 100);
+    }
+
+    /**
+     * 限制私聊上下文条数，避免一次回复把过多历史内容发给模型。
+     */
+    private Integer normalizeHistoryMaxMessages(Integer value) {
+        if (value == null) {
+            return 12;
+        }
+        return Math.min(Math.max(value, 1), 50);
+    }
+
+    /**
+     * 限制注入模型的历史文本总长度，兼顾上下文连续性与调用成本。
+     */
+    private Integer normalizeHistoryMaxChars(Integer value) {
+        if (value == null) {
+            return 2000;
+        }
+        return Math.min(Math.max(value, 200), 12_000);
     }
 
     /**

@@ -1,7 +1,12 @@
 package com.memoecho.eventcenter.service;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.node.JsonNodeFactory;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.memoecho.eventcenter.dto.ConversationMessageResponse;
+import com.memoecho.eventcenter.dto.MediaAnalysisItem;
+import com.memoecho.eventcenter.dto.MediaAnalysisResponse;
+import com.memoecho.eventcenter.dto.MediaAnalysisUpdateRequest;
 import com.memoecho.eventcenter.dto.ConversationDigestRequest;
 import com.memoecho.eventcenter.dto.ConversationOverviewResponse;
 import com.memoecho.eventcenter.dto.ConversationSummaryResponse;
@@ -19,16 +24,20 @@ import com.memoecho.eventcenter.dto.UnifiedEventPayload;
 import com.memoecho.eventcenter.dto.SenderPayload;
 import com.memoecho.eventcenter.dto.WorkspaceInboxItemResponse;
 import com.memoecho.eventcenter.dto.WorkspaceStreamEventResponse;
+import com.memoecho.eventcenter.config.AgentDispatchRetryProperties;
+import com.memoecho.eventcenter.model.AgentDispatchRetryJob;
 import com.memoecho.eventcenter.model.StoredEvent;
 import com.memoecho.eventcenter.model.AgentExecutionStep;
 import com.memoecho.eventcenter.model.ExecutionTrace;
 import com.memoecho.eventcenter.model.NotificationDecision;
 import com.memoecho.eventcenter.repository.EventRecordRepository;
+import com.memoecho.eventcenter.repository.AgentDispatchRetryJobRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpStatus;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.web.server.ResponseStatusException;
 
 import java.time.Duration;
@@ -50,19 +59,43 @@ public class EventCenterApplicationService {
     private final AgentRuntimeDispatchClient dispatchClient;
     private final QqConnectorMessageClient qqConnectorMessageClient;
     private final WorkspaceEventStreamService workspaceEventStreamService;
+    private final EventOwnershipResolver eventOwnershipResolver;
+    private ConversationDigestBatchService digestBatchService;
+    private AgentDispatchRetryJobRepository dispatchRetryRepository;
+    private AgentDispatchRetryProperties dispatchRetryProperties;
+
+    /** 可选注入摘要仓库；保留可选形式以兼容不启动 JDBC 上下文的轻量单元测试。 */
+    @Autowired(required = false)
+    public void setDigestBatchService(ConversationDigestBatchService digestBatchService) {
+        this.digestBatchService = digestBatchService;
+    }
+
+    /**
+     * 注入持久化重试组件。使用可选 Setter 是为了兼容现有纯单元测试，生产环境会由 Spring 正常注入。
+     */
+    @Autowired(required = false)
+    public void setDispatchRetrySupport(
+            AgentDispatchRetryJobRepository dispatchRetryRepository,
+            AgentDispatchRetryProperties dispatchRetryProperties
+    ) {
+        this.dispatchRetryRepository = dispatchRetryRepository;
+        this.dispatchRetryProperties = dispatchRetryProperties;
+    }
 
     @Autowired
     public EventCenterApplicationService(
             EventRecordRepository repository,
             AgentRuntimeDispatchClient dispatchClient,
             QqConnectorMessageClient qqConnectorMessageClient,
-            WorkspaceEventStreamService workspaceEventStreamService
+            WorkspaceEventStreamService workspaceEventStreamService,
+            EventOwnershipResolver eventOwnershipResolver
     ) {
         // 这个构造函数的作用是注入事件仓库、Runtime 派发器和 QQ Connector，使事件中心能够完成草稿确认闭环。
         this.repository = repository;
         this.dispatchClient = dispatchClient;
         this.qqConnectorMessageClient = qqConnectorMessageClient;
         this.workspaceEventStreamService = workspaceEventStreamService;
+        this.eventOwnershipResolver = eventOwnershipResolver;
     }
 
     public EventCenterApplicationService(
@@ -71,7 +104,7 @@ public class EventCenterApplicationService {
             QqConnectorMessageClient qqConnectorMessageClient
     ) {
         // 这个构造函数的作用是兼容现有单元测试和独立使用场景，其中不需要创建真实 SSE 订阅。
-        this(repository, dispatchClient, qqConnectorMessageClient, new WorkspaceEventStreamService());
+        this(repository, dispatchClient, qqConnectorMessageClient, new WorkspaceEventStreamService(), null);
     }
 
     public EventIngestResponse ingest(UnifiedEventPayload event) {
@@ -93,10 +126,53 @@ public class EventCenterApplicationService {
             );
         }
 
-        StoredEvent receivedEvent = StoredEvent.received(event.eventId(), event, Instant.now());
+        String ownerUserId = eventOwnershipResolver == null
+                ? "local-user"
+                : eventOwnershipResolver.resolveOwnerUserId(event);
+        UnifiedEventPayload ownedEvent = withOwnerUserId(event, ownerUserId);
+        StoredEvent receivedEvent = StoredEvent.received(event.eventId(), ownerUserId, ownedEvent, Instant.now())
+                .withMessageOrigin(resolveIncomingMessageOrigin(ownedEvent, ownerUserId));
         repository.save(receivedEvent);
-        DispatchResult dispatch = dispatchClient.dispatch(event);
-        StoredEvent processedEvent = applyDispatchResult(receivedEvent, dispatch);
+
+        // 开启 NapCat 的“上报自身消息”后，自己的消息要入库供上下文读取，但不能再次派给 Runtime。
+        // 否则 Agent 发出的消息会被当作新入站消息，形成自我回复循环。
+        if (isSelfReportedMessage(ownedEvent)) {
+            StoredEvent archivedEvent = receivedEvent.markProcessed(
+                    "SELF_MESSAGE_RECORDED",
+                    "已保存当前账号发出的消息，仅用于后续上下文和授权的风格训练。",
+                    "self_history",
+                    "NOT_APPLICABLE",
+                    false,
+                    Instant.now(),
+                    "",
+                    null
+            ).markInboxStatus("DONE", null, Instant.now());
+            repository.save(archivedEvent);
+            publishWorkspaceUpdate("conversation.self-message-recorded", archivedEvent);
+            return new EventIngestResponse(
+                    event.eventId(),
+                    true,
+                    false,
+                    new DispatchResult(false, null, null, null),
+                    "Self-reported message archived without runtime dispatch."
+            );
+        }
+
+        DispatchResult dispatch = dispatchClient.dispatch(ownedEvent);
+        StoredEvent processedEvent;
+        if (shouldScheduleAutomaticRetry(dispatch, 1)) {
+            Instant nextAttemptAt = nextRetryAt(1);
+            dispatchRetryRepository.schedule(
+                    receivedEvent.eventId(),
+                    1,
+                    nextAttemptAt,
+                    dispatchError(dispatch),
+                    Instant.now()
+            );
+            processedEvent = markDispatchRetryPending(receivedEvent, 1, nextAttemptAt, dispatch);
+        } else {
+            processedEvent = applyDispatchResult(receivedEvent, dispatch);
+        }
         repository.save(processedEvent);
         publishWorkspaceUpdate("inbox.updated", processedEvent);
         log.info("Dispatched to agent runtime: attempted={}, httpStatus={}, error={}",
@@ -113,9 +189,89 @@ public class EventCenterApplicationService {
         );
     }
 
+    /**
+     * 把事件中心解析出的本地用户写入 Runtime 可见载荷，让设定集和模型配置按同一用户查询。
+     */
+    private UnifiedEventPayload withOwnerUserId(UnifiedEventPayload event, String ownerUserId) {
+        if (ownerUserId == null || ownerUserId.isBlank() || "local-user".equals(ownerUserId)) {
+            return event;
+        }
+        ObjectNode rawPayload = event.rawPayload() != null && event.rawPayload().isObject()
+                ? ((ObjectNode) event.rawPayload()).deepCopy()
+                : JsonNodeFactory.instance.objectNode();
+        rawPayload.put("userId", ownerUserId);
+        return new UnifiedEventPayload(
+                event.eventId(), event.platform(), event.scene(), event.eventType(), event.chatType(),
+                event.chatId(), event.selfId(), event.sender(), event.text(), event.attachments(),
+                event.mentions(), event.timestamp(), rawPayload, event.actorType(), event.platformMessageId(),
+                event.clientMessageId(), event.correlationId(), event.sequence(), event.sentAt(),
+                event.receivedAt(), event.importedAt(), event.direction(), event.delegatedTaskId()
+        );
+    }
+
+    /**
+     * 区分手动消息与 Runtime/确认草稿产生的回显。只有 USER_MANUAL 会被个人风格提炼使用。
+     * 对 selfId 回显，使用同会话、已发送草稿的文本匹配；确认发送与自动发送都会被排除。
+     */
+    private String resolveIncomingMessageOrigin(UnifiedEventPayload event, String ownerUserId) {
+        if ("AGENT".equalsIgnoreCase(event.actorType())) {
+            return "AGENT_AUTO";
+        }
+        if ("OWNER".equalsIgnoreCase(event.actorType())) {
+            return "USER_MANUAL";
+        }
+        if ("CONTACT".equalsIgnoreCase(event.actorType()) || "SYSTEM".equalsIgnoreCase(event.actorType())) {
+            return "EXTERNAL";
+        }
+        if (event.sender() == null || event.selfId() == null
+                || !event.selfId().equals(event.sender().id())) {
+            return "EXTERNAL";
+        }
+        return repository.findAll().stream()
+                .filter(previous -> ownerUserId.equals(previous.ownerUserId()))
+                .filter(previous -> event.platform().equals(previous.payload().platform()))
+                .filter(previous -> event.chatType().equals(previous.payload().chatType()))
+                .filter(previous -> event.chatId().equals(previous.payload().chatId()))
+                .filter(previous -> "SENT".equals(previous.writeBackStatus())
+                        || "DELAYED_SENT".equals(previous.writeBackStatus()))
+                .filter(previous -> draftContainsMessage(previous.replyDraft(), event.text()))
+                .findFirst()
+                .map(previous -> "CONFIRMED".equals(previous.lastAction())
+                        ? "AGENT_CONFIRMED" : "AGENT_AUTO")
+                .orElse("USER_MANUAL");
+    }
+
+    /** 判断当前 Webhook 是否来自已登录账号；命中后只存档，不触发 Runtime。 */
+    private boolean isSelfReportedMessage(UnifiedEventPayload event) {
+        if ("OWNER".equalsIgnoreCase(event.actorType()) || "AGENT".equalsIgnoreCase(event.actorType())) {
+            return true;
+        }
+        if ("CONTACT".equalsIgnoreCase(event.actorType()) || "SYSTEM".equalsIgnoreCase(event.actorType())) {
+            return false;
+        }
+        return event.sender() != null
+                && event.selfId() != null
+                && !event.selfId().isBlank()
+                && event.selfId().equals(event.sender().id());
+    }
+
+    private boolean draftContainsMessage(String draft, String text) {
+        if (draft == null || text == null || text.isBlank()) {
+            return false;
+        }
+        return java.util.Arrays.stream(draft.split("\\R"))
+                .map(String::trim)
+                .anyMatch(text.trim()::equals);
+    }
+
     public StoredEventResponse recordConversationDigest(ConversationDigestRequest request) {
         // 这个函数的作用是将慢通道定时生成的摘要保存为合成事件，避免它再次进入 Runtime 形成循环处理。
         Instant now = Instant.now();
+        if (digestBatchService != null) {
+            String ownerUserId = request.ownerUserId() == null || request.ownerUserId().isBlank()
+                    ? "default" : request.ownerUserId().trim();
+            digestBatchService.save(ownerUserId, request);
+        }
         String eventId = "digest:" + UUID.randomUUID();
         int messageCount = request.messageCount() == null ? 0 : Math.max(request.messageCount(), 0);
         NotificationDecision notification = new NotificationDecision(
@@ -170,6 +326,15 @@ public class EventCenterApplicationService {
         return repository.findByEventId(eventId).map(this::toStoredEventResponse);
     }
 
+    /**
+     * 校验事件是否属于当前登录用户，供高权限审批接口在代理 Runtime 前执行对象级鉴权。
+     */
+    public boolean isEventOwnedBy(String ownerUserId, String eventId) {
+        return repository.findByEventId(eventId)
+                .filter(event -> isOwnedConversationEvent(ownerUserId, event))
+                .isPresent();
+    }
+
     public List<StoredEventResponse> findAll() {
         // 这个函数的作用是兼容旧调用方，未传筛选条件时返回全部事件记录。
         return findAll(null);
@@ -187,6 +352,25 @@ public class EventCenterApplicationService {
         // 这个函数的作用是返回工作台收件箱所需的完整消息卡片，默认排除完成、忽略和未到期的稍后处理消息。
         int safeLimit = limit == null || limit <= 0 ? 50 : Math.min(limit, 200);
         return repository.findAll().stream()
+                .filter(event -> inboxStatus == null || inboxStatus.isBlank()
+                        ? isVisibleInInbox(event)
+                        : matchesInboxStatus(event, inboxStatus))
+                .limit(safeLimit)
+                .map(this::toWorkspaceInboxItem)
+                .toList();
+    }
+
+    /**
+     * 只返回指定用户拥有的工作台消息，避免本地多账号之间共享收件箱。
+     */
+    public List<WorkspaceInboxItemResponse> findWorkspaceInboxItems(
+            String ownerUserId,
+            String inboxStatus,
+            Integer limit
+    ) {
+        int safeLimit = limit == null || limit <= 0 ? 50 : Math.min(limit, 200);
+        return repository.findAll().stream()
+                .filter(event -> ownerUserId.equals(event.ownerUserId()))
                 .filter(event -> inboxStatus == null || inboxStatus.isBlank()
                         ? isVisibleInInbox(event)
                         : matchesInboxStatus(event, inboxStatus))
@@ -283,7 +467,26 @@ public class EventCenterApplicationService {
             throw new ResponseStatusException(HttpStatus.CONFLICT, "当前事件不需要重试。");
         }
         DispatchResult dispatch = dispatchClient.dispatch(storedEvent.payload());
-        StoredEvent dispatchedEvent = applyDispatchResult(storedEvent, dispatch);
+        int completedAttempts = dispatchRetryRepository == null
+                ? 1
+                : dispatchRetryRepository.findByEventId(eventId)
+                .map(job -> job.attemptCount() + 1)
+                .orElse(1);
+        StoredEvent dispatchedEvent;
+        if (shouldScheduleAutomaticRetry(dispatch, completedAttempts)) {
+            Instant nextAttemptAt = nextRetryAt(completedAttempts);
+            dispatchRetryRepository.schedule(
+                    eventId,
+                    completedAttempts,
+                    nextAttemptAt,
+                    dispatchError(dispatch),
+                    Instant.now()
+            );
+            dispatchedEvent = markDispatchRetryPending(storedEvent, completedAttempts, nextAttemptAt, dispatch);
+        } else {
+            dispatchedEvent = applyDispatchResult(storedEvent, dispatch);
+            finishRetryJob(eventId, dispatch, completedAttempts);
+        }
         StoredEvent updatedEvent = dispatchedEvent.markAction(
                 dispatchedEvent.processingStatus(),
                 dispatchedEvent.processingSummary(),
@@ -297,6 +500,107 @@ public class EventCenterApplicationService {
         repository.save(updatedEvent);
         publishWorkspaceUpdate("inbox.updated", updatedEvent);
         return toStoredEventResponse(updatedEvent);
+    }
+
+    /**
+     * 定时领取到期的 Runtime 派发任务。任务状态存放在数据库中，Event Center 重启后仍可继续恢复。
+     */
+    @Scheduled(fixedDelayString = "${event-center.dispatch.retry.poll-interval-ms:1000}")
+    public void retryPendingRuntimeDispatches() {
+        if (!isAutomaticRetryEnabled()) {
+            return;
+        }
+        Instant now = Instant.now();
+        List<AgentDispatchRetryJob> dueJobs = dispatchRetryRepository.findDue(
+                now,
+                dispatchRetryProperties.getBatchSize()
+        );
+        for (AgentDispatchRetryJob job : dueJobs) {
+            retryPendingRuntimeDispatch(job, now);
+        }
+    }
+
+    /**
+     * 执行单个已领取任务，并根据结果进入成功、继续等待或最终失败状态。
+     */
+    private void retryPendingRuntimeDispatch(AgentDispatchRetryJob job, Instant claimedAt) {
+        if (!dispatchRetryRepository.claim(job.eventId(), job.attemptCount(), claimedAt)) {
+            return;
+        }
+        Optional<StoredEvent> storedEvent = repository.findByEventId(job.eventId());
+        if (storedEvent.isEmpty()) {
+            dispatchRetryRepository.markDead(
+                    job.eventId(),
+                    job.attemptCount(),
+                    "对应事件记录不存在，无法继续派发。",
+                    Instant.now()
+            );
+            return;
+        }
+
+        int completedAttempts = job.attemptCount() + 1;
+        DispatchResult dispatch = dispatchClient.dispatch(storedEvent.get().payload());
+        if (isSuccessfulDispatch(dispatch)) {
+            StoredEvent dispatched = applyDispatchResult(storedEvent.get(), dispatch);
+            StoredEvent recovered = dispatched.markAction(
+                    dispatched.processingStatus(),
+                    dispatched.processingSummary(),
+                    dispatched.writeBackStatus(),
+                    dispatched.needHumanConfirmation(),
+                    dispatched.replyDraft(),
+                    "AUTO_RETRIED",
+                    "Runtime 暂时不可用后已自动恢复。",
+                    Instant.now()
+            );
+            repository.save(recovered);
+            dispatchRetryRepository.markSucceeded(job.eventId(), Instant.now());
+            publishWorkspaceUpdate("inbox.updated", recovered);
+            log.info("Agent Runtime automatic retry succeeded: eventId={}, attempts={}",
+                    job.eventId(), completedAttempts);
+            return;
+        }
+
+        if (shouldScheduleAutomaticRetry(dispatch, completedAttempts)) {
+            Instant nextAttemptAt = nextRetryAt(completedAttempts);
+            dispatchRetryRepository.schedule(
+                    job.eventId(),
+                    completedAttempts,
+                    nextAttemptAt,
+                    dispatchError(dispatch),
+                    Instant.now()
+            );
+            StoredEvent waiting = markDispatchRetryPending(
+                    storedEvent.get(),
+                    completedAttempts,
+                    nextAttemptAt,
+                    dispatch
+            );
+            repository.save(waiting);
+            log.warn("Agent Runtime automatic retry postponed: eventId={}, attempts={}, nextAttemptAt={}, error={}",
+                    job.eventId(), completedAttempts, nextAttemptAt, dispatchError(dispatch));
+            return;
+        }
+
+        StoredEvent failed = applyDispatchResult(storedEvent.get(), dispatch).markAction(
+                "DISPATCH_FAILED",
+                deriveProcessingSummary(dispatch, "DISPATCH_FAILED", deriveWriteBackStatus(dispatch)),
+                deriveWriteBackStatus(dispatch),
+                false,
+                storedEvent.get().replyDraft(),
+                "AUTO_RETRY_EXHAUSTED",
+                "Runtime 自动重试结束，需要用户检查服务状态后手动重试。",
+                Instant.now()
+        );
+        repository.save(failed);
+        dispatchRetryRepository.markDead(
+                job.eventId(),
+                completedAttempts,
+                dispatchError(dispatch),
+                Instant.now()
+        );
+        publishWorkspaceUpdate("inbox.updated", failed);
+        log.error("Agent Runtime automatic retry exhausted: eventId={}, attempts={}, error={}",
+                job.eventId(), completedAttempts, dispatchError(dispatch));
     }
 
     public ConversationOverviewResponse getConversationOverview() {
@@ -340,27 +644,361 @@ public class EventCenterApplicationService {
             Integer activeWithinMinutes
     ) {
         // 会话列表只需要每个会话最后一条事件，不需要完整事件时间线。
+        Map<String, String> preferredNames = preferredConversationNames(null);
         return latestConversationEvents().values().stream()
-                .map(this::toConversationSummary)
+                .map(event -> toConversationSummary(event, preferredNames.get(conversationKey(event.payload()))))
                 .filter(summary -> matchesConversationSummary(summary, platform, chatType, keyword, dispatchMode, activeWithinMinutes))
                 .sorted(Comparator.comparing(this::sortByLastActivity).reversed())
                 .toList();
     }
 
+    /**
+     * 按本地用户读取会话摘要。用户过滤必须发生在“每个会话取最新事件”之前，
+     * 否则不同用户具有相同平台会话 ID 时，较新的外部事件可能覆盖当前用户自己的会话。
+     */
+    public List<ConversationSummaryResponse> findConversationSummariesForUser(
+            String ownerUserId,
+            String platform,
+            String chatType,
+            String keyword,
+            String dispatchMode,
+            Integer activeWithinMinutes
+    ) {
+        Map<String, String> preferredNames = preferredConversationNames(ownerUserId);
+        return latestConversationEvents(ownerUserId).values().stream()
+                .map(event -> toConversationSummary(event, preferredNames.get(conversationKey(event.payload()))))
+                .filter(summary -> matchesConversationSummary(
+                        summary, platform, chatType, keyword, dispatchMode, activeWithinMinutes))
+                .sorted(Comparator.comparing(this::sortByLastActivity).reversed())
+                .toList();
+    }
+
+    public List<ConversationMessageResponse> findConversationMessages(
+            String ownerUserId,
+            String chatId,
+            String platform,
+            String chatType,
+            Integer limit
+    ) {
+        return findConversationMessages(ownerUserId, chatId, platform, chatType, limit, null, null);
+    }
+
+    /**
+     * 按会话时间窗读取消息。after 为包含边界，before 为排除边界，避免把任务创建前历史误作任务完成证据。
+     */
+    public List<ConversationMessageResponse> findConversationMessages(
+            String ownerUserId,
+            String chatId,
+            String platform,
+            String chatType,
+            Integer limit,
+            String before,
+            String after
+    ) {
+        // 这里做一个安全上限，避免前端或调试脚本一次拉太多消息。
+        int safeLimit = limit == null || limit <= 0 ? 50 : Math.min(limit, 200);
+        Instant beforeInstant = parseTimestamp(before);
+        Instant afterInstant = parseTimestamp(after);
+
+        List<StoredEvent> conversationEvents = repository.findAll().stream()
+                .filter(event -> isOwnedConversationEvent(ownerUserId, event))
+                .filter(event -> matchesFilters(event.payload(), platform, chatType, chatId))
+                .filter(event -> isWithinConversationWindow(event, beforeInstant, afterInstant))
+                .toList();
+        return buildConversationTimeline(conversationEvents, safeLimit, true);
+    }
+
+    /**
+     * 兼容旧的工作台和测试调用。新 Runtime 调用必须使用带 ownerUserId 的重载方法，
+     * 从而保证不同本地账户之间不会读取到彼此的私聊记录。
+     */
     public List<ConversationMessageResponse> findConversationMessages(
             String chatId,
             String platform,
             String chatType,
             Integer limit
     ) {
-        // 这里做一个安全上限，避免前端或调试脚本一次拉太多消息。
-        int safeLimit = limit == null || limit <= 0 ? 50 : Math.min(limit, 200);
+        return findConversationMessages(chatId, platform, chatType, limit, null, null);
+    }
 
-        return repository.findAll().stream()
+    /** 兼容未加载本地用户上下文的测试环境，并支持与正式接口一致的时间窗口。 */
+    public List<ConversationMessageResponse> findConversationMessages(
+            String chatId,
+            String platform,
+            String chatType,
+            Integer limit,
+            String before,
+            String after
+    ) {
+        int safeLimit = limit == null || limit <= 0 ? 50 : Math.min(limit, 200);
+        Instant beforeInstant = parseTimestamp(before);
+        Instant afterInstant = parseTimestamp(after);
+        List<StoredEvent> conversationEvents = repository.findAll().stream()
                 .filter(event -> matchesFilters(event.payload(), platform, chatType, chatId))
-                .limit(safeLimit)
-                .map(this::toConversationMessage)
+                .filter(event -> isWithinConversationWindow(event, beforeInstant, afterInstant))
                 .toList();
+        return buildConversationTimeline(conversationEvents, safeLimit, true);
+    }
+
+    /** 使用平台时间优先过滤，旧事件没有平台时间时退回接收时间。 */
+    private boolean isWithinConversationWindow(StoredEvent event, Instant before, Instant after) {
+        Instant occurredAt = resolveEventTimestamp(event);
+        if (after != null && occurredAt.isBefore(after)) {
+            return false;
+        }
+        return before == null || occurredAt.isBefore(before);
+    }
+
+    public Optional<ConversationMessageResponse> findOwnedSourceMessage(String ownerUserId, String eventId) {
+        // 这个函数的作用是按用户归属读取一条原始事件，供日程来源校验和来源信息展示复用。
+        if (eventId == null || eventId.isBlank()) {
+            return Optional.empty();
+        }
+        return repository.findByEventId(eventId)
+                .filter(event -> isOwnedConversationEvent(ownerUserId, event))
+                .map(this::toConversationMessage);
+    }
+
+    public List<ConversationMessageResponse> findConversationContextAroundEvent(
+            String ownerUserId,
+            String eventId,
+            Integer radius
+    ) {
+        // 这个函数的作用是围绕日程来源消息截取上下文，而不是把整段聊天历史暴露给客户端。
+        StoredEvent sourceEvent = repository.findByEventId(eventId)
+                .filter(event -> isOwnedConversationEvent(ownerUserId, event))
+                .orElse(null);
+        if (sourceEvent == null) {
+            return List.of();
+        }
+
+        int safeRadius = radius == null ? 3 : Math.min(Math.max(radius, 0), 10);
+        List<StoredEvent> conversationEvents = repository.findAll().stream()
+                .filter(event -> isOwnedConversationEvent(ownerUserId, event))
+                .filter(event -> conversationKey(event.payload()).equals(conversationKey(sourceEvent.payload())))
+                .sorted(storedEventComparator())
+                .toList();
+        int sourceIndex = -1;
+        for (int index = 0; index < conversationEvents.size(); index++) {
+            if (conversationEvents.get(index).eventId().equals(eventId)) {
+                sourceIndex = index;
+                break;
+            }
+        }
+        if (sourceIndex < 0) {
+            return List.of(toConversationMessage(sourceEvent));
+        }
+
+        int fromIndex = Math.max(0, sourceIndex - safeRadius);
+        int toIndex = Math.min(conversationEvents.size(), sourceIndex + safeRadius + 1);
+        List<StoredEvent> contextEvents = conversationEvents.subList(fromIndex, toIndex);
+        return buildConversationTimeline(contextEvents, Integer.MAX_VALUE, false);
+    }
+
+    /**
+     * 将原始事件展开为稳定的会话时间线。平台时间决定主顺序，平台序号和事件 ID 负责消除同秒消息的不确定性。
+     */
+    private List<ConversationMessageResponse> buildConversationTimeline(
+            List<StoredEvent> events,
+            int limit,
+            boolean newestFirst
+    ) {
+        Map<String, Integer> explicitAgentCorrelations = collectExplicitAgentCorrelationCounts(events);
+        Map<String, Integer> legacySelfMessages = collectExplicitSelfMessageCounts(events);
+        Map<String, Instant> arrivalTimes = new LinkedHashMap<>();
+        for (StoredEvent event : events) {
+            arrivalTimes.put(event.eventId(), event.receivedAt());
+            List<String> sentParts = sentReplyParts(event);
+            for (int index = 0; index < sentParts.size(); index++) {
+                arrivalTimes.put(event.eventId() + ":reply:" + index, event.receivedAt());
+            }
+        }
+        Comparator<ConversationMessageResponse> comparator = conversationMessageComparator(arrivalTimes);
+        if (newestFirst) {
+            comparator = comparator.reversed();
+        }
+        return events.stream()
+                .flatMap(event -> toConversationTimeline(
+                        event,
+                        explicitAgentCorrelations,
+                        legacySelfMessages
+                ).stream())
+                .sorted(comparator)
+                .limit(limit)
+                .toList();
+    }
+
+    /**
+     * 构造事件稳定排序器。平台时间不可用时使用接收时间，最后用平台 sequence 与 eventId 打破平局。
+     */
+    private Comparator<StoredEvent> storedEventComparator() {
+        return Comparator
+                .comparing(this::resolveEventTimestamp)
+                .thenComparing(event -> event.payload().sequence(), Comparator.nullsFirst(Long::compareTo))
+                .thenComparing(StoredEvent::receivedAt)
+                .thenComparing(StoredEvent::eventId);
+    }
+
+    /** 返回事件真实发生时间；旧事件缺少平台时间时才退回 Event Center 接收时间。 */
+    private Instant resolveEventTimestamp(StoredEvent event) {
+        Instant platformTimestamp = parseTimestamp(event.payload().timestamp());
+        return platformTimestamp != null ? platformTimestamp : event.receivedAt();
+    }
+
+    /** 为展开后的消息构造确定性排序器。 */
+    private Comparator<ConversationMessageResponse> conversationMessageComparator(Map<String, Instant> arrivalTimes) {
+        return Comparator
+                .comparing((ConversationMessageResponse message) -> {
+                    Instant timestamp = parseTimestamp(message.timestamp());
+                    return timestamp == null ? Instant.EPOCH : timestamp;
+                })
+                .thenComparing(ConversationMessageResponse::sequence, Comparator.nullsFirst(Long::compareTo))
+                .thenComparing(message -> arrivalTimes.getOrDefault(message.eventId(), Instant.EPOCH))
+                .thenComparing(ConversationMessageResponse::eventId);
+    }
+
+    /**
+     * 校验事件归属。新事件直接按 ownerUserId 隔离；旧版 local-user 事件仅在平台账号仍属于当前用户时兼容读取。
+     */
+    private boolean isOwnedConversationEvent(String ownerUserId, StoredEvent event) {
+        if (ownerUserId.equals(event.ownerUserId())) {
+            return true;
+        }
+        return "local-user".equals(event.ownerUserId())
+                && eventOwnershipResolver != null
+                && eventOwnershipResolver.isConnectedAccountOwnedBy(ownerUserId, event.payload());
+    }
+
+    /**
+     * 收集连接器已经明确上报的“我”方消息，避免同一条 Agent 回复既由回写草稿合成又由 Webhook 重复出现。
+     */
+    private Map<String, Integer> collectExplicitSelfMessageCounts(List<StoredEvent> events) {
+        Map<String, Integer> counts = new LinkedHashMap<>();
+        events.stream()
+                .filter(event -> isSelfReportedMessage(event.payload()))
+                // 新事件使用 correlationId 精确关联，不能再同时进入文本兜底计数。
+                .filter(event -> event.payload().correlationId() == null
+                        || event.payload().correlationId().isBlank())
+                .map(event -> conversationMessageKey(event.payload(), event.payload().text()))
+                .forEach(key -> counts.merge(key, 1, Integer::sum));
+        return counts;
+    }
+
+    /**
+     * 收集连接器明确标记的 Agent 回写关联。一个关联计数只抵消一个合成气泡，避免多段回复被整体吞掉。
+     */
+    private Map<String, Integer> collectExplicitAgentCorrelationCounts(List<StoredEvent> events) {
+        Map<String, Integer> counts = new LinkedHashMap<>();
+        events.stream()
+                .map(StoredEvent::payload)
+                .filter(payload -> "AGENT".equalsIgnoreCase(payload.actorType()))
+                .map(UnifiedEventPayload::correlationId)
+                .filter(correlationId -> correlationId != null && !correlationId.isBlank())
+                .forEach(correlationId -> counts.merge(correlationId, 1, Integer::sum));
+        return counts;
+    }
+
+    /**
+     * 将一个事件展开成按时间倒序排列的会话片段：先返回较新的己方回复，再返回触发回复的对方消息。
+     */
+    private List<ConversationMessageResponse> toConversationTimeline(
+            StoredEvent event,
+            Map<String, Integer> explicitAgentCorrelations,
+            Map<String, Integer> explicitSelfMessages
+    ) {
+        List<ConversationMessageResponse> timeline = new ArrayList<>();
+        List<String> sentParts = sentReplyParts(event);
+        for (int index = sentParts.size() - 1; index >= 0; index--) {
+            String part = sentParts.get(index);
+            int correlatedCount = explicitAgentCorrelations.getOrDefault(event.eventId(), 0);
+            if (correlatedCount > 0) {
+                // Runtime 发送消息时 correlationId 指向触发回复的入站 eventId，这是首选的精确去重路径。
+                explicitAgentCorrelations.put(event.eventId(), correlatedCount - 1);
+                continue;
+            }
+            String messageKey = conversationMessageKey(event.payload(), part);
+            int explicitCount = explicitSelfMessages.getOrDefault(messageKey, 0);
+            if (explicitCount > 0) {
+                // 一个明确上报只能抵消一个合成回复；相同文本重复发送时不能把所有历史一起删掉。
+                explicitSelfMessages.put(messageKey, explicitCount - 1);
+            } else {
+                timeline.add(toSentReplyMessage(event, part, index));
+            }
+        }
+        timeline.add(toConversationMessage(event));
+        return timeline;
+    }
+
+    /**
+     * 只有平台确认发送成功的草稿才能进入历史，待审批、失败或仅生成草稿的内容绝不能伪装成真实消息。
+     */
+    private List<String> sentReplyParts(StoredEvent event) {
+        if (!("SENT".equals(event.writeBackStatus()) || "DELAYED_SENT".equals(event.writeBackStatus()))
+                || event.replyDraft() == null || event.replyDraft().isBlank()) {
+            return List.of();
+        }
+        return java.util.Arrays.stream(event.replyDraft().split("\\R+"))
+                .map(String::trim)
+                .filter(part -> !part.isBlank())
+                .toList();
+    }
+
+    /**
+     * 构造一条只用于上下文读取的己方回复记录，不修改原事件，也不会再次触发 Runtime。
+     */
+    private ConversationMessageResponse toSentReplyMessage(StoredEvent event, String text, int partIndex) {
+        UnifiedEventPayload payload = event.payload();
+        Instant sentAt = event.lastActionAt() != null
+                ? event.lastActionAt()
+                : (event.processedAt() != null ? event.processedAt() : event.receivedAt());
+        String messageOrigin = "CONFIRMED".equals(event.lastAction())
+                ? "AGENT_CONFIRMED" : "AGENT_AUTO";
+        return new ConversationMessageResponse(
+                event.eventId() + ":reply:" + partIndex,
+                payload.platform(),
+                payload.chatType(),
+                payload.chatId(),
+                deriveChatName(payload),
+                payload.selfId(),
+                "我",
+                "self",
+                resolveSenderAvatar(payload.rawPayload(), payload.selfId()),
+                text,
+                sentAt.toString(),
+                List.of(),
+                List.of(),
+                true,
+                false,
+                resolveStoredRoute(event),
+                deriveDispatchMode(payload),
+                event.processingStatus(),
+                event.processingSummary(),
+                event.writeBackStatus(),
+                false,
+                "",
+                resolveInboxStatus(event),
+                null,
+                messageOrigin,
+                List.of(),
+                "AGENT",
+                null,
+                "synthetic:" + event.eventId() + ":" + partIndex,
+                event.eventId(),
+                null,
+                sentAt.toString(),
+                event.receivedAt().toString(),
+                null,
+                "OUTBOUND",
+                payload.delegatedTaskId()
+        );
+    }
+
+    /**
+     * 为显式自身消息和合成回复生成稳定去重键，忽略仅由换行或空格造成的差异。
+     */
+    private String conversationMessageKey(UnifiedEventPayload payload, String text) {
+        String normalizedText = text == null ? "" : text.replaceAll("\\s+", "").trim();
+        return String.join("|", payload.platform(), payload.chatType(), payload.chatId(), normalizedText);
     }
 
     private StoredEventResponse toStoredEventResponse(StoredEvent storedEvent) {
@@ -387,7 +1025,8 @@ public class EventCenterApplicationService {
                 storedEvent.lastActionAt() != null ? storedEvent.lastActionAt().toString() : null,
                 resolveInboxStatus(storedEvent),
                 storedEvent.inboxUpdatedAt() != null ? storedEvent.inboxUpdatedAt().toString() : null,
-                storedEvent.snoozedUntil() != null ? storedEvent.snoozedUntil().toString() : null
+                storedEvent.snoozedUntil() != null ? storedEvent.snoozedUntil().toString() : null,
+                storedEvent.messageOrigin()
         );
     }
 
@@ -421,6 +1060,14 @@ public class EventCenterApplicationService {
     }
 
     private ConversationSummaryResponse toConversationSummary(StoredEvent storedEvent) {
+        return toConversationSummary(storedEvent, deriveChatName(storedEvent.payload()));
+    }
+
+    /**
+     * 这个函数的作用是使用会话历史中解析出的稳定名称生成列表摘要。
+     * 最新事件可能是 Agent 代发消息，不能让它把联系人名称覆盖成本人昵称或纯 QQ 号。
+     */
+    private ConversationSummaryResponse toConversationSummary(StoredEvent storedEvent, String preferredChatName) {
         // 这里返回的是“列表摘要模型”，字段尽量贴近前端会话栏直接可用的形态。
         UnifiedEventPayload payload = storedEvent.payload();
         String dispatchMode = deriveDispatchMode(payload);
@@ -428,7 +1075,9 @@ public class EventCenterApplicationService {
                 payload.platform(),
                 payload.chatType(),
                 payload.chatId(),
-                deriveChatName(payload),
+                isUsableConversationName(preferredChatName, payload.chatId())
+                        ? preferredChatName
+                        : deriveChatName(payload),
                 payload.sender() != null ? payload.sender().name() : "",
                 shorten(payload.text()),
                 payload.timestamp(),
@@ -456,6 +1105,10 @@ public class EventCenterApplicationService {
                 payload.sender() != null ? payload.sender().id() : null,
                 payload.sender() != null ? payload.sender().name() : null,
                 payload.sender() != null ? payload.sender().role() : null,
+                resolveSenderAvatar(
+                        payload.rawPayload(),
+                        payload.sender() != null ? payload.sender().id() : null
+                ),
                 payload.text(),
                 payload.timestamp(),
                 payload.mentions(),
@@ -470,8 +1123,129 @@ public class EventCenterApplicationService {
                 storedEvent.needHumanConfirmation(),
                 storedEvent.replyDraft(),
                 resolveInboxStatus(storedEvent),
-                storedEvent.snoozedUntil() != null ? storedEvent.snoozedUntil().toString() : null
+                storedEvent.snoozedUntil() != null ? storedEvent.snoozedUntil().toString() : null,
+                storedEvent.messageOrigin(),
+                extractMediaAnalysis(storedEvent.payload().rawPayload()),
+                resolveActorType(payload),
+                payload.platformMessageId(),
+                payload.clientMessageId(),
+                payload.correlationId(),
+                payload.sequence(),
+                firstNonBlank(payload.sentAt(), payload.timestamp()),
+                firstNonBlank(payload.receivedAt(), storedEvent.receivedAt().toString()),
+                payload.importedAt(),
+                resolveDirection(payload),
+                payload.delegatedTaskId()
         );
+    }
+
+    /**
+     * 统一参与者身份。新连接器直接提供 actorType；旧事件才根据 selfId 与 senderId 推断。
+     */
+    private String resolveActorType(UnifiedEventPayload payload) {
+        if (payload.actorType() != null && !payload.actorType().isBlank()) {
+            return payload.actorType().trim().toUpperCase();
+        }
+        if (isSelfReportedMessage(payload)) {
+            return payload.correlationId() != null && !payload.correlationId().isBlank()
+                    ? "AGENT" : "OWNER";
+        }
+        return "CONTACT";
+    }
+
+    /**
+     * 统一消息方向。连接器明确提供的方向优先，旧数据才根据参与者身份回退推断。
+     */
+    private String resolveDirection(UnifiedEventPayload payload) {
+        if (payload.direction() != null && !payload.direction().isBlank()) {
+            return payload.direction().trim().toUpperCase();
+        }
+        return switch (resolveActorType(payload)) {
+            case "OWNER", "AGENT" -> "OUTBOUND";
+            case "SYSTEM" -> "INTERNAL";
+            default -> "INBOUND";
+        };
+    }
+
+    /**
+     * 优先读取 QCE 导出消息内嵌的头像；没有内嵌头像时再按 QQ 号生成公开头像地址。
+     * 其他平台或无法确认数字账号时返回空值，前端会继续使用文字占位头像。
+     */
+    private String resolveSenderAvatar(JsonNode rawPayload, String senderId) {
+        String embeddedAvatar = rawPayload == null
+                ? ""
+                : rawPayload.path("qceMessage").path("sender").path("avatarBase64").asText("").trim();
+        if (!embeddedAvatar.isBlank()) {
+            return embeddedAvatar.startsWith("data:")
+                    ? embeddedAvatar
+                    : "data:image/png;base64," + embeddedAvatar;
+        }
+        String safeSenderId = safeText(senderId);
+        if (safeSenderId.matches("\\d{5,12}")) {
+            return "https://q1.qlogo.cn/g?b=qq&nk=" + safeSenderId + "&s=100";
+        }
+        return null;
+    }
+
+    /**
+     * 接收 Runtime 后台附件任务的结果，并追加到该事件原始载荷中。
+     * 该操作不会重新派发 Agent，也不会覆盖原有草稿或人工审批状态。
+     */
+    public StoredEvent recordMediaAnalysis(String eventId, MediaAnalysisUpdateRequest request) {
+        StoredEvent storedEvent = repository.findByEventId(eventId)
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "事件不存在"));
+
+        UnifiedEventPayload payload = storedEvent.payload();
+        ObjectNode rawPayload = payload.rawPayload() != null && payload.rawPayload().isObject()
+                ? ((ObjectNode) payload.rawPayload()).deepCopy()
+                : JsonNodeFactory.instance.objectNode();
+        var mediaAnalysis = rawPayload.putArray("mediaAnalysis");
+        for (MediaAnalysisItem item : request.analyses()) {
+            ObjectNode node = mediaAnalysis.addObject();
+            node.put("attachmentId", safeText(item.attachmentId()));
+            node.put("fileName", safeText(item.fileName()));
+            node.put("fileType", safeText(item.fileType()));
+            node.put("status", safeText(item.status()));
+            node.put("summary", safeText(item.summary()));
+            node.put("extractedText", safeText(item.extractedText()));
+        }
+
+        UnifiedEventPayload updatedPayload = new UnifiedEventPayload(
+                payload.eventId(), payload.platform(), payload.scene(), payload.eventType(), payload.chatType(),
+                payload.chatId(), payload.selfId(), payload.sender(), payload.text(), payload.attachments(),
+                payload.mentions(), payload.timestamp(), rawPayload, payload.actorType(),
+                payload.platformMessageId(), payload.clientMessageId(), payload.correlationId(), payload.sequence(),
+                payload.sentAt(), payload.receivedAt(), payload.importedAt(), payload.direction(),
+                payload.delegatedTaskId()
+        );
+        StoredEvent updatedEvent = storedEvent.withPayload(updatedPayload);
+        repository.save(updatedEvent);
+        publishWorkspaceUpdate("event.media_analyzed", updatedEvent);
+        return updatedEvent;
+    }
+
+    /** 从 rawPayload 读取异步结果，兼容旧事件没有 mediaAnalysis 字段的情况。 */
+    private List<MediaAnalysisResponse> extractMediaAnalysis(JsonNode rawPayload) {
+        if (rawPayload == null || !rawPayload.path("mediaAnalysis").isArray()) {
+            return List.of();
+        }
+        List<MediaAnalysisResponse> result = new ArrayList<>();
+        for (JsonNode item : rawPayload.path("mediaAnalysis")) {
+            result.add(new MediaAnalysisResponse(
+                    text(item, "attachmentId"), text(item, "fileName"), text(item, "fileType"),
+                    text(item, "status"), text(item, "summary"), text(item, "extractedText")
+            ));
+        }
+        return result;
+    }
+
+    private String safeText(String value) {
+        return value == null ? "" : value;
+    }
+
+    /** 返回第一个非空值，兼容尚未单独上报 sentAt/receivedAt 的旧事件。 */
+    private String firstNonBlank(String preferred, String fallback) {
+        return preferred == null || preferred.isBlank() ? fallback : preferred;
     }
 
     private StoredEvent applyDispatchResult(StoredEvent storedEvent, DispatchResult dispatch) {
@@ -521,8 +1295,30 @@ public class EventCenterApplicationService {
                 dispatch.body().path("summary").asText(""),
                 writeBackActions(dispatch).stream().map(this::sanitizeWriteBackAction).toList(),
                 steps,
-                deriveNotificationDecision(dispatch.body().path("notification"))
+                deriveNotificationDecision(dispatch.body().path("notification")),
+                extractSafeMemoryIds(dispatch.body().path("verified_memory_ids"))
         );
+    }
+
+    private List<String> extractSafeMemoryIds(JsonNode values) {
+        // 这个函数的作用是只保留有限数量的记忆标识，不允许 Runtime 借审计字段写入正文或嵌套数据。
+        if (!values.isArray()) {
+            return List.of();
+        }
+        List<String> memoryIds = new ArrayList<>();
+        for (JsonNode value : values) {
+            if (!value.isTextual()) {
+                continue;
+            }
+            String memoryId = value.asText("").trim();
+            if (!memoryId.isBlank() && memoryId.length() <= 255 && !memoryIds.contains(memoryId)) {
+                memoryIds.add(memoryId);
+            }
+            if (memoryIds.size() >= 100) {
+                break;
+            }
+        }
+        return memoryIds;
     }
 
     private NotificationDecision deriveNotificationDecision(JsonNode notification) {
@@ -600,7 +1396,8 @@ public class EventCenterApplicationService {
                 executionTrace.summary(),
                 executionTrace.writeBackActions(),
                 steps,
-                toNotificationDecisionResponse(executionTrace.notification())
+                toNotificationDecisionResponse(executionTrace.notification()),
+                executionTrace.verifiedMemoryIds() == null ? List.of() : executionTrace.verifiedMemoryIds()
         );
     }
 
@@ -680,9 +1477,111 @@ public class EventCenterApplicationService {
     private boolean isRetryable(StoredEvent storedEvent) {
         // 这个函数的作用是限制重试范围，只允许对派发、发送失败或尚未完成处理的事件再次执行。
         return "RECEIVED".equals(storedEvent.processingStatus())
+                || "DISPATCH_RETRY_PENDING".equals(storedEvent.processingStatus())
                 || "DISPATCH_FAILED".equals(storedEvent.processingStatus())
                 || "SEND_FAILED".equals(storedEvent.processingStatus())
                 || "FAILED".equals(storedEvent.writeBackStatus());
+    }
+
+    /** 判断自动重试组件是否完整启用。 */
+    private boolean isAutomaticRetryEnabled() {
+        return dispatchRetryRepository != null
+                && dispatchRetryProperties != null
+                && dispatchRetryProperties.isEnabled();
+    }
+
+    /**
+     * 判断当前失败能否自动重试。4xx 参数或权限错误不会重试，避免无意义请求持续占用模型和平台资源。
+     */
+    private boolean isTransientDispatchFailure(DispatchResult dispatch) {
+        if (!dispatch.attempted() || isSuccessfulDispatch(dispatch)) {
+            return false;
+        }
+        Integer status = dispatch.httpStatus();
+        if (status == null) {
+            return true;
+        }
+        return status == 408 || status == 425 || status == 429 || status >= 500;
+    }
+
+    /** 判断 Runtime 是否返回了可落库的成功响应。 */
+    private boolean isSuccessfulDispatch(DispatchResult dispatch) {
+        return dispatch.attempted()
+                && dispatch.error() == null
+                && dispatch.httpStatus() != null
+                && dispatch.httpStatus() >= 200
+                && dispatch.httpStatus() < 400;
+    }
+
+    /** 根据已完成次数和最大次数判断是否继续安排下一次自动重试。 */
+    private boolean shouldScheduleAutomaticRetry(DispatchResult dispatch, int completedAttempts) {
+        return isAutomaticRetryEnabled()
+                && isTransientDispatchFailure(dispatch)
+                && completedAttempts < dispatchRetryProperties.getMaxAttempts();
+    }
+
+    /** 使用指数退避计算下一次执行时间，并受配置的最大延迟限制。 */
+    private Instant nextRetryAt(int completedAttempts) {
+        long multiplier = 1L << Math.min(Math.max(completedAttempts - 1, 0), 20);
+        long delaySeconds = Math.min(
+                dispatchRetryProperties.getInitialDelaySeconds() * multiplier,
+                dispatchRetryProperties.getMaxDelaySeconds()
+        );
+        return Instant.now().plusSeconds(Math.max(delaySeconds, 0));
+    }
+
+    /** 把临时故障转换成不会触发人工接管的“等待自动恢复”事件状态。 */
+    private StoredEvent markDispatchRetryPending(
+            StoredEvent storedEvent,
+            int completedAttempts,
+            Instant nextAttemptAt,
+            DispatchResult dispatch
+    ) {
+        return storedEvent.markProcessed(
+                "DISPATCH_RETRY_PENDING",
+                "Agent Runtime 暂时不可用，已完成第 " + completedAttempts
+                        + " 次尝试，将在 " + nextAttemptAt + " 自动重试。",
+                deriveRoute(storedEvent.payload()),
+                "PENDING",
+                false,
+                null,
+                storedEvent.replyDraft(),
+                storedEvent.executionTrace()
+        ).markAction(
+                "DISPATCH_RETRY_PENDING",
+                "Agent Runtime 暂时不可用，系统正在自动恢复。",
+                "PENDING",
+                false,
+                storedEvent.replyDraft(),
+                "AUTO_RETRY_SCHEDULED",
+                dispatchError(dispatch),
+                Instant.now()
+        );
+    }
+
+    /** 返回适合日志和重试表保存的简短故障信息。 */
+    private String dispatchError(DispatchResult dispatch) {
+        if (dispatch.error() != null && !dispatch.error().isBlank()) {
+            return dispatch.error();
+        }
+        return "HTTP " + dispatch.httpStatus();
+    }
+
+    /** 在手动重试产生最终结果后同步结束可能存在的后台任务。 */
+    private void finishRetryJob(String eventId, DispatchResult dispatch, int completedAttempts) {
+        if (dispatchRetryRepository == null) {
+            return;
+        }
+        if (isSuccessfulDispatch(dispatch)) {
+            dispatchRetryRepository.markSucceeded(eventId, Instant.now());
+        } else {
+            dispatchRetryRepository.markDead(
+                    eventId,
+                    completedAttempts,
+                    dispatchError(dispatch),
+                    Instant.now()
+            );
+        }
     }
 
     private String normalizeNote(String note) {
@@ -908,15 +1807,41 @@ public class EventCenterApplicationService {
     }
 
     private Map<String, StoredEvent> latestConversationEvents() {
+        // 旧版内部统计仍可读取全部用户的数据；用户侧功能必须调用带 ownerUserId 的重载。
+        return latestConversationEvents(null);
+    }
+
+    /** 先执行用户隔离，再为每个会话保留最新事件。 */
+    private Map<String, StoredEvent> latestConversationEvents(String ownerUserId) {
         Map<String, StoredEvent> latestByConversation = new LinkedHashMap<>();
 
         // repository.findAll() 已经按 receivedAt 倒序排好，
         // 所以每个会话第一次出现的事件就是最新那条。
         repository.findAll().stream()
                 .filter(this::isVisibleInInbox)
+                .filter(event -> ownerUserId == null || isOwnedConversationEvent(ownerUserId, event))
                 .forEach(event -> latestByConversation.putIfAbsent(conversationKey(event.payload()), event));
 
         return latestByConversation;
+    }
+
+    /**
+     * 这个函数的作用是从每个会话的历史入站事件中提取联系人或群名称。
+     * 仓库按时间倒序返回事件，putIfAbsent 会优先保留最近一次真实、可读的名称。
+     */
+    private Map<String, String> preferredConversationNames(String ownerUserId) {
+        Map<String, String> names = new LinkedHashMap<>();
+        repository.findAll().stream()
+                .filter(this::isVisibleInInbox)
+                .filter(event -> ownerUserId == null || isOwnedConversationEvent(ownerUserId, event))
+                .forEach(event -> {
+                    UnifiedEventPayload payload = event.payload();
+                    String candidate = deriveStableChatName(payload);
+                    if (isUsableConversationName(candidate, payload.chatId())) {
+                        names.putIfAbsent(conversationKey(payload), candidate.trim());
+                    }
+                });
+        return names;
     }
 
     private boolean matchesConversationSummary(
@@ -990,6 +1915,15 @@ public class EventCenterApplicationService {
     }
 
     private String deriveChatName(UnifiedEventPayload payload) {
+        String stableName = deriveStableChatName(payload);
+        return stableName.isBlank() ? payload.chatId() : stableName;
+    }
+
+    /**
+     * 这个函数的作用是只从能够证明对方身份的字段中解析会话名称。
+     * 私聊中 senderId 等于 chatId 才表示消息来自对方；Agent 或本人发出的消息不能用于命名联系人。
+     */
+    private String deriveStableChatName(UnifiedEventPayload payload) {
         JsonNode rawPayload = payload.rawPayload();
         if (rawPayload != null) {
             String groupName = text(rawPayload, "group_name");
@@ -997,10 +1931,26 @@ public class EventCenterApplicationService {
                 return groupName;
             }
         }
-        if ("private".equals(payload.chatType()) && payload.sender() != null && payload.sender().name() != null) {
+        if ("private".equals(payload.chatType())
+                && payload.sender() != null
+                && payload.chatId().equals(payload.sender().id())
+                && payload.sender().name() != null) {
             return payload.sender().name();
         }
-        return payload.chatId();
+        return "";
+    }
+
+    /** 这个函数的作用是排除 QQ 号和旧版本占位符，只把可读文本作为会话名称。 */
+    private boolean isUsableConversationName(String value, String chatId) {
+        if (value == null || value.isBlank()) {
+            return false;
+        }
+        String normalized = value.trim();
+        return !normalized.equals(chatId)
+                && !normalized.matches("\\d+")
+                && !normalized.equalsIgnoreCase("unknown")
+                && !normalized.equalsIgnoreCase("null")
+                && !normalized.equalsIgnoreCase("undefined");
     }
 
     private String deriveRoute(UnifiedEventPayload payload) {

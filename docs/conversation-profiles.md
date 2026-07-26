@@ -2,6 +2,9 @@
 
 会话设定集是 `Memo Echo Agent` 的一层运行时策略配置。
 
+涉及收款码、卡密、交付文件等敏感内容时，不要把正文写进 `systemPrompt`。应使用
+[安全资产库](secure-assets.md) 保存正文，并在 Profile 2.0 中只绑定资产引用和使用条件。
+
 它不直接替代某个具体 Agent，而是在消息进入 Python runtime 之前，先决定：
 
 - 这条消息属于哪个会话范围
@@ -332,16 +335,132 @@ Content-Type: application/json
 }
 ```
 
-## 下一步建议
+## Conversation Profile 2.0
 
-下一步最适合接的是两块：
+Profile 2.0 将原来集中在 `systemPrompt` 的身份、关系和业务信息拆成结构化上下文。自由文本人格仍保留，用于兼容旧设定和补充难以结构化的表达要求，但不再承担工具授权和业务状态管理。
 
-1. 前端配置页
-   - 直接增删改查这些设定
-   - 展示当前会话命中的 profile
-   - 展示 `resolvedSkills`、`unresolved_skill_references`、`allowedTools`
+### 字段职责
 
-2. GitHub skill 安装链路
-   - 把 `github://...` 从“仅记录未解析”升级为“可安装 skill 源”
-   - 增加 skill 清单、缓存目录、版本号、启停状态
-   - 增加 skill 审核策略，避免前端一键加载任意危险能力
+| 模块 | API 字段 | 作用 |
+| --- | --- | --- |
+| 我的身份 | `profileContext.identity` | 代表对象、角色、说话风格和禁用表达 |
+| 对方资料 | `profileContext.counterparty` | 对方身份、关系、称呼、已知事实、可信度和沟通偏好 |
+| 对话背景 | `profileContext.background` | 会话起因、之前发生的事情和当前进展 |
+| 对话任务 | `profileContext.task` | 最终目标、成功条件、截止时间和禁止事项 |
+| 业务规则 | `profileContext.businessRules` | 报价、最低价、退款、交付条件和硬约束 |
+| 可用资产 | `profileContext.assets` | 只保存资产 ID、类型、名称和使用条件，不保存资产正文 |
+| 知识来源 | `knowledgeBaseSources`、`skillReferences` | 继续使用原有知识库和 Skill 解析链路 |
+| 工具权限 | `allowedTools` | 工具白名单；任务和资产不能自动扩大权限 |
+| 审批策略 | `reviewMode`、`requireHumanConfirmation` | 决定自动纠偏还是转人工，以及动作是否确认 |
+| 记忆策略 | `privateHistoryEnabled`、`historyTrainingEnabled`、`profileContext.memoryPolicy` | 分别控制历史读取、个人 Skill 样本授权和长期记忆候选提取 |
+
+### 创建示例
+
+下面只展示 2.0 相关字段。实际请求仍需包含会话范围、触发模式和回复策略等既有字段。
+
+```json
+{
+  "name": "网易云会员交易",
+  "systemPrompt": "像本人一样简短自然地聊天",
+  "allowedTools": ["send_qq_message", "send_asset"],
+  "reviewMode": "STRICT_HANDOFF",
+  "requireHumanConfirmation": true,
+  "knowledgeBaseSources": ["C:/memo-echo/knowledge/product-rules.md"],
+  "profileContext": {
+    "version": 2,
+    "identity": {
+      "representedPerson": "freeze",
+      "role": "网易云会员卖家",
+      "speakingStyle": "短句、自然、不使用客服腔",
+      "forbiddenExpressions": ["我先确认一下", "我会跟进"]
+    },
+    "counterparty": {
+      "name": "小号",
+      "identity": "潜在买家",
+      "relationship": "首次交易",
+      "preferredAddress": "你",
+      "knownFacts": ["想购买一个月会员"],
+      "trustLevel": "MEDIUM",
+      "communicationPreference": "直接沟通价格和交付"
+    },
+    "background": {
+      "origin": "对方询问网易云会员",
+      "previousEvents": "已告知月卡和年卡价格",
+      "currentProgress": "等待对方确认套餐"
+    },
+    "task": {
+      "objective": "在规则范围内完成交易",
+      "successCriteria": ["确认套餐", "确认付款", "完成交付"],
+      "deadline": "2026-07-20T20:00:00+08:00",
+      "prohibitedActions": ["不得虚构联系方式", "不得在未到账时交付"]
+    },
+    "businessRules": {
+      "pricingPolicy": "月卡 15 元，年卡 50 元",
+      "minimumPrice": "15 元",
+      "refundPolicy": "未交付可退款，交付后按商品规则处理",
+      "deliveryConditions": "确认到账后才能交付",
+      "hardConstraints": ["不得低于最低价"]
+    },
+    "memoryPolicy": {
+      "extractionEnabled": true
+    },
+    "assets": [
+      {
+        "assetId": "asset-payment-001",
+        "type": "PAYMENT_QR",
+        "name": "微信收款码",
+        "description": "当前账号的微信收款码",
+        "usageCondition": "买家明确确认购买后，经审批发送"
+      }
+    ]
+  }
+}
+```
+
+### Prompt 编译顺序
+
+Python Runtime 的 `ConversationPromptCompiler` 按以下顺序拼接系统上下文：
+
+1. 执行边界、工具白名单和审批模式。
+2. 我的身份和对方资料。
+3. 对话背景和对话任务。
+4. 业务规则和资产引用。
+5. 旧版自由文本人格补充。
+6. SocialAgent 再追加 Skill、QQ 短消息协议、历史上下文和知识检索片段。
+
+空模块不会进入最终 Prompt。所有缺失事实都保持未知，不允许模型自行补全；资产正文只能由已授权工具按 `assetId` 读取。
+
+## 长期记忆候选
+
+长期记忆候选与“读取近期历史”“历史消息用于个人 Skill”是三项独立授权：
+
+| 授权 | 控制字段 | 用途 |
+| --- | --- | --- |
+| 读取近期历史 | `privateHistoryEnabled` | 为当前一轮回复补充短期上下文 |
+| 个人 Skill 样本 | `historyTrainingEnabled` | 提炼账号主人的表达风格 |
+| 长期记忆候选 | `profileContext.memoryPolicy.extractionEnabled` | 从账号主人明确说出的稳定事实中生成待确认候选 |
+
+只有三项授权分别开启时，对应能力才会工作；开启其中一项不会隐式开启另外两项。
+
+### 自动提取边界
+
+Runtime 只在以下条件同时成立时异步提取长期记忆候选：
+
+1. 当前会话命中了已启用的 Profile。
+2. `memoryPolicy.extractionEnabled=true`。
+3. 当前事件已被 Event Center 标记为 `OWNER`，即消息确实来自账号主人。
+4. 当前路由解析到了可用的 LLM 配置。
+5. 文本包含账号主人明确陈述、未来仍可能有用的稳定事实。
+
+问题、命令、临时状态、玩笑、猜测、第三方陈述、密码和验证码等敏感信息不会被提取。Agent 代发消息也不会作为候选来源。
+
+### 状态与可信度
+
+- 自动抽取结果固定写入 `CANDIDATE`，不会直接成为已确认记忆。
+- Event Center 会按来源 `eventId` 回查事件归属、`actorType=OWNER` 和 `messageOrigin=USER_MANUAL`，不信任 Runtime 自报的来源标签。
+- 只有用户在桌面端确认后的 `VERIFIED` 记录，才能按平台、场景或会话作用域进入 Agent 上下文。
+- 完全相同的候选事实会合并来源事件并更新最后出现时间，避免重复卡片。
+- 同一属性出现不同值时不会覆盖旧事实，也不能绕过冲突流程直接确认。
+- 用户选择“保留已确认值”时，新候选进入 `REJECTED`；选择“采用候选值”时，旧值进入 `SUPERSEDED`，新值进入 `VERIFIED`。两步由同一数据库事务完成。
+- 候选来源按需读取，每个来源事件只返回有限半径内的聊天上下文；多段窗口会按事件 ID 去重，缺失或越权来源会单独标记。
+- 桌面端“长期记忆”入口会显示待确认数量；打开后可查看来源、编辑、确认、处理冲突、拒绝或删除。

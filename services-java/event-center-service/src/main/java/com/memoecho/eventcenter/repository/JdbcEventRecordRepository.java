@@ -46,12 +46,13 @@ public class JdbcEventRecordRepository implements EventRecordRepository {
         // 这个函数的作用是保存完整事件状态；先更新再插入的方式兼容 H2 和 MySQL，避免依赖方言专属 MERGE 语法。
         int updated = jdbcTemplate.update("""
                         UPDATE event_record
-                        SET payload_json = ?, received_at = ?, processing_status = ?, processing_summary = ?,
+                        SET owner_user_id = ?, payload_json = ?, received_at = ?, processing_status = ?, processing_summary = ?,
                             resolved_route = ?, write_back_status = ?, need_human_confirmation = ?, processed_at = ?,
                             reply_draft = ?, execution_trace_json = ?, last_action = ?, last_action_note = ?,
-                            last_action_at = ?, inbox_status = ?, inbox_updated_at = ?, snoozed_until = ?
+                            last_action_at = ?, inbox_status = ?, inbox_updated_at = ?, snoozed_until = ?, message_origin = ?
                         WHERE event_id = ?
                         """,
+                event.ownerUserId(),
                 serialize(event.payload()),
                 toTimestamp(event.receivedAt()),
                 event.processingStatus(),
@@ -68,18 +69,20 @@ public class JdbcEventRecordRepository implements EventRecordRepository {
                 event.inboxStatus(),
                 toTimestamp(event.inboxUpdatedAt()),
                 toTimestamp(event.snoozedUntil()),
+                event.messageOrigin(),
                 event.eventId()
         );
         if (updated == 0) {
             jdbcTemplate.update("""
                             INSERT INTO event_record (
-                                event_id, payload_json, received_at, processing_status, processing_summary,
+                                event_id, owner_user_id, payload_json, received_at, processing_status, processing_summary,
                                 resolved_route, write_back_status, need_human_confirmation, processed_at,
                                 reply_draft, execution_trace_json, last_action, last_action_note, last_action_at,
-                                inbox_status, inbox_updated_at, snoozed_until
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                inbox_status, inbox_updated_at, snoozed_until, message_origin
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                             """,
                     event.eventId(),
+                    event.ownerUserId(),
                     serialize(event.payload()),
                     toTimestamp(event.receivedAt()),
                     event.processingStatus(),
@@ -95,7 +98,8 @@ public class JdbcEventRecordRepository implements EventRecordRepository {
                     toTimestamp(event.lastActionAt()),
                     event.inboxStatus(),
                     toTimestamp(event.inboxUpdatedAt()),
-                    toTimestamp(event.snoozedUntil())
+                    toTimestamp(event.snoozedUntil()),
+                    event.messageOrigin()
             );
         }
     }
@@ -124,6 +128,7 @@ public class JdbcEventRecordRepository implements EventRecordRepository {
         // 这个函数的作用是创建依赖当前 ObjectMapper 的行映射器，负责把 JSON 列还原成领域对象。
         return (rs, rowNum) -> new StoredEvent(
                 rs.getString("event_id"),
+                rs.getString("owner_user_id"),
                 deserialize(rs.getString("payload_json"), UnifiedEventPayload.class),
                 toInstant(rs.getTimestamp("received_at")),
                 rs.getString("processing_status"),
@@ -139,7 +144,8 @@ public class JdbcEventRecordRepository implements EventRecordRepository {
                 toInstant(rs.getTimestamp("last_action_at")),
                 rs.getString("inbox_status"),
                 toInstant(rs.getTimestamp("inbox_updated_at")),
-                toInstant(rs.getTimestamp("snoozed_until"))
+                toInstant(rs.getTimestamp("snoozed_until")),
+                rs.getString("message_origin")
         );
     }
 

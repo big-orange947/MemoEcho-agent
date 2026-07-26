@@ -42,6 +42,10 @@ class RouterService:
         if not is_direct_message:
             return "message_dispatch"
 
+        # 私聊图片属于会话内容：先由视觉解析补足上下文，再交给社交回复和审查链路。
+        # 文档附件仍保持文件分析工作流，避免打断已有的任务提取和日程创建能力。
+        if is_direct_message and any((attachment.file_type or "").lower() == "image" for attachment in event.attachments):
+            return "social_reply"
         if event.attachments:
             return "file_analysis"
         if self._looks_like_task_route(text):
@@ -50,9 +54,19 @@ class RouterService:
             return "schedule_extract"
         if event.chat_type == "private":
             return "social_reply"
-        if any(keyword in text for keyword in ("notice", "welcome", "mute", "announce")):
+        if self._looks_like_group_operation(text):
             return "group_ops"
         return "chat_summary"
+
+    @staticmethod
+    def _looks_like_group_operation(text: str) -> bool:
+        """仅对明确群管理词汇触发 GroupOps，避免普通聊天误进入管理链路。"""
+        keywords = (
+            "/group", "group info", "group members", "group notices", "mute", "unmute",
+            "群信息", "群资料", "群成员", "成员列表", "群公告", "群文件", "禁言列表",
+            "禁言", "踢出", "踢人", "群名片", "设置群名", "管理员", "精华消息", "设为精华",
+        )
+        return any(keyword in text for keyword in keywords)
 
     def _resolve_desktop_route(self, event: UnifiedEvent) -> str | None:
         # 这个函数的作用是读取桌面客户端显式选择的工作流，并用白名单阻止任意内部路由注入。

@@ -4,6 +4,7 @@ import com.memoecho.eventcenter.model.UserModelProfile;
 import org.springframework.context.annotation.Primary;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
+import org.springframework.jdbc.core.ConnectionCallback;
 import org.springframework.stereotype.Repository;
 
 import java.sql.ResultSet;
@@ -21,16 +22,56 @@ public class JdbcUserModelProfileRepository implements UserModelProfileRepositor
     private static final RowMapper<UserModelProfile> ROW_MAPPER = new UserModelProfileRowMapper();
 
     private final JdbcTemplate jdbcTemplate;
+    private final boolean mysqlDatabase;
 
     public JdbcUserModelProfileRepository(JdbcTemplate jdbcTemplate) {
         // 这个函数的作用是注入 JdbcTemplate，供用户模型配置走数据库持久化读写。
         this.jdbcTemplate = jdbcTemplate;
+        this.mysqlDatabase = Boolean.TRUE.equals(jdbcTemplate.execute(
+                (ConnectionCallback<Boolean>) connection ->
+                        "MySQL".equalsIgnoreCase(connection.getMetaData().getDatabaseProductName())
+        ));
     }
 
     @Override
     public UserModelProfile save(UserModelProfile profile) {
-        // 这个函数的作用是把用户模型配置写入数据库，已存在则覆盖更新。
-        jdbcTemplate.update("""
+        // MySQL 不支持 H2 的 MERGE；主键冲突时更新全部配置字段，避免编辑操作产生重复记录。
+        String sql = mysqlDatabase ? """
+                        INSERT INTO user_model_profile (
+                            id,
+                            user_id,
+                            name,
+                            description,
+                            enabled,
+                            provider,
+                            base_url,
+                            api_key,
+                            model,
+                            temperature,
+                            max_tokens,
+                            supported_routes,
+                            is_default,
+                            priority,
+                            created_at,
+                            updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON DUPLICATE KEY UPDATE
+                            user_id = VALUES(user_id),
+                            name = VALUES(name),
+                            description = VALUES(description),
+                            enabled = VALUES(enabled),
+                            provider = VALUES(provider),
+                            base_url = VALUES(base_url),
+                            api_key = VALUES(api_key),
+                            model = VALUES(model),
+                            temperature = VALUES(temperature),
+                            max_tokens = VALUES(max_tokens),
+                            supported_routes = VALUES(supported_routes),
+                            is_default = VALUES(is_default),
+                            priority = VALUES(priority),
+                            created_at = VALUES(created_at),
+                            updated_at = VALUES(updated_at)
+                        """ : """
                         MERGE INTO user_model_profile (
                             id,
                             user_id,
@@ -49,7 +90,8 @@ public class JdbcUserModelProfileRepository implements UserModelProfileRepositor
                             created_at,
                             updated_at
                         ) KEY (id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
+                        """;
+        jdbcTemplate.update(sql,
                 profile.id(),
                 profile.userId(),
                 profile.name(),

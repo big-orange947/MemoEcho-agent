@@ -1,0 +1,28 @@
+-- 会话认知卡保存 AI 对单个会话的动态理解；用户确认字段由应用层锁定，不能被后续推断覆盖。
+CREATE TABLE IF NOT EXISTS conversation_cognition_card (
+    id VARCHAR(64) NOT NULL,
+    user_id VARCHAR(128) NOT NULL,
+    platform VARCHAR(64) NOT NULL,
+    chat_type VARCHAR(32) NOT NULL,
+    chat_id VARCHAR(255) NOT NULL,
+    version INT NOT NULL,
+    relationship_json LONGTEXT NOT NULL,
+    preferred_address_json LONGTEXT NOT NULL,
+    counterparty_traits_json LONGTEXT NOT NULL,
+    owner_expression_habits_json LONGTEXT NOT NULL,
+    counterparty_expression_habits_json LONGTEXT NOT NULL,
+    background_summary_json LONGTEXT NOT NULL,
+    current_progress_json LONGTEXT NOT NULL,
+    known_facts_json LONGTEXT NOT NULL,
+    recent_topics_json LONGTEXT NOT NULL,
+    open_questions_json LONGTEXT NOT NULL,
+    source_event_ids_json LONGTEXT NOT NULL,
+    source_message_count INT NOT NULL,
+    status VARCHAR(32) NOT NULL,
+    analyzed_at DATETIME(6) NOT NULL,
+    created_at DATETIME(6) NOT NULL,
+    updated_at DATETIME(6) NOT NULL,
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_cognition_card_scope (user_id, platform, chat_type, chat_id),
+    KEY idx_cognition_card_user_updated (user_id, updated_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

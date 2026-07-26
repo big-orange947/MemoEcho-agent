@@ -16,6 +16,9 @@ public interface PlatformConnectionRepository {
     /** 按连接 ID 和用户 ID 查询，用于强制执行所有权边界。 */
     Optional<PlatformConnection> findByIdAndUserId(String id, String userId);
 
+    /** 根据平台及已登录账号反查连接所属用户，用于给接入事件建立数据归属。 */
+    Optional<String> findUserIdByPlatformAndAccountId(String platform, String accountId);
+
     /** 只删除指定用户拥有的连接档案。 */
     void deleteByIdAndUserId(String id, String userId);
 }

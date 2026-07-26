@@ -4,8 +4,10 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.memoecho.eventcenter.model.ConversationProfile;
+import com.memoecho.eventcenter.model.ConversationProfileContext;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
+import org.springframework.jdbc.core.ConnectionCallback;
 import org.springframework.stereotype.Repository;
 
 import java.sql.ResultSet;
@@ -27,20 +29,85 @@ public class JdbcConversationProfileRepository implements ConversationProfileRep
     private static final RowMapper<ConversationProfile> ROW_MAPPER = new ConversationProfileRowMapper();
 
     private final JdbcTemplate jdbcTemplate;
+    private final boolean mysqlDatabase;
 
     /**
      * 注入 Spring JDBC 模板，用于执行设定集的增删改查。
      */
     public JdbcConversationProfileRepository(JdbcTemplate jdbcTemplate) {
         this.jdbcTemplate = jdbcTemplate;
+        this.mysqlDatabase = Boolean.TRUE.equals(jdbcTemplate.execute(
+                (ConnectionCallback<Boolean>) connection ->
+                        "MySQL".equalsIgnoreCase(connection.getMetaData().getDatabaseProductName())
+        ));
     }
 
     /**
-     * 新增或覆盖一个会话设定集。MERGE 让创建和编辑共用同一条持久化路径。
+     * 新增或覆盖会话设定。MySQL 不支持 H2 的 MERGE 语法，因此使用主键冲突更新实现幂等保存。
      */
     @Override
     public ConversationProfile save(ConversationProfile profile) {
-        jdbcTemplate.update("""
+        String sql = mysqlDatabase ? """
+                        INSERT INTO conversation_profile (
+                            id, user_id, name, description, enabled, platform, account_id, scene, chat_type,
+                            chat_ids_json, target_user_ids_json, supported_routes_json, trigger_mode,
+                            trigger_keywords_json, persona_mode, system_prompt, skill_reference,
+                            skill_references_json, model_profile_id, preferred_route, reply_mode,
+                            reply_delay_seconds_min, reply_delay_seconds_max, allowed_tools_json,
+                            require_human_confirmation, priority, created_at, updated_at, notification_mode,
+                            notification_keywords_json, digest_window_seconds, digest_max_messages,
+                            include_urgent_in_digest, max_reply_chars, split_long_reply,
+                            split_reply_chance_percent, private_history_enabled,
+                            history_max_messages, history_max_chars, history_training_enabled, review_mode,
+                            knowledge_base_sources_json, profile_context_json
+                        ) VALUES (
+                            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                        )
+                        ON DUPLICATE KEY UPDATE
+                            user_id = VALUES(user_id),
+                            name = VALUES(name),
+                            description = VALUES(description),
+                            enabled = VALUES(enabled),
+                            platform = VALUES(platform),
+                            account_id = VALUES(account_id),
+                            scene = VALUES(scene),
+                            chat_type = VALUES(chat_type),
+                            chat_ids_json = VALUES(chat_ids_json),
+                            target_user_ids_json = VALUES(target_user_ids_json),
+                            supported_routes_json = VALUES(supported_routes_json),
+                            trigger_mode = VALUES(trigger_mode),
+                            trigger_keywords_json = VALUES(trigger_keywords_json),
+                            persona_mode = VALUES(persona_mode),
+                            system_prompt = VALUES(system_prompt),
+                            skill_reference = VALUES(skill_reference),
+                            skill_references_json = VALUES(skill_references_json),
+                            model_profile_id = VALUES(model_profile_id),
+                            preferred_route = VALUES(preferred_route),
+                            reply_mode = VALUES(reply_mode),
+                            reply_delay_seconds_min = VALUES(reply_delay_seconds_min),
+                            reply_delay_seconds_max = VALUES(reply_delay_seconds_max),
+                            allowed_tools_json = VALUES(allowed_tools_json),
+                            require_human_confirmation = VALUES(require_human_confirmation),
+                            priority = VALUES(priority),
+                            created_at = VALUES(created_at),
+                            updated_at = VALUES(updated_at),
+                            notification_mode = VALUES(notification_mode),
+                            notification_keywords_json = VALUES(notification_keywords_json),
+                            digest_window_seconds = VALUES(digest_window_seconds),
+                            digest_max_messages = VALUES(digest_max_messages),
+                            include_urgent_in_digest = VALUES(include_urgent_in_digest),
+                            max_reply_chars = VALUES(max_reply_chars),
+                            split_long_reply = VALUES(split_long_reply),
+                            split_reply_chance_percent = VALUES(split_reply_chance_percent),
+                            private_history_enabled = VALUES(private_history_enabled),
+                            history_max_messages = VALUES(history_max_messages),
+                            history_max_chars = VALUES(history_max_chars),
+                            history_training_enabled = VALUES(history_training_enabled),
+                            review_mode = VALUES(review_mode),
+                            knowledge_base_sources_json = VALUES(knowledge_base_sources_json),
+                            profile_context_json = VALUES(profile_context_json)
+                        """ : """
                         MERGE INTO conversation_profile (
                             id, user_id, name, description, enabled, platform, account_id, scene, chat_type,
                             chat_ids_json, target_user_ids_json, supported_routes_json, trigger_mode,
@@ -49,12 +116,16 @@ public class JdbcConversationProfileRepository implements ConversationProfileRep
                             reply_delay_seconds_min, reply_delay_seconds_max, allowed_tools_json,
                             require_human_confirmation, priority, created_at, updated_at, notification_mode,
                             notification_keywords_json, digest_window_seconds, digest_max_messages,
-                            include_urgent_in_digest
+                            include_urgent_in_digest, max_reply_chars, split_long_reply,
+                            split_reply_chance_percent, private_history_enabled,
+                            history_max_messages, history_max_chars, history_training_enabled, review_mode,
+                            knowledge_base_sources_json, profile_context_json
                         ) KEY (id) VALUES (
                             ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                            ?, ?, ?, ?, ?, ?, ?, ?
+                            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                         )
-                        """,
+                        """;
+        jdbcTemplate.update(sql,
                 profile.id(),
                 profile.userId(),
                 profile.name(),
@@ -87,7 +158,17 @@ public class JdbcConversationProfileRepository implements ConversationProfileRep
                 toJson(profile.notificationKeywords()),
                 profile.digestWindowSeconds(),
                 profile.digestMaxMessages(),
-                profile.includeUrgentInDigest()
+                profile.includeUrgentInDigest(),
+                profile.maxReplyChars(),
+                profile.splitLongReply(),
+                profile.splitReplyChancePercent(),
+                profile.privateHistoryEnabled(),
+                profile.historyMaxMessages(),
+                profile.historyMaxChars(),
+                profile.historyTrainingEnabled(),
+                profile.reviewMode(),
+                toJson(profile.knowledgeBaseSources()),
+                toObjectJson(profile.profileContext())
         );
         return profile;
     }
@@ -192,6 +273,29 @@ public class JdbcConversationProfileRepository implements ConversationProfileRep
         }
     }
 
+    /** 将结构化会话上下文序列化为 JSON，数据库只增加一个可版本化字段。 */
+    private static String toObjectJson(ConversationProfileContext context) {
+        try {
+            return OBJECT_MAPPER.writeValueAsString(
+                    context == null ? ConversationProfileContext.empty() : context
+            );
+        } catch (JsonProcessingException exception) {
+            throw new IllegalArgumentException("结构化会话上下文无法序列化", exception);
+        }
+    }
+
+    /** 将结构化上下文 JSON 还原为 2.0 模型，空列和旧数据安全回退默认结构。 */
+    private static ConversationProfileContext fromContextJson(String value) {
+        if (value == null || value.isBlank() || "{}".equals(value.trim())) {
+            return ConversationProfileContext.empty();
+        }
+        try {
+            return OBJECT_MAPPER.readValue(value, ConversationProfileContext.class);
+        } catch (JsonProcessingException exception) {
+            throw new IllegalStateException("结构化会话上下文无法反序列化", exception);
+        }
+    }
+
     /**
      * 将领域层时间转换为 JDBC 时间戳。
      */
@@ -242,7 +346,17 @@ public class JdbcConversationProfileRepository implements ConversationProfileRep
                     fromJson(rs.getString("notification_keywords_json")),
                     rs.getObject("digest_window_seconds", Integer.class),
                     rs.getObject("digest_max_messages", Integer.class),
-                    rs.getBoolean("include_urgent_in_digest")
+                    rs.getBoolean("include_urgent_in_digest"),
+                    rs.getObject("max_reply_chars", Integer.class),
+                    rs.getObject("split_long_reply", Boolean.class),
+                    rs.getObject("split_reply_chance_percent", Integer.class),
+                    rs.getBoolean("private_history_enabled"),
+                    rs.getObject("history_max_messages", Integer.class),
+                    rs.getObject("history_max_chars", Integer.class),
+                    rs.getBoolean("history_training_enabled"),
+                    rs.getString("review_mode"),
+                    fromJson(rs.getString("knowledge_base_sources_json")),
+                    fromContextJson(rs.getString("profile_context_json"))
             );
         }
     }

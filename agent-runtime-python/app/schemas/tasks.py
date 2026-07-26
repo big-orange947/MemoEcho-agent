@@ -2,20 +2,26 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
+from app.schemas.conversation_state import ConversationOpenState
+from app.schemas.memories import VerifiedMemory
 from app.schemas.events import UnifiedEvent
 
 
 class AgentTaskContext(BaseModel):
+    """封装一次 Agent 执行所需的事件、可信上下文、开放状态和工具权限。"""
+
     task_id: str
     route: str
     event: UnifiedEvent
-    history_context: list[dict[str, Any]] = []
-    retrieved_knowledge: list[dict[str, Any]] = []
-    allowed_tools: list[str] = []
+    history_context: list[dict[str, Any]] = Field(default_factory=list)
+    conversation_state: ConversationOpenState | None = None
+    verified_memories: list[VerifiedMemory] = Field(default_factory=list)
+    retrieved_knowledge: list[dict[str, Any]] = Field(default_factory=list)
+    allowed_tools: list[str] = Field(default_factory=list)
     execution_mode: str = "suggest_only"
-    metadata: dict[str, Any] = {}
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class PlanStep(BaseModel):
@@ -27,4 +33,3 @@ class PlanStep(BaseModel):
 class ExecutionPlan(BaseModel):
     mode: str
     steps: list[PlanStep]
-

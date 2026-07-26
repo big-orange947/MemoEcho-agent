@@ -106,7 +106,7 @@ class WorkspaceBriefingApplicationServiceTest {
                         "source-schedule-002",
                         "qq",
                         "1098307542",
-                        "2597164807",
+                        "88880001",
                         "明天答辩彩排",
                         today.plusDays(1).atTime(10, 0),
                         today.plusDays(1).atTime(11, 0),
@@ -122,7 +122,8 @@ class WorkspaceBriefingApplicationServiceTest {
                 .willReturn(conversations);
         given(taskServiceQueryClient.listPendingTasks("2597164807", 5))
                 .willReturn(tasks);
-        given(scheduleServiceQueryClient.listSchedules("2597164807"))
+        // 第二条日程来自另一位群成员；工作台仍应把它作为当前本地用户的近期安排展示出来。
+        given(scheduleServiceQueryClient.listWorkspaceSchedules())
                 .willReturn(schedules);
 
         WorkspaceBriefingResponse response = service.buildBriefing("freeze", "2597164807", 480, 5, 5, 5);
@@ -130,6 +131,7 @@ class WorkspaceBriefingApplicationServiceTest {
         assertEquals(2, response.importantConversations().size());
         assertEquals(1, response.pendingTasks().size());
         assertEquals(1, response.todaySchedules().size());
+        assertEquals(2, response.upcomingSchedules().size());
         assertEquals(4, response.suggestedActions().size());
         assertEquals(1, response.overview().actionRequiredCount());
         assertTrue(response.importantConversations().get(0).actionRequired());

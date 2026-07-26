@@ -17,12 +17,45 @@ public class WorkspaceInboxApplicationService {
         this.eventCenterApplicationService = eventCenterApplicationService;
     }
 
-    public WorkspaceInboxResponse buildInbox(String inboxStatus, Integer limit) {
+    public WorkspaceInboxResponse buildInbox(String ownerUserId, String inboxStatus, Integer limit) {
         // 这个函数的作用是生成工作台收件箱快照，默认只显示仍需关注的消息，同时给出状态计数方便前端绘制筛选标签。
+        int safeLimit = limit == null || limit <= 0 ? 50 : Math.min(limit, 200);
+        List<WorkspaceInboxItemResponse> allItems = eventCenterApplicationService.findWorkspaceInboxItems(
+                ownerUserId,
+                inboxStatus,
+                200
+        );
+        List<WorkspaceInboxItemResponse> visibleItems = allItems.stream().limit(safeLimit).toList();
+
+        return new WorkspaceInboxResponse(
+                Instant.now().toString(),
+                inboxStatus == null ? "" : inboxStatus,
+                allItems.size(),
+                (int) allItems.stream().filter(item -> "NEW".equals(item.inboxStatus())).count(),
+                (int) allItems.stream().filter(item -> "READ".equals(item.inboxStatus())).count(),
+                (int) allItems.stream().filter(WorkspaceInboxItemResponse::actionRequired).count(),
+                visibleItems
+        );
+    }
+
+    /**
+     * 兼容旧的内部调用和单元测试，默认读取本地兼容用户的消息。
+     */
+    public WorkspaceInboxResponse buildInbox(String inboxStatus, Integer limit) {
         int safeLimit = limit == null || limit <= 0 ? 50 : Math.min(limit, 200);
         List<WorkspaceInboxItemResponse> allItems = eventCenterApplicationService.findWorkspaceInboxItems(inboxStatus, 200);
         List<WorkspaceInboxItemResponse> visibleItems = allItems.stream().limit(safeLimit).toList();
+        return buildResponse(inboxStatus, allItems, visibleItems);
+    }
 
+    /**
+     * 将已过滤的消息转换为统一收件箱响应，并计算各状态数量。
+     */
+    private WorkspaceInboxResponse buildResponse(
+            String inboxStatus,
+            List<WorkspaceInboxItemResponse> allItems,
+            List<WorkspaceInboxItemResponse> visibleItems
+    ) {
         return new WorkspaceInboxResponse(
                 Instant.now().toString(),
                 inboxStatus == null ? "" : inboxStatus,

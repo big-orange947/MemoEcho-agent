@@ -82,7 +82,7 @@ class InternalConversationControllerTest {
 
     @Test
     void shouldListConversationMessages() throws Exception {
-        given(applicationService.findConversationMessages("1098307542", "qq", "group", 20))
+        given(applicationService.findConversationMessages("1098307542", "qq", "group", 20, null, null))
                 .willReturn(List.of(new ConversationMessageResponse(
                         "qq:message:group:1",
                         "qq",
@@ -123,6 +123,6 @@ class InternalConversationControllerTest {
                 .andExpect(jsonPath("$[0].replyDraft").value("你好，会议日程已经为你整理好了。"))
                 .andExpect(jsonPath("$[0].inboxStatus").value("NEW"));
 
-        verify(applicationService).findConversationMessages("1098307542", "qq", "group", 20);
+        verify(applicationService).findConversationMessages("1098307542", "qq", "group", 20, null, null);
     }
 }

@@ -37,7 +37,11 @@ class PlannerService:
             return self._with_dispatch(
                 ExecutionPlan(
                     mode="single_agent",
-                    steps=[PlanStep(agent="social", action="draft_reply")],
+                    steps=[
+                        PlanStep(agent="social", action="draft_reply"),
+                        PlanStep(agent="context_review", action="review_context"),
+                        PlanStep(agent="review", action="review_reply"),
+                    ],
                 )
             )
         if route == "group_ops":

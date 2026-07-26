@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class ToolCallRecord(BaseModel):
@@ -39,6 +39,8 @@ class NotificationDecision(BaseModel):
 
 
 class OrchestratorResult(BaseModel):
+    """描述一次编排执行的稳定返回契约，并仅暴露可安全审计的长期记忆 ID。"""
+
     execution_id: str
     status: str
     route: str
@@ -47,3 +49,4 @@ class OrchestratorResult(BaseModel):
     final_reply: str
     write_back_actions: list[str] = []
     notification: NotificationDecision | None = None
+    verified_memory_ids: list[str] = Field(default_factory=list)

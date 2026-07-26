@@ -41,6 +41,11 @@ class JdbcEventRecordRepositoryTest {
     @Test
     void shouldPersistAndUpdateEventStateIncludingTrace() {
         // 这个测试函数的作用是验证事件、草稿、收件箱状态和脱敏执行轨迹可以跨数据库读写完整保留。
+        var rawPayload = objectMapper.createObjectNode().put("source", "jdbc-test");
+        rawPayload.putArray("message").addObject()
+                .put("type", "text")
+                .putObject("data")
+                .put("text", "test segment");
         UnifiedEventPayload payload = new UnifiedEventPayload(
                 "qq:message:private:persistence-1",
                 "qq",
@@ -54,7 +59,7 @@ class JdbcEventRecordRepositoryTest {
                 List.of(),
                 List.of("3969785168"),
                 "2026-07-10T08:00:00Z",
-                objectMapper.createObjectNode().put("source", "jdbc-test")
+                rawPayload
         );
         Instant receivedAt = Instant.parse("2026-07-10T08:00:01Z");
         ExecutionTrace trace = new ExecutionTrace(
@@ -94,6 +99,8 @@ class JdbcEventRecordRepositoryTest {
         assertTrue(repository.exists(payload.eventId()));
         assertEquals("下午两点开会", reloaded.payload().text());
         assertEquals("jdbc-test", reloaded.payload().rawPayload().path("source").asText());
+        // 回读数据库中的 payload_json 时，派生 segments 不应作为可写集合被 Jackson 反序列化。
+        assertEquals(1, reloaded.payload().segments().size());
         assertEquals("NEEDS_CONFIRMATION", reloaded.processingStatus());
         assertEquals("你好，下午两点见。", reloaded.replyDraft());
         assertEquals("SNOOZED", reloaded.inboxStatus());

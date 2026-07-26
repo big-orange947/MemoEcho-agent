@@ -66,6 +66,33 @@ public class JdbcPlatformConnectionRepository implements PlatformConnectionRepos
                 (rs, rowNum) -> map(rs), id, userId).stream().findFirst();
     }
 
+    /**
+     * 根据平台和外部账号 ID 反查本地用户；只使用启用的连接，避免停用连接继续接收数据。
+     */
+    @Override
+    public Optional<String> findUserIdByPlatformAndAccountId(String platform, String accountId) {
+        if (platform == null || platform.isBlank() || accountId == null || accountId.isBlank()) {
+            return Optional.empty();
+        }
+        Optional<String> exactOwner = jdbcTemplate.query(
+                "SELECT user_id FROM platform_connection WHERE LOWER(platform) = LOWER(?) AND account_id = ? AND enabled = TRUE ORDER BY updated_at DESC",
+                (rs, rowNum) -> rs.getString("user_id"),
+                platform.trim(),
+                accountId.trim()
+        ).stream().findFirst();
+        if (exactOwner.isPresent()) {
+            return exactOwner;
+        }
+
+        // 首次接入时健康检测可能尚未回填 account_id；只有唯一启用连接时才允许安全回退。
+        List<String> candidateOwners = jdbcTemplate.query(
+                "SELECT DISTINCT user_id FROM platform_connection WHERE LOWER(platform) = LOWER(?) AND enabled = TRUE",
+                (rs, rowNum) -> rs.getString("user_id"),
+                platform.trim()
+        );
+        return candidateOwners.size() == 1 ? Optional.of(candidateOwners.getFirst()) : Optional.empty();
+    }
+
     @Override
     public void deleteByIdAndUserId(String id, String userId) {
         // 这个函数的作用是只删除当前用户拥有的连接档案。

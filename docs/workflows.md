@@ -1,4 +1,21 @@
-﻿# 工作流说明
+# 工作流说明
+
+## 0. 主控台委托任务工作流
+
+主控台输入的自然语言命令先由 Java 侧做鉴权、审计和事件落库，再进入 Python Runtime。任务识别、联系人选择、任务创建和执行计划都由 Agent 侧完成。
+
+```text
+Desktop 主控台命令
+-> event-center-service 鉴权、审计、落库
+-> Python Runtime Workspace Command Handler
+-> Router Agent 选择目标会话和任务类型
+-> Delegated Task Workflow 创建任务契约
+-> ReAct 执行图调用工具
+-> send_qq_message / update_delegated_task / finish_delegated_task
+-> event-center-service 保存进度和审计记录
+```
+
+这个链路避免在前端或 Java 侧用正则硬拆命令。联系人、多目标、私聊和群聊判断都交给 Router Agent，并由工具权限和审查 Agent 做边界控制。
 
 ## 1. 消息摘要工作流
 

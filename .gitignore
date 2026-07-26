@@ -43,3 +43,8 @@ desktop.ini
 # Runtime temp files
 *.tmp
 *.temp
+.runtime/
+scripts/local-env.ps1
+agent-runtime-python/data/*.sqlite3
+agent-runtime-python/data/*.sqlite3-*
+services-java/*/data/

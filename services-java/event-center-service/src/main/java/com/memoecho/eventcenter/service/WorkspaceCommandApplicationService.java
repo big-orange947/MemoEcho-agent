@@ -56,6 +56,9 @@ public class WorkspaceCommandApplicationService {
         ObjectNode rawPayload = objectMapper.createObjectNode();
         rawPayload.put("source", "desktop-client");
         rawPayload.put("userId", userId);
+        rawPayload.put("commandId", commandId);
+        // 主控台命令统一交给 Python Runtime/LangGraph 编译，Java 不再用关键词规则提前创建任务。
+        rawPayload.put("allowTaskCreation", true);
         if (requestedRoute != null) {
             rawPayload.put("requestedRoute", requestedRoute);
         }
@@ -123,6 +126,7 @@ public class WorkspaceCommandApplicationService {
                 finalReply,
                 needConfirmation,
                 results,
+                null,
                 ""
         );
     }
@@ -186,6 +190,7 @@ public class WorkspaceCommandApplicationService {
                 "",
                 false,
                 List.of(),
+                null,
                 error == null ? "未知错误" : error
         );
     }

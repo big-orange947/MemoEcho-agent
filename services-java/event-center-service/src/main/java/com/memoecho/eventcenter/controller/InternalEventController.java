@@ -6,6 +6,7 @@ import com.memoecho.eventcenter.dto.DraftConfirmRequest;
 import com.memoecho.eventcenter.dto.DraftRejectRequest;
 import com.memoecho.eventcenter.dto.StoredEventResponse;
 import com.memoecho.eventcenter.dto.SnoozeEventRequest;
+import com.memoecho.eventcenter.dto.MediaAnalysisUpdateRequest;
 import com.memoecho.eventcenter.dto.UnifiedEventPayload;
 import com.memoecho.eventcenter.service.EventCenterApplicationService;
 import jakarta.validation.Valid;
@@ -40,6 +41,16 @@ public class InternalEventController {
     public ResponseEntity<StoredEventResponse> recordDigest(@Valid @RequestBody ConversationDigestRequest request) {
         // 这个接口的作用是接收 Runtime 后台定时器生成的会话摘要，并直接持久化为工作台事件而不再次派发 Agent。
         return ResponseEntity.ok(applicationService.recordConversationDigest(request));
+    }
+
+    @PostMapping("/{eventId}/media-analysis")
+    public ResponseEntity<Void> recordMediaAnalysis(
+            @PathVariable String eventId,
+            @Valid @RequestBody MediaAnalysisUpdateRequest request
+    ) {
+        // 异步附件任务仅补充事件信息，不会再次进入 Runtime 的主消息处理链路。
+        applicationService.recordMediaAnalysis(eventId, request);
+        return ResponseEntity.noContent().build();
     }
 
     @GetMapping

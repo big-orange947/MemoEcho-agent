@@ -18,7 +18,7 @@ class FileAgent(BaseAgent):
         next_actions: list[str] = []
 
         try:
-            extracted = await self._get_tool(task_context, "extract_file_text").execute(**payload)
+            extracted = await self._invoke_tool(task_context, "extract_file_text", payload)
         except KeyError:
             extracted = self._fallback_extract(payload["attachments"], payload["message_text"])
             next_actions.append("extract_file_text tool is not registered")

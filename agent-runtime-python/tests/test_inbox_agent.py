@@ -5,7 +5,9 @@ import unittest
 from app.agents.inbox_agent import InboxAgent
 from app.schemas.events import Sender, UnifiedEvent
 from app.schemas.tasks import AgentTaskContext
+from app.services.slow_channel_buffer import SlowChannelFlush
 from app.tools.registry import ToolRegistry
+from tool_test_utils import register_test_tool
 
 
 class DummyRecentMessagesTool:
@@ -21,6 +23,38 @@ class DummyRecentMessagesTool:
 
 
 class InboxAgentTest(unittest.IsolatedAsyncioTestCase):
+    async def test_should_build_three_section_digest_for_slow_channel_batch(self) -> None:
+        """验证慢通道批次通过 InboxAgent 产出发生、待办和下一步三段内容。"""
+        event = UnifiedEvent(
+            eventId="qq:message:group:batch-001",
+            platform="qq",
+            scene="life",
+            eventType="message",
+            chatType="group",
+            chatId="1098307542",
+            sender=Sender(id="10001", name="alice", role=None),
+            text="deadline Friday",
+            attachments=[],
+            mentions=[],
+            timestamp="2026-07-12T10:00:00+08:00",
+            rawPayload={},
+        )
+        flush = SlowChannelFlush(
+            aggregation_key="qq:group:1098307542",
+            source_event=event,
+            source_event_ids=[event.event_id],
+            message_count=2,
+            summary="fallback",
+            transcript="alice: deadline Friday\nbob: document is ready",
+        )
+
+        result = await InboxAgent(ToolRegistry()).summarize_slow_channel_batch(flush)
+
+        self.assertIn("deadline Friday", result["happened"])
+        self.assertIn("deadline Friday", result["actionItems"])
+        self.assertTrue(result["nextStep"])
+        self.assertIn(result["happened"], result["summary"])
+
     async def test_should_build_summary_from_recent_messages(self) -> None:
         registry = ToolRegistry()
         tool = DummyRecentMessagesTool(
@@ -54,7 +88,7 @@ class InboxAgentTest(unittest.IsolatedAsyncioTestCase):
                 },
             ]
         )
-        registry.register("get_recent_messages", tool)
+        register_test_tool(registry, "get_recent_messages", tool)
         agent = InboxAgent(registry)
 
         event = UnifiedEvent(

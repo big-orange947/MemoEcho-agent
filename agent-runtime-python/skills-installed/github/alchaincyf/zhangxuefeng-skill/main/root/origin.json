@@ -1,0 +1,11 @@
+{
+  "reference" : "https://github.com/alchaincyf/zhangxuefeng-skill",
+  "runtimeReference" : "github://alchaincyf/zhangxuefeng-skill@main",
+  "owner" : "alchaincyf",
+  "repository" : "zhangxuefeng-skill",
+  "gitRef" : "main",
+  "path" : "",
+  "rawDescriptorUrl" : "https://raw.githubusercontent.com/alchaincyf/zhangxuefeng-skill/main/skill.json",
+  "sourceFormat" : "SKILL.md",
+  "installedAt" : "2026-07-14T07:11:13.543126900Z"
+}

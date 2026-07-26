@@ -77,6 +77,17 @@ public class PlatformConnectionApplicationService {
         return toResponse(repository.save(checked));
     }
 
+    /**
+     * 扫码成功后刷新当前用户的 QQ/NapCat 档案，使首页无需再次手动执行健康检查。
+     */
+    public void refreshLocalQqConnection(String userId) {
+        ensureLocalQqConnection(userId);
+        repository.findAllByUserId(userId).stream()
+                .filter(connection -> "qq".equals(connection.platform()) && "napcat".equals(connection.connector()))
+                .map(this::check)
+                .forEach(repository::save);
+    }
+
     private PlatformConnection check(PlatformConnection connection) {
         if (!connection.enabled()) {
             return withHealth(connection, "DISABLED", "连接已停用。", "", "");

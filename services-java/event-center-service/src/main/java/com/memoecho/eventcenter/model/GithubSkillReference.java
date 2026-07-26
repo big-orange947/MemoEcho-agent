@@ -13,6 +13,28 @@ public record GithubSkillReference(
         return "https://raw.githubusercontent.com/" + owner + "/" + repository + "/" + gitRef + "/" + descriptorPath();
     }
 
+    public String rawMarkdownUrl() {
+        // 这个函数的作用是生成通用 Agent Skills 入口文件 SKILL.md 的 Raw 地址。
+        return "https://raw.githubusercontent.com/" + owner + "/" + repository + "/" + gitRef + "/" + markdownPath();
+    }
+
+    public String markdownPath() {
+        // 这个函数兼容仓库根目录和子目录两种 Agent Skill 布局。
+        if (path == null || path.isBlank()) {
+            return "SKILL.md";
+        }
+        if (path.endsWith("SKILL.md")) {
+            return path;
+        }
+        return path + "/SKILL.md";
+    }
+
+    public String runtimeReference() {
+        // 这个函数生成 Python Runtime 能稳定定位本地缓存的规范化 github:// 引用。
+        String suffix = path == null || path.isBlank() ? "" : "/" + path.replace('\\', '/');
+        return "github://" + owner + "/" + repository + "@" + gitRef + suffix;
+    }
+
     public String descriptorPath() {
         // 这个函数的作用是统一补齐 skill.json 文件名，让“目录引用”和“文件引用”两种写法最终都落到一个明确的描述文件路径上。
         if (path == null || path.isBlank()) {

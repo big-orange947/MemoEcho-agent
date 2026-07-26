@@ -2,22 +2,26 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.tools.base import BaseTool
 
+class SendQqMessageTool:
+    """QQ 发送适配器；真正暴露给 Agent 的入口在 LangChain @tool 中。"""
 
-class SendQqMessageTool(BaseTool):
     name = "send_qq_message"
 
     def __init__(self, connector_service_client: Any) -> None:
         self.connector_service_client = connector_service_client
 
-    async def execute(self, **kwargs: Any) -> Any:
-        # 这个工具是 runtime 回写 QQ 的统一出口，后面接别的平台时可以保持同样接口风格。
-        chat_type = kwargs.get("chat_type")
-        chat_id = kwargs.get("chat_id")
-        message = kwargs.get("message")
-        segments = kwargs.get("segments")
-
+    async def send(
+        self,
+        *,
+        chat_type: str,
+        chat_id: str,
+        message: str | None = None,
+        segments: list[dict[str, Any]] | None = None,
+        client_message_id: str | None = None,
+        correlation_id: str | None = None,
+    ) -> Any:
+        """向 QQ 私聊或群聊发送文本/消息段。"""
         if chat_type not in {"group", "private"}:
             raise ValueError("chat_type must be group or private")
         if chat_id is None:
@@ -30,10 +34,14 @@ class SendQqMessageTool(BaseTool):
                 group_id=int(chat_id),
                 message=message,
                 segments=segments,
+                client_message_id=client_message_id,
+                correlation_id=correlation_id,
             )
 
         return await self.connector_service_client.send_private_message(
             user_id=int(chat_id),
             message=message,
             segments=segments,
+            client_message_id=client_message_id,
+            correlation_id=correlation_id,
         )

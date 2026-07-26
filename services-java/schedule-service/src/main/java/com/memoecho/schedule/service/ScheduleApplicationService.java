@@ -4,6 +4,8 @@ import com.memoecho.schedule.dto.CreateScheduleRequest;
 import com.memoecho.schedule.dto.ScheduleItemResponse;
 import com.memoecho.schedule.model.ScheduleItem;
 import com.memoecho.schedule.repository.ScheduleRepository;
+import org.springframework.dao.DuplicateKeyException;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
 import java.time.LocalDateTime;
@@ -42,17 +44,47 @@ public class ScheduleApplicationService {
                 request.confidence(),
                 LocalDateTime.now()
         );
-        return toResponse(scheduleRepository.save(item));
+        try {
+            return toResponse(scheduleRepository.save(item));
+        } catch (DuplicateKeyException exception) {
+            // 并发消费同一事件时，数据库唯一约束只允许一条成功；失败请求回读已有日程即可。
+            return scheduleRepository.findBySourceEventId(request.sourceEventId())
+                    .map(this::toResponse)
+                    .orElseThrow(() -> exception);
+        }
     }
 
     public List<ScheduleItemResponse> list(String chatId, String senderId, String sourceEventId) {
-        // 现在使用的是内存仓库，所以筛选逻辑先保留在 service 层。
+        // 查询前兜底清理一次，保证定时任务尚未执行时客户端也不会看到已过期记录。
+        cleanupExpiredSchedules();
         return scheduleRepository.findAll().stream()
                 .filter(item -> chatId == null || chatId.isBlank() || item.chatId().equals(chatId))
                 .filter(item -> senderId == null || senderId.isBlank() || item.senderId().equals(senderId))
                 .filter(item -> sourceEventId == null || sourceEventId.isBlank() || item.sourceEventId().equals(sourceEventId))
                 .map(this::toResponse)
                 .toList();
+    }
+
+    public ScheduleItemResponse findById(String id) {
+        // 这个函数的作用是读取单条日程；找不到时由 Controller 返回 404。
+        cleanupExpiredSchedules();
+        return scheduleRepository.findById(id).map(this::toResponse).orElse(null);
+    }
+
+    public boolean delete(String id) {
+        // 这个函数的作用是删除用户指定的日程，并让调用方区分成功和不存在。
+        return scheduleRepository.deleteById(id);
+    }
+
+    public int cleanupExpiredSchedules() {
+        // 这个函数的作用是立即清理已结束或日期已过的日程，返回数量便于测试和监控。
+        return scheduleRepository.deleteExpired(LocalDateTime.now());
+    }
+
+    @Scheduled(fixedDelayString = "${schedule.cleanup.fixed-delay-ms:60000}")
+    public void cleanupExpiredSchedulesOnSchedule() {
+        // 这个函数是 Spring 定时入口。定时方法保持 void，避免不同 Spring 版本对返回值处理不一致。
+        cleanupExpiredSchedules();
     }
 
     private ScheduleItemResponse toResponse(ScheduleItem item) {

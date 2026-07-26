@@ -11,7 +11,7 @@ public class EventCenterSecurityProperties {
     private String jwtSecret = "memo-echo-jwt-dev-secret-change-me";
     private long jwtExpiresSeconds = 604800;
     private boolean allowLegacyUserHeader = false;
-    private String runtimeToken = "";
+    private String runtimeToken = "memo-echo-local-runtime-token";
     private List<String> allowedOrigins = List.of(
             "http://127.0.0.1:5173",
             "http://tauri.localhost",

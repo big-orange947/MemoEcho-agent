@@ -1,6 +1,7 @@
 package com.memoecho.eventcenter.repository;
 
 import com.memoecho.eventcenter.model.ConversationProfile;
+import com.memoecho.eventcenter.model.ConversationProfileContext;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.jdbc.JdbcTest;
@@ -27,6 +28,30 @@ class JdbcConversationProfileRepositoryTest {
      */
     @Test
     void shouldSaveAndLoadCompleteConversationProfile() {
+        ConversationProfileContext profileContext = new ConversationProfileContext(
+                2,
+                new ConversationProfileContext.Identity(
+                        "freeze", "网易云会员卖家", "简短自然", List.of("客服腔", "虚构承诺")
+                ),
+                new ConversationProfileContext.Counterparty(
+                        "小号", "潜在买家", "首次交易", "你", List.of("需要一个月会员"), "MEDIUM", "短句沟通"
+                ),
+                new ConversationProfileContext.Background(
+                        "对方询问会员价格", "已告知月卡 15 元", "等待确认购买"
+                ),
+                new ConversationProfileContext.Task(
+                        "完成真实交易", List.of("确认套餐", "确认付款"), "2026-07-20T20:00:00+08:00",
+                        List.of("不得编造收款信息")
+                ),
+                new ConversationProfileContext.BusinessRules(
+                        "月卡 15 元，年卡 50 元", "15", "未交付可退款", "确认到账后交付",
+                        List.of("不得低于最低价")
+                ),
+                new ConversationProfileContext.MemoryPolicy(true),
+                List.of(new ConversationProfileContext.AssetReference(
+                        "asset-payment-001", "PAYMENT_QR", "微信收款码", "当前账号的收款码", "买家确认购买后"
+                ))
+        );
         ConversationProfile profile = profile(
                 "profile-001",
                 "freeze",
@@ -34,7 +59,7 @@ class JdbcConversationProfileRepositoryTest {
                 List.of("123456", "789012"),
                 List.of("https://github.com/example/skill,with-comma", "local://skills/reply"),
                 30
-        );
+        ).withProfileContext(profileContext);
 
         repository.save(profile);
         ConversationProfile reloaded = repository.findById("profile-001").orElseThrow();
@@ -46,6 +71,10 @@ class JdbcConversationProfileRepositoryTest {
         assertEquals(List.of("send_message", "create_schedule"), reloaded.allowedTools());
         assertEquals(120, reloaded.digestWindowSeconds());
         assertTrue(reloaded.includeUrgentInDigest());
+        assertEquals("freeze", reloaded.profileContext().identity().representedPerson());
+        assertEquals("完成真实交易", reloaded.profileContext().task().objective());
+        assertEquals("15", reloaded.profileContext().businessRules().minimumPrice());
+        assertEquals("asset-payment-001", reloaded.profileContext().assets().getFirst().assetId());
     }
 
     /**

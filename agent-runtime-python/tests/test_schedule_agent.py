@@ -6,6 +6,7 @@ from app.agents.schedule_agent import ScheduleAgent
 from app.schemas.events import Sender, UnifiedEvent
 from app.schemas.tasks import AgentTaskContext
 from app.tools.registry import ToolRegistry
+from tool_test_utils import register_test_tool
 
 
 class DummyCreateScheduleTool:
@@ -47,7 +48,7 @@ class ScheduleAgentTest(unittest.IsolatedAsyncioTestCase):
         # 这个测试函数的作用是验证 ScheduleAgent 能提取并持久化日程。
         registry = ToolRegistry()
         tool = DummyCreateScheduleTool()
-        registry.register("create_schedule", tool)
+        register_test_tool(registry, "create_schedule", tool)
         agent = ScheduleAgent(registry)
 
         event = UnifiedEvent(
@@ -86,7 +87,7 @@ class ScheduleAgentTest(unittest.IsolatedAsyncioTestCase):
         # 这个测试函数的作用是验证 ScheduleAgent 在命中用户模型配置时会优先使用大模型回复。
         registry = ToolRegistry()
         tool = DummyCreateScheduleTool()
-        registry.register("create_schedule", tool)
+        register_test_tool(registry, "create_schedule", tool)
         llm_client = DummyLlmClient()
         agent = ScheduleAgent(registry, llm_client=llm_client)
 
@@ -147,16 +148,27 @@ class ScheduleAgentTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.structured_result["llmEnabled"])
         self.assertTrue(result.structured_result["llmUsed"])
         self.assertEqual(len(llm_client.calls), 1)
-        self.assertIn("当前会话已绑定以下 skills", llm_client.calls[0]["system_prompt"])
-        self.assertIn("会议助理", llm_client.calls[0]["system_prompt"])
+        system_prompt = llm_client.calls[0]["system_prompt"]
+        user_message = llm_client.calls[0]["user_message"]
+        self.assertIn("[角色与任务]", system_prompt)
+        self.assertIn("[证据优先级]", system_prompt)
+        self.assertIn("persistence_status=persisted", system_prompt)
+        self.assertIn("当前会话已绑定以下 skills", system_prompt)
+        self.assertIn("会议助理", system_prompt)
+        self.assertIn("平台：qq", user_message)
+        self.assertIn("会话类型：group", user_message)
+        self.assertIn("消息发送者：freeze", user_message)
+        self.assertIn("开始时间：2026-07-06 14:00:00", user_message)
+        self.assertIn("persistence_status：persisted", user_message)
         self.assertEqual(result.structured_result["promptSource"], "skill_plus_profile_prompt")
         self.assertEqual(result.structured_result["modelProfileId"], "profile-001")
+        self.assertEqual(result.structured_result["source_timestamp"], "2026-07-06T12:00:00+08:00")
 
     async def test_should_block_schedule_persistence_when_tool_is_not_allowed(self) -> None:
         # 这个测试函数的作用是验证会话工具白名单未放行 create_schedule 时，ScheduleAgent 不会继续落库。
         registry = ToolRegistry()
         tool = DummyCreateScheduleTool()
-        registry.register("create_schedule", tool)
+        register_test_tool(registry, "create_schedule", tool)
         agent = ScheduleAgent(registry)
 
         event = UnifiedEvent(

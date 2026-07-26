@@ -13,6 +13,21 @@ connector:
 
 napcat:
   api:
-    enabled: true
-    base-url: http://127.0.0.1:3011
-    token: "hDjKztJ_7hgNV.T9"
+    enabled: ${NAPCAT_API_ENABLED:true}
+    base-url: ${NAPCAT_API_BASE_URL:http://127.0.0.1:3011}
+    # Token 不进入源码和 Git 历史，由本地环境文件或系统环境变量注入。
+    token: ${NAPCAT_API_TOKEN:}
+  webui:
+    enabled: ${NAPCAT_WEBUI_ENABLED:true}
+    base-url: ${NAPCAT_WEBUI_BASE_URL:http://127.0.0.1:6099}
+    api-prefix: ${NAPCAT_WEBUI_API_PREFIX:/api}
+    # 正常使用无需配置：托管版、原生版和 Docker 版都会自动发现；仅调试时允许显式覆盖。
+    token: ${NAPCAT_WEBUI_TOKEN:}
+    # 托管版会自动读取桌面客户端目录；仅便携版或自定义目录需要覆盖。
+    managed-runtime-root: ${NAPCAT_MANAGED_RUNTIME_ROOT:}
+    docker-containers: ${NAPCAT_DOCKER_CONTAINERS:memo_echo_napcat,napcat}
+    # 原生安装会自动检查各盘符的 napcat/config/webui.json；非标准目录可显式补充。
+    native-config-paths: ${NAPCAT_NATIVE_CONFIG_PATHS:}
+    # 留空时自动区分原生 NapCat 和 Docker NapCat。
+    event-callback-url: ${NAPCAT_EVENT_CALLBACK_URL:}
+    onebot-http-port: ${NAPCAT_ONEBOT_HTTP_PORT:3011}
