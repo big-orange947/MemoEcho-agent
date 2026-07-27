@@ -243,6 +243,9 @@ public class EventCenterApplicationService {
 
     /** 判断当前 Webhook 是否来自已登录账号；命中后只存档，不触发 Runtime。 */
     private boolean isSelfReportedMessage(UnifiedEventPayload event) {
+        if (isWorkspaceCommand(event)) {
+            return false;
+        }
         if ("OWNER".equalsIgnoreCase(event.actorType()) || "AGENT".equalsIgnoreCase(event.actorType())) {
             return true;
         }
@@ -253,6 +256,15 @@ public class EventCenterApplicationService {
                 && event.selfId() != null
                 && !event.selfId().isBlank()
                 && event.selfId().equals(event.sender().id());
+    }
+
+    /**
+     * 主控台命令虽然由当前用户发起，但它不是连接器回传的“自己发出的聊天消息”。
+     * 这类事件必须继续派发到 Agent Runtime，否则客户端会误显示 Runtime 未启用。
+     */
+    private boolean isWorkspaceCommand(UnifiedEventPayload event) {
+        return "desktop".equalsIgnoreCase(event.platform())
+                && "desktop_command".equalsIgnoreCase(event.eventType());
     }
 
     private boolean draftContainsMessage(String draft, String text) {

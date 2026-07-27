@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import unicodedata
@@ -68,6 +69,8 @@ class ActionState(TypedDict, total=False):
     # 图内观察工具的结果必须进入下一轮规划，避免只把读取意图交回 Java 后丢失上下文。
     pre_task_history: list[dict[str, Any]]
     tool_observations: list[dict[str, Any]]
+    # 独立进度节点的结论用于在生成候选回复前终止已经完成的任务。
+    task_progress: dict[str, Any]
     result: DelegatedTaskActionDecision
 
 
@@ -136,13 +139,19 @@ class DelegatedTaskWorkflow:
         """
         graph = StateGraph(ActionState)
         graph.add_node("build_timeline", self._build_action_timeline)
+        graph.add_node("assess_progress", self._assess_task_progress)
         graph.add_node("plan_react", self._plan_react_action)
         graph.add_node("observe_tool", self._observe_react_tool)
         graph.add_node("review_candidate", self._review_react_candidate)
         graph.add_node("select_action", self._select_runtime_action)
         graph.add_node("finalize_action", self._finalize_action)
         graph.add_edge(START, "build_timeline")
-        graph.add_edge("build_timeline", "plan_react")
+        graph.add_edge("build_timeline", "assess_progress")
+        graph.add_conditional_edges(
+            "assess_progress",
+            self._route_after_progress_assessment,
+            {"plan_react": "plan_react", "select_action": "select_action"},
+        )
         graph.add_conditional_edges(
             "plan_react",
             self._route_after_react_plan,
@@ -152,7 +161,8 @@ class DelegatedTaskWorkflow:
                 "select_action": "select_action",
             },
         )
-        graph.add_edge("observe_tool", "plan_react")
+        # 读取任务前历史后重新评估进度；新取得的背景可能改变终态判断。
+        graph.add_edge("observe_tool", "assess_progress")
         graph.add_conditional_edges(
             "review_candidate",
             self._route_after_react_review,
@@ -537,30 +547,95 @@ class DelegatedTaskWorkflow:
         )
         return {"result": result}
 
+    def _timeline_event_id(self, row: dict[str, Any], text: str = "") -> str:
+        """为时间线生成稳定消息 ID，避免跨轮恢复时丢失平台消息。"""
+        for key in (
+            "eventId", "event_id", "platformMessageId", "platform_message_id",
+            "clientMessageId", "client_message_id", "id",
+        ):
+            value = " ".join(str(row.get(key) or "").split())
+            if value:
+                return value
+        at = row.get("at") or row.get("sentAt") or row.get("timestamp") or row.get("receivedAt") or row.get("importedAt") or ""
+        raw = "|".join(
+            [
+                str(at),
+                str(row.get("direction") or ""),
+                str(row.get("actorType") or row.get("actor_type") or ""),
+                str(row.get("messageOrigin") or row.get("origin") or ""),
+                text,
+            ]
+        )
+        return "synthetic:" + hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+    def _normalize_timeline_role(self, row: dict[str, Any]) -> str:
+        """统一任务时间线中的角色，优先采用消息方向而不是平台成员身份。"""
+        origin = str(row.get("messageOrigin") or row.get("origin") or "").upper()
+        direction = str(row.get("direction") or "").upper()
+        actor = str(row.get("actorType") or row.get("actor_type") or "").upper()
+        if origin in {"AGENT", "AGENT_REPLY", "PROXY_REPLY", "BOT"} or actor in {"AGENT", "PROXY", "BOT"}:
+            return "代理"
+        if origin in {"SYSTEM", "TOOL", "WORKFLOW"} or actor in {"SYSTEM", "TOOL"}:
+            return "系统"
+        if direction in {"OUTBOUND", "SENT", "SELF", "TO_CONTACT"}:
+            return "我方"
+        if direction in {"INBOUND", "RECEIVED", "FROM_CONTACT"}:
+            return "对方"
+
+        # NapCat 的 owner/admin/member 表示群成员权限，不表示当前账号。只有 SELF、ME
+        # 和 ACCOUNT_OWNER 才能在缺少 direction 的旧事件中证明消息由账号主人发送。
+        if actor in {"SELF", "ME", "ACCOUNT_OWNER"}:
+            return "我方"
+        if actor in {"PEER", "CONTACT", "OTHER", "MEMBER", "OWNER", "ADMIN"}:
+            return "对方"
+
+        raw_role = str(row.get("role") or row.get("speaker") or "").strip().lower()
+        if raw_role in {"我方", "我", "本人", "账号主人", "self", "me", "account_owner"}:
+            return "我方"
+        if raw_role in {"对方", "联系人", "peer", "contact", "external", "other", "owner", "admin", "member"}:
+            return "对方"
+        if raw_role in {"代理", "agent", "bot", "proxy"}:
+            return "代理"
+        if raw_role in {"系统", "system", "tool", "workflow"}:
+            return "系统"
+        return "对方"
+
+    def _timeline_speaker(self, row: dict[str, Any], role: str) -> str:
+        """提取用于展示和提示的说话人名，缺失时用角色兜底。"""
+        for key in ("speaker", "senderName", "nickname", "displayName", "sender"):
+            value = " ".join(str(row.get(key) or "").split())
+            if value and value.lower() not in {"unknown", "unknown:", "none", "null"}:
+                if value not in {"我方", "对方", "代理", "系统"}:
+                    return value[:60]
+        return {"我方": "我", "对方": "对方", "代理": "代理", "系统": "系统"}.get(role, role)
+
     def _build_timeline(self, state: RuntimeState) -> dict[str, Any]:
-        """按平台发送时间排序并去重历史消息，明确区分本人、对方、代理和系统事件。"""
+        """按任务创建时间裁剪并去重，保留任务开始后的完整双方会话。"""
         runtime_input = state["runtime_input"]
         previous_state = self._safe_json(runtime_input.task.get("stateJson"))
         task_anchor = self._resolve_task_anchor(runtime_input.task, previous_state)
         rows = [*runtime_input.history, runtime_input.event]
         deduplicated: dict[str, dict[str, Any]] = {}
 
-        # Java 的历史查询可能受分页窗口限制，因此先恢复上轮已经持久化的规范时间线。
-        # 这些记录已经完成身份归一化，不能再次按缺省字段推断，否则“我/代理”会被误标为“对方”。
+        # Java 的历史查询可能受分页窗口限制，先恢复上轮已持久化的规范时间线。
+        # 恢复时也要兼容旧数据：旧版本可能只有 speaker，没有 role 或稳定 eventId。
         for item in previous_state.get("timeline") or []:
             if not isinstance(item, dict):
                 continue
-            event_id = str(item.get("eventId") or "").strip()
-            speaker = str(item.get("speaker") or "").strip()
             text = " ".join(str(item.get("text") or "").split())
-            if not event_id or speaker not in {"我", "对方", "代理", "系统"} or not text:
+            if not text:
                 continue
-            # 旧状态可能来自升级前的“最近消息”策略，必须再次按任务锚点裁剪。
             if not self._is_at_or_after_task_anchor(item.get("at"), task_anchor):
                 continue
+            event_id = self._timeline_event_id(item, text)
+            role = self._normalize_timeline_role(item)
+            speaker = self._timeline_speaker(item, role)
             deduplicated[event_id] = {
                 "eventId": event_id,
+                "platformMessageId": str(item.get("platformMessageId") or item.get("platform_message_id") or "").strip(),
+                "clientMessageId": str(item.get("clientMessageId") or item.get("client_message_id") or "").strip(),
                 "at": str(item.get("at") or ""),
+                "role": role,
                 "speaker": speaker,
                 "text": text,
                 "eventType": str(item.get("eventType") or "message").lower(),
@@ -574,11 +649,13 @@ class DelegatedTaskWorkflow:
             raw_payload = row.get("rawPayload") if isinstance(row.get("rawPayload"), dict) else {}
             origin = str(row.get("messageOrigin") or raw_payload.get("messageOrigin") or "").upper()
             # 工作台命令是控制面事件，不属于双方聊天，也不能作为任务完成证据。
-            if event_type == "delegated_task_started" or origin == "INTERNAL":
+            if event_type == "delegated_task_started" or origin in {
+                "INTERNAL",
+                "USER_COMMAND",
+                "DESKTOP_COMMAND",
+                "WORKSPACE_COMMAND",
+            }:
                 continue
-            key = str(row.get("eventId") or row.get("platformMessageId") or row.get("clientMessageId") or "")
-            if not key:
-                key = json.dumps(row, ensure_ascii=False, sort_keys=True)
             effective_at = str(
                 row.get("sentAt") or row.get("timestamp") or row.get("receivedAt") or row.get("importedAt") or ""
             )
@@ -587,17 +664,28 @@ class DelegatedTaskWorkflow:
                 continue
             direction = str(row.get("direction") or "").upper()
             actor = str(row.get("actorType") or "").upper()
-            if actor == "OWNER" or direction == "OUTBOUND" and origin != "AGENT":
-                speaker = "我"
-            elif actor in {"AGENT", "SYSTEM"} or origin == "AGENT":
-                speaker = "代理" if actor != "SYSTEM" else "系统"
-            else:
-                speaker = "对方"
-            deduplicated[key] = {
-                "eventId": str(row.get("eventId") or ""),
+            text = " ".join(
+                str(
+                    row.get("text")
+                    or row.get("content")
+                    or raw_payload.get("rawMessage")
+                    or raw_payload.get("raw_message")
+                    or ""
+                ).split()
+            )
+            if not text:
+                continue
+            event_id = self._timeline_event_id(row, text)
+            role = self._normalize_timeline_role(row)
+            speaker = self._timeline_speaker(row, role)
+            deduplicated[event_id] = {
+                "eventId": event_id,
+                "platformMessageId": str(row.get("platformMessageId") or row.get("platform_message_id") or "").strip(),
+                "clientMessageId": str(row.get("clientMessageId") or row.get("client_message_id") or "").strip(),
                 "at": effective_at,
+                "role": role,
                 "speaker": speaker,
-                "text": " ".join(str(row.get("text") or "").split()),
+                "text": text,
                 "eventType": event_type,
                 "direction": direction,
                 "actorType": actor,
@@ -631,6 +719,85 @@ class DelegatedTaskWorkflow:
             "tool_observations": list(previous_state.get("toolObservations") or []),
             **timeline_state,
         }
+
+    async def _assess_task_progress(self, state: ActionState) -> dict[str, Any]:
+        """在规划回复前判断任务是否已经进入终态。
+
+        进度判断与回复生成相互独立。只要任务后的联系人证据已经满足成功、拒绝
+        或无法继续的条件，就直接产出 ``complete_delegated_task``，避免模型先生成
+        一句多余追问，再在动作落地阶段才发现任务已经结束。
+        """
+        action_input = state["action_input"]
+        event = action_input.event
+        previous_state = state.get("previous_state") or {}
+        current_event_id = str(event.get("eventId") or "").strip()
+        processed_event_ids = set(self._as_text_list(previous_state.get("processedEventIds")))
+
+        # 同一平台事件可能因 MQ 重投或服务重启被再次送达。重复事件不得再次进入
+        # 规划器，否则即使模型上下文正确，也可能产生第二条语义相同的回复。
+        if current_event_id and current_event_id in processed_event_ids:
+            evaluation = {
+                "reactManaged": True,
+                "status": "ACTIVE",
+                "requestedTool": "update_delegated_task",
+                "reason": "当前平台事件已经处理，本轮保持原任务状态",
+                "progressSummary": "已忽略重复投递的事件",
+                "messageInstruction": "",
+                "completionReport": "",
+                "knownFacts": [],
+                "pendingConditions": [],
+                "evidence": [],
+                "evidenceEventIds": [],
+                "toolArguments": {"duplicateEvent": True},
+            }
+            return {
+                "evaluation": evaluation,
+                "task_progress": {"terminal": True, "duplicateEvent": True},
+            }
+
+        baseline = {
+            "reactManaged": True,
+            "status": "ACTIVE",
+            "requestedTool": "update_delegated_task",
+            "reason": "任务进度评估中",
+            "progressSummary": "任务仍在进行",
+            "messageInstruction": "",
+            "completionReport": "",
+            "knownFacts": [],
+            "pendingConditions": [],
+            "evidence": [],
+            "evidenceEventIds": [],
+            "toolArguments": {},
+        }
+        evaluated = await self._maybe_promote_completion_action(
+            state=state,
+            evaluation=baseline,
+            timeline=list(state.get("timeline") or []),
+            event=event,
+        )
+        terminal = str(evaluated.get("requestedTool") or "") == "complete_delegated_task"
+        if terminal:
+            return {
+                "evaluation": evaluated,
+                "task_progress": {
+                    "terminal": True,
+                    "status": str(evaluated.get("status") or "COMPLETED"),
+                    "reason": str(evaluated.get("reason") or "任务已满足结束条件"),
+                },
+            }
+        return {
+            "task_progress": {
+                "terminal": False,
+                "status": "ACTIVE",
+                "reason": str(evaluated.get("reason") or "尚未满足结束条件"),
+            }
+        }
+
+    @staticmethod
+    def _route_after_progress_assessment(state: ActionState) -> str:
+        """终态和重复事件直接落地，其余任务继续进入 ReAct 规划器。"""
+        progress = state.get("task_progress") or {}
+        return "select_action" if progress.get("terminal") else "plan_react"
 
     async def _plan_react_action(self, state: ActionState) -> dict[str, Any]:
         """让主控台任务以普通 JSON 规划下一次受限工具调用。
@@ -694,8 +861,9 @@ class DelegatedTaskWorkflow:
             "候选消息必须是账号主人此刻实际要发送给对方的自然聊天文本，不能提到任务、Agent、工具、系统、联系人检索或内部编号。"
             "只能依据 taskGoal、任务后的 conversationTimeline、允许的 preTaskContext、workingMemory 和当前时间推理。"
             "preTaskContext 仅用于背景，不能作为任务完成证据。相对时间必须按消息自身 at 和 taskCreatedAt 理解。"
-            "到了目标日期当天应说‘今晚’，不能沿用任务创建时的‘明天’。"
-            "对方已经明确接受任务的成功条件时选择 complete_delegated_task，并提供来自任务后对方消息的 evidenceEventIds。"
+            "相对时间表述必须结合消息时间戳和任务目标转换成当前语境下自然、准确的说法。"
+            "任务后的联系人消息已经在语义上满足成功、拒绝或无法继续的条件时，选择 complete_delegated_task，"
+            "并提供来自任务后联系人消息的 evidenceEventIds。"
             "若缺少背景且允许读取历史，选择 get_task_pre_history；若目前无需发言，选择 update_delegated_task。"
             "get_task_pre_history 是图内只读观察：若 toolObservations 已记录该工具，无论成功、空结果或失败，均不得再次选择它，"
             "必须依据已返回的上下文继续规划其他工具。"
@@ -705,9 +873,15 @@ class DelegatedTaskWorkflow:
         system_prompt += (
             "当 conversationTimeline 末尾连续出现多条联系人新消息时，必须把这些消息作为同一轮输入一起处理，"
             "不要只回答较早的一条。"
+            "conversationTimeline 是任务创建后目标会话的完整时间线，role 字段是身份判定依据："
+            "我方=账号主人手动发送，代理=你之前通过工具发送，对方=联系人消息，系统=内部事件。"
+            "actionLedger 是你已经执行过的工具账本。发送前必须同时检查 conversationTimeline 和 actionLedger："
+            "如果你已经以我方或代理身份向同一联系人表达过高度相同的邀约、确认或追问，且没有新的对方事实或新的业务目的，"
+            "不要重复发送，改用 update_delegated_task 记录等待状态。"
+            "允许主动跟进，但必须有明确新目的：首次联系、回应新的对方消息、补充新信息、计划变更、或等待足够久后的轻提醒。"
             "candidateMessage 不要用联系人昵称、QQ号、任务标题或内部状态作为开头，也不要机械复述任务时间槽位；"
             "除非对方正在确认该信息。"
-            "若对方已经明确接受、拒绝或给出无法继续的条件，优先调用 complete_delegated_task；"
+            "若任务后的联系人消息已经足以判定成功、拒绝或无法继续，优先调用 complete_delegated_task；"
             "需要发最后一句时，把它放进 complete_delegated_task 的 candidateMessage。"
             "允许 candidateMessage 用换行拆成多条短气泡，但每一行都必须是真实要发给对方的话。"
         )
@@ -976,6 +1150,55 @@ class DelegatedTaskWorkflow:
         }
 
     @staticmethod
+    def _compact_action_text(value: Any, limit: int = 240) -> str:
+        """压缩动作账本文本，避免 stateJson 因候选回复或原因过长而膨胀。"""
+        text = " ".join(str(value or "").split())
+        if len(text) <= limit:
+            return text
+        return f"{text[:limit]}..."
+
+    def _append_action_ledger(
+        self,
+        previous_value: Any,
+        *,
+        action: str,
+        requested_tool: str,
+        message: str,
+        reason: str,
+        event_id: str,
+        task: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """记录本轮 Agent 的真实工具意图，供下一轮基于记忆判断是否重复或是否完成。"""
+        ledger = list(previous_value) if isinstance(previous_value, list) else []
+        normalized_action = self._compact_action_text(action, limit=40)
+        normalized_tool = self._compact_action_text(requested_tool, limit=80)
+        normalized_message = self._compact_action_text(message, limit=280)
+        normalized_reason = self._compact_action_text(reason, limit=240)
+        if not any([normalized_action, normalized_tool, normalized_message, normalized_reason]):
+            return ledger[-80:]
+        ledger.append(
+            {
+                "at": datetime.now(timezone.utc).isoformat(),
+                "tool": normalized_tool,
+                "action": normalized_action,
+                "status": "PLANNED",
+                "message": normalized_message,
+                "candidateMessage": normalized_message,
+                "reason": normalized_reason,
+                "eventId": self._compact_action_text(event_id, limit=80),
+                "target": self._compact_action_text(
+                    task.get("chatId") or task.get("chat_id") or "",
+                    limit=80,
+                ),
+                "targetName": self._compact_action_text(
+                    task.get("targetName") or task.get("target_name") or "",
+                    limit=80,
+                ),
+            }
+        )
+        return ledger[-80:]
+
+    @staticmethod
     def _as_text_list(value: Any) -> list[str]:
         """把模型可能返回的标量或数组归一成有限长度的非空文本列表。"""
         values = value if isinstance(value, list) else [value]
@@ -1190,22 +1413,10 @@ class DelegatedTaskWorkflow:
 
     async def _select_runtime_action(self, state: ActionState) -> dict[str, Any]:
         """根据当前控制事件、可信发送方向和完成结论选择唯一下一动作。"""
-        action_input = state["action_input"]
-        event = action_input.event
         evaluation = dict(state.get("evaluation") or {})
-        timeline = list(state.get("timeline") or [])
 
-        # 主控台委托任务允许 Agent 自主结束。ReAct 规划器有时会保守地继续发送或等待，
-        # 因此动作落地前补一轮完成复核，让模型基于完整时间线决定是否提升为结束任务工具。
-        evaluation = await self._maybe_promote_completion_action(
-            state=state,
-            evaluation=evaluation,
-            timeline=timeline,
-            event=event,
-        )
-
-        # ReAct 规划器已经完成了工具选择和候选消息审查。主控台任务在这里直接映射
-        # 受限动作，不能再被下方遗留的事件规则覆盖，否则会出现模型选择结束却被改回等待。
+        # 独立进度节点或 ReAct 规划器已经完成工具选择。这里仅做确定性动作映射，
+        # 不再调用模型，避免在候选回复产生后才重新判断任务是否结束。
         # 动作只能来自上游已校验的 @tool 意图；不再回落到下面历史遗留的事件规则。
         if True:
             requested_tool = str(evaluation.get("requestedTool") or "update_delegated_task")
@@ -1272,6 +1483,9 @@ class DelegatedTaskWorkflow:
             "preTaskContext 只能用于背景理解，不能作为完成证据。\n"
             "只有任务创建后的联系人消息能作为 evidenceEventIds；账号主人、Agent、系统、内部命令和任务创建前历史都不能作为完成证据。\n"
             "不要只看最后一条消息，多条联系人消息可以共同证明任务已完成。\n"
+            "先从 task 的 objective、successCriteria 和 executionMode 推导最小成功条件，不要要求任务中没有声明的额外确认。\n"
+            "联系人已经接受或拒绝请求，或者双方已经就任务要求的事项达成明确安排时，任务通常已经结束；"
+            "不要为了寒暄、重复确认或生成候选回复而重新打开已经达成的事项。\n"
             "如果证据不足，返回 shouldComplete=false。\n"
             "如果已完成，输出 shouldComplete=true，并填写 reason、progressSummary、completionReport、"
             "finalMessageInstruction、knownFacts、pendingConditions、evidence、evidenceEventIds。\n"
@@ -1282,7 +1496,7 @@ class DelegatedTaskWorkflow:
             "previousState": previous_state,
             "currentEvaluation": evaluation,
             "currentEvent": event,
-            "timeline": timeline[-500:],
+            "conversationTimeline": timeline[-500:],
             "context": state.get("model_context") or {},
             "toolObservations": list(state.get("tool_observations") or []),
             "currentTime": current_time.isoformat(),
@@ -1296,23 +1510,9 @@ class DelegatedTaskWorkflow:
             )
             parsed = self._parse_json_object(raw)
         except Exception:
-            return self._fallback_completion_evaluation(
-                state=state,
-                evaluation=evaluation,
-                timeline=timeline,
-                event=event,
-                task=task,
-                previous_state=previous_state,
-            ) or evaluation
+            return evaluation
         if not parsed or not parsed.get("shouldComplete"):
-            return self._fallback_completion_evaluation(
-                state=state,
-                evaluation=evaluation,
-                timeline=timeline,
-                event=event,
-                task=task,
-                previous_state=previous_state,
-            ) or evaluation
+            return evaluation
 
         tool = self.action_tools_by_name.get("complete_delegated_task")
         if tool is None:
@@ -1354,201 +1554,6 @@ class DelegatedTaskWorkflow:
             return evaluation
         return evaluation
 
-    def _fallback_completion_evaluation(
-        self,
-        *,
-        state: ActionState,
-        evaluation: dict[str, Any],
-        timeline: list[dict[str, Any]],
-        event: dict[str, Any],
-        task: dict[str, Any],
-        previous_state: dict[str, Any],
-    ) -> dict[str, Any] | None:
-        """在完成复核模型失效时，使用保守证据兜底结束主控台任务。
-
-        这里不是替代 ReviewAgent 的语义判断，而是防止模型返回非 JSON、工具模式报错或超时后，
-        明确已经收尾的主控台任务一直卡在“代理中”。兜底必须同时满足三个条件：
-        1. 任务创建后已经由 Agent/用户向联系人发起过推进消息；
-        2. 当前没有更新的联系人消息压过本轮事件；
-        3. 任务创建后的联系人消息给出了明确接受、拒绝、取消或自然收尾。
-        """
-        tool = self.action_tools_by_name.get("complete_delegated_task")
-        if tool is None:
-            return None
-        if self._has_newer_peer_message_after_current_event(timeline, event):
-            return None
-
-        signal = self._latest_peer_completion_signal(timeline, event, task, previous_state)
-        if signal is None:
-            return None
-
-        outcome = signal["outcome"]
-        text = signal["text"]
-        event_id = signal["eventId"]
-        reason = f"联系人已给出可核验的任务结果：{text}"
-        progress_summary = "任务已具备结束条件"
-        completion_report = f"已根据联系人回复结束任务：{text}"
-
-        try:
-            tool_result = tool.invoke(
-                {
-                    "reason": reason,
-                    "progressSummary": progress_summary,
-                    "completionReport": completion_report,
-                    "outcome": outcome,
-                    "evidence": [text],
-                    "evidenceEventIds": [event_id],
-                    "knownFacts": [text],
-                    "pendingConditions": [],
-                    "finalMessageInstruction": None,
-                }
-            )
-            arguments = tool_result.get("arguments") if isinstance(tool_result, dict) else {}
-            promoted = self._normalize_tool_decision(
-                {"name": "complete_delegated_task", "arguments": arguments}
-            )
-            promoted["reactManaged"] = True
-            promoted["completionReflection"] = "fallback"
-            promoted = self._repair_completion_evidence(promoted, timeline, event, task, previous_state)
-            promoted = self._validate_completion_tool_call(promoted, timeline, event, task, previous_state)
-            if promoted.get("requestedTool") == "complete_delegated_task":
-                return promoted
-        except Exception:
-            return None
-        return None
-
-    def _latest_peer_completion_signal(
-        self,
-        timeline: list[dict[str, Any]],
-        event: dict[str, Any],
-        task: dict[str, Any],
-        previous_state: dict[str, Any],
-    ) -> dict[str, str] | None:
-        """从任务后的时间线里提取最近一条可作为结束证据的联系人消息。"""
-        task_anchor = self._resolve_task_anchor(task, previous_state)
-        if not self._has_prior_outbound_after_anchor(timeline, task_anchor, previous_state):
-            return None
-
-        for row in reversed(timeline):
-            if not self._is_peer_timeline_row(row):
-                continue
-            if not self._is_at_or_after_task_anchor(row.get("at"), task_anchor):
-                continue
-            text = str(row.get("text") or "").strip()
-            outcome = self._completion_outcome_from_text(text)
-            if not outcome:
-                continue
-            event_id = str(row.get("eventId") or event.get("eventId") or "").strip()
-            if not event_id:
-                continue
-            return {"eventId": event_id, "text": text, "outcome": outcome}
-        return None
-
-    def _has_prior_outbound_after_anchor(
-        self,
-        timeline: list[dict[str, Any]],
-        task_anchor: datetime | None,
-        previous_state: dict[str, Any],
-    ) -> bool:
-        """判断任务创建后是否已经主动向联系人推进过，避免把第一条联系人消息误判为结束。"""
-        last_status = str(previous_state.get("lastWriteBackStatus") or "").upper()
-        last_action = str(previous_state.get("lastPlannedAction") or "").upper()
-        if last_status == "SENT" and last_action in {"SEND_MESSAGE", "SEND_AND_COMPLETE"}:
-            return True
-
-        for row in timeline:
-            if not isinstance(row, dict):
-                continue
-            text = str(row.get("text") or "").strip()
-            if not text:
-                continue
-            if not self._is_at_or_after_task_anchor(row.get("at"), task_anchor):
-                continue
-            direction = str(row.get("direction") or "").upper()
-            actor = str(row.get("actorType") or "").upper()
-            origin = str(row.get("messageOrigin") or "").upper()
-            speaker = str(row.get("speaker") or "").strip().lower()
-            if direction == "OUTBOUND" or actor in {"OWNER", "AGENT"}:
-                return True
-            if origin in {"AGENT", "AGENT_AUTO", "AGENT_CONFIRMED", "USER_MANUAL"}:
-                return True
-            if speaker in {"我", "owner", "agent", "代理"}:
-                return True
-        return False
-
-    def _completion_outcome_from_text(self, text: str) -> str | None:
-        """把联系人自然收尾语义归一为任务结果；无法确定时返回 None。"""
-        normalized = self._normalize_chat_text(text)
-        if not normalized or self._is_question_like_completion_text(normalized):
-            return None
-        if len(normalized) > 80:
-            return None
-
-        rejected_tokens = (
-            "不行",
-            "不可以",
-            "没空",
-            "不方便",
-            "算了",
-            "取消",
-            "不用了",
-            "办不了",
-            "改不了",
-            "没办法",
-        )
-        if any(token in normalized for token in rejected_tokens):
-            return "REJECTED"
-
-        accepted_tokens = (
-            "好",
-            "好的",
-            "可以",
-            "行",
-            "ok",
-            "OK",
-            "没问题",
-            "收到",
-            "知道了",
-            "了解",
-            "明白",
-            "就这么定",
-            "定了",
-            "见",
-            "到时候见",
-            "明晚见",
-            "今晚见",
-            "晚上见",
-        )
-        return "SUCCESS" if any(token in normalized for token in accepted_tokens) else None
-
-    @staticmethod
-    def _normalize_chat_text(text: str) -> str:
-        """清理聊天文本中的空白和结尾标点，便于做保守兜底判断。"""
-        normalized = unicodedata.normalize("NFKC", str(text or "")).strip()
-        normalized = re.sub(r"\s+", "", normalized)
-        return normalized.strip("。.!！~～")
-
-    @staticmethod
-    def _is_question_like_completion_text(normalized_text: str) -> bool:
-        """识别仍在协商中的反问句，避免把“可以吗”提前当成完成。"""
-        if not normalized_text:
-            return False
-        question_markers = ("?", "？", "吗", "嘛", "么", "呢", "咋", "怎么", "多少", "哪个", "哪", "啥")
-        if normalized_text.endswith(question_markers):
-            return True
-        negotiation_markers = (
-            "可以吗",
-            "行吗",
-            "方便吗",
-            "可不可以",
-            "能不能",
-            "要不要",
-            "还是",
-            "或者",
-            "改到",
-        )
-        return any(marker in normalized_text for marker in negotiation_markers)
-
     @staticmethod
     def _is_peer_inbound_message(
         *,
@@ -1568,7 +1573,7 @@ class DelegatedTaskWorkflow:
         # 类型缺失时允许继续依据方向判断，但明确的非消息事件仍不能触发回复或完成任务。
         if not event_text or (event_type and event_type != "message"):
             return False
-        if direction == "OUTBOUND" or actor in {"OWNER", "AGENT", "SYSTEM"}:
+        if direction == "OUTBOUND" or actor in {"SELF", "ME", "ACCOUNT_OWNER", "AGENT", "SYSTEM"}:
             return False
         if origin in {
             "INTERNAL",
@@ -1578,7 +1583,7 @@ class DelegatedTaskWorkflow:
             "USER_MANUAL",
         }:
             return False
-        if direction == "INBOUND" or actor == "CONTACT":
+        if direction == "INBOUND" or actor in {"CONTACT", "PEER", "OTHER", "MEMBER", "OWNER", "ADMIN"}:
             return True
         # 连接器旧事件没有 direction；EXTERNAL + message 是平台联系人入站的可靠组合。
         return origin in {"EXTERNAL", "PLATFORM"}
@@ -1600,8 +1605,17 @@ class DelegatedTaskWorkflow:
         actor = str(row.get("actorType") or "").upper()
         origin = str(row.get("messageOrigin") or "").upper()
         speaker = str(row.get("speaker") or "").strip().lower()
-        if speaker in {"我", "owner", "agent", "代理", "system", "系统"}:
+        role = str(row.get("role") or "").strip().lower()
+        if role in {"对方", "联系人", "peer", "contact", "external"}:
+            return True
+        if role in {"我方", "我", "本人", "账号主人", "self", "me", "agent", "代理", "system", "系统"}:
             return False
+        if role in {"owner", "admin", "member"}:
+            return direction != "OUTBOUND"
+        if speaker in {"我方", "我", "本人", "账号主人", "self", "me", "agent", "代理", "system", "系统"}:
+            return False
+        if speaker in {"owner", "admin", "member"}:
+            return direction != "OUTBOUND"
         if speaker in {"对方", "contact", "peer", "external"}:
             return True
         return self._is_peer_inbound_message(
@@ -1679,10 +1693,8 @@ class DelegatedTaskWorkflow:
                 continue
             valid_ids.append(evidence_id)
 
-        # 模型主动给了证据但证据无效时，不能私自换成当前消息；
-        # 这类情况通常说明模型把任务前历史或普通追问误当作完成证据。
-        if requested_ids and not valid_ids:
-            return evaluation
+        # 这里不决定任务是否完成，只修复“模型已经决定完成但 evidenceEventIds 写错/漏写”的参数问题。
+        # 是否完成仍由上游 ReAct 决策和下游统一校验共同约束，不能在这里加入关键词特判。
 
         if not valid_ids:
             current_id = str(event.get("eventId") or "").strip()
@@ -1794,6 +1806,20 @@ class DelegatedTaskWorkflow:
         history_access_allowed = bool(
             previous.get("historyAccessAllowed", action_input.history_access_allowed)
         )
+        action_ledger = self._append_action_ledger(
+            previous.get("actionLedger"),
+            action=action,
+            requested_tool=requested_tool,
+            message=final_message_instruction if action in {"SEND_MESSAGE", "SEND_AND_COMPLETE"} else "",
+            reason=final_reason,
+            event_id=str(action_input.event.get("eventId") or ""),
+            task=action_input.task,
+        )
+        current_event_id = str(action_input.event.get("eventId") or "").strip()
+        processed_event_ids = self._merge_unique(
+            previous.get("processedEventIds"),
+            [current_event_id] if current_event_id else [],
+        )
         graph_state = {
             **previous,
             "graphVersion": 3,
@@ -1818,6 +1844,9 @@ class DelegatedTaskWorkflow:
             "toolObservations": tool_observations[-3:],
             "historyAccessAllowed": history_access_allowed,
             "timeline": timeline,
+            "actionLedger": action_ledger,
+            # 事件幂等信息必须写回持久化状态，服务重启或 MQ 重投后才能阻止重复规划。
+            "processedEventIds": processed_event_ids,
             "lastPlannedAction": action,
             "lastPlannedAt": datetime.now(timezone.utc).isoformat(),
             "lastEvidence": list(evaluation.get("evidence") or [])[:10],
@@ -1960,19 +1989,17 @@ class DelegatedTaskWorkflow:
             "send_qq_message 用于继续对话；update_delegated_task 用于无需回复但仍要等待；"
             "complete_delegated_task 用于任务创建后的联系人消息已经共同证明目标成功、明确拒绝或确定无法继续。"
             "完成结论必须综合任务创建后的多轮对话，不要求最后一条消息独自包含全部条件。"
-            "如果任务已经可以结束，但联系人最后一句沿用了跨天后已经过时的‘明天/明晚’等时间口径，"
+            "如果任务已经可以结束，但联系人最后一句沿用了任务创建时的相对时间口径，"
             "不要因此抹掉此前有效确认；仍选择 complete_delegated_task，并在 finalMessageInstruction 中要求"
             "先发送一句符合 currentTime 和 resolvedTimeText 的简短纠正或收尾消息。"
-            "例如目标日期就是 currentTime 当天，而联系人说‘明天见’，应要求回复‘今晚见’，发送成功后结束任务。"
             "不得把用户工作台命令、本人消息、代理消息或任务创建前的旧聊天当作完成证据。"
             "结束任务时 evidenceEventIds 必须引用时间线中任务创建后由对方发送的真实事件；"
             "当前事件必须是触发本轮判断的联系人入站消息，但证据可以由当前消息和此前多条任务内消息共同组成。"
             "命令中的相对时间必须以 taskCreatedAt 为基准解释，历史消息里的相对时间必须以各自 at 为基准解释。"
             "绝不能在跨天后把旧消息中的‘明天’重新按 currentTime 解释。"
-            "生成当前回复时要按 currentTime 选择今天、今晚或明天等表述；"
-            "例如任务创建日说的‘明天晚上’，到了目标日期当天应说‘今晚’，不能说‘明天晚上’。"
+            "生成当前回复时要按 currentTime 和 resolvedTimeText 选择符合当前日期的自然时间表述。"
             "不确定是否结束时必须继续对话，不要为了收尾而猜测。"
-            "当对方已经明确接受安排、确认具体时间，或使用‘好的/可以/就这么定/到时见’等语义完成了当前任务时，"
+            "当任务创建后的联系人消息在语义上已经满足当前任务目标、明确拒绝或表明无法继续时，"
             "应优先选择 complete_delegated_task，而不是继续围绕同一时间、地点或条件重复提问。"
             "若仍有一个必要信息未确认，只能询问那个缺失信息；不要把任务目标中的全部字段再次复述给对方。"
             "工具参数应保存当前进度、已知事实和待满足条件；messageInstruction 只描述下一条回复应完成什么。"

@@ -8,6 +8,7 @@ import org.springframework.stereotype.Repository;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Timestamp;
+import java.time.Instant;
 import java.util.List;
 import java.util.Optional;
 
@@ -65,6 +66,30 @@ public class JdbcDelegatedTaskRepository {
         ).stream().findFirst();
     }
 
+    /**
+     * 查找短时间内同一会话、同一原始命令创建的任务。
+     * 这个方法用于抵御前端重复点击、Runtime 重试和并发事件导致的重复创建。
+     */
+    public Optional<DelegatedTask> findRecentDuplicateCommand(
+            String userId,
+            String originalCommand,
+            String platform,
+            String chatType,
+            String chatId,
+            Instant cutoff
+    ) {
+        return jdbcTemplate.query("""
+                SELECT * FROM delegated_task
+                WHERE user_id = ? AND original_command = ? AND platform = ? AND chat_type = ? AND chat_id = ?
+                  AND created_at >= ?
+                  AND status IN ('ACTIVE', 'WAITING_TARGET', 'PAUSED')
+                ORDER BY created_at DESC
+                LIMIT 1
+                """, rowMapper, userId, originalCommand, platform, chatType, chatId, Timestamp.from(cutoff))
+                .stream()
+                .findFirst();
+    }
+
     /** 更新生命周期状态并返回最新对象。 */
     public Optional<DelegatedTask> updateStatus(String id, String userId, String status, boolean requiresConfirmation) {
         jdbcTemplate.update("""
@@ -103,6 +128,33 @@ public class JdbcDelegatedTaskRepository {
                 ORDER BY updated_at DESC
                 LIMIT 1
                 """, rowMapper, userId, platform, chatType, chatId).stream().findFirst();
+    }
+
+    /**
+     * 同一会话只允许一个主控台委托继续接管。
+     * 新任务激活后，旧 ACTIVE/WAITING_TARGET/PAUSED 任务会被归档，防止历史任务被再次拉起执行。
+     */
+    public int cancelActiveByConversation(
+            String userId,
+            String platform,
+            String chatType,
+            String chatId,
+            String exceptId,
+            String reason
+    ) {
+        Instant now = Instant.now();
+        return jdbcTemplate.update("""
+                UPDATE delegated_task
+                SET status = 'CANCELLED',
+                    progress_summary = ?,
+                    completion_report = ?,
+                    completed_at = COALESCE(completed_at, ?),
+                    updated_at = ?
+                WHERE user_id = ? AND platform = ? AND chat_type = ? AND chat_id = ?
+                  AND id <> ?
+                  AND status IN ('ACTIVE', 'WAITING_TARGET', 'PAUSED')
+                """, reason, reason, Timestamp.from(now), Timestamp.from(now),
+                userId, platform, chatType, chatId, exceptId);
     }
 
     /** 幂等更新 LangGraph 运行态；完成时间只在进入终态时写入。 */

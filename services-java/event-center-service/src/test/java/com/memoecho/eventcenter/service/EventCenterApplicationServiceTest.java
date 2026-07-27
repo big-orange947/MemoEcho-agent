@@ -21,6 +21,7 @@ import java.time.Instant;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.BDDMockito.given;
 import static org.mockito.Mockito.mock;
@@ -87,6 +88,39 @@ class EventCenterApplicationServiceTest {
         assertEquals("SELF_MESSAGE_RECORDED", storedEvent.processingStatus());
         assertEquals("USER_MANUAL", storedEvent.messageOrigin());
         org.mockito.Mockito.verify(dispatchClient, org.mockito.Mockito.never()).dispatch(any(UnifiedEventPayload.class));
+    }
+
+    @Test
+    void shouldDispatchDesktopWorkspaceCommandEvenWhenSenderIsCurrentUser() {
+        // 这个测试函数的作用是防止主控台命令被误判为“自己发出的聊天消息”，否则前端会显示 Agent Runtime 当前未启用。
+        InMemoryEventRecordRepository repository = new InMemoryEventRecordRepository();
+        AgentRuntimeDispatchClient dispatchClient = mock(AgentRuntimeDispatchClient.class);
+        QqConnectorMessageClient qqConnectorMessageClient = mock(QqConnectorMessageClient.class);
+        EventCenterApplicationService service = new EventCenterApplicationService(repository, dispatchClient, qqConnectorMessageClient);
+        UnifiedEventPayload desktopCommand = new UnifiedEventPayload(
+                "desktop-command-runtime-dispatch",
+                "desktop",
+                "workspace",
+                "desktop_command",
+                "private",
+                "workspace:user-001",
+                "user-001",
+                new SenderPayload("user-001", "desktop-user", "owner"),
+                "帮我跟km约一下明天晚上打游戏",
+                List.of(),
+                List.of(),
+                "2026-07-26T11:00:00Z",
+                objectMapper.createObjectNode()
+        );
+        given(dispatchClient.dispatch(any(UnifiedEventPayload.class)))
+                .willReturn(new DispatchResult(true, 200, objectMapper.createObjectNode(), null));
+
+        var response = service.ingest(desktopCommand);
+
+        assertTrue(response.dispatch().attempted());
+        StoredEvent storedEvent = repository.findByEventId(desktopCommand.eventId()).orElseThrow();
+        assertNotEquals("SELF_MESSAGE_RECORDED", storedEvent.processingStatus());
+        verify(dispatchClient).dispatch(any(UnifiedEventPayload.class));
     }
 
     @Test

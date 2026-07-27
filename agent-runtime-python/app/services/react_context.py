@@ -46,6 +46,7 @@ class MasterTaskContextBuilder:
             conversation_timeline=self._normalize_messages(timeline, limit=500),
             pre_task_context=self._normalize_messages(pre_task_history, limit=30),
             working_memory=self._safe_memory(previous_state.get("workingMemory")),
+            action_ledger=self._safe_action_ledger(previous_state.get("actionLedger")),
             history_access_allowed=history_access_allowed,
             available_tools=sorted({str(item).strip() for item in available_tools if str(item).strip()}),
         )
@@ -54,21 +55,6 @@ class MasterTaskContextBuilder:
         """返回仅用于控制和会话定位、绝不应作为聊天气泡输出的内部术语。"""
         values = (task.get("targetName"), task.get("target_name"), task.get("targetQuery"), task.get("target_query"))
         return tuple(text for value in values if len(text := " ".join(str(value or "").split())) >= 2)
-
-    def _normalize_messages(self, rows: list[dict[str, Any]], *, limit: int) -> list[dict[str, str]]:
-        """将消息压缩为时间、角色和文本，避免将原始平台载荷传给模型。"""
-        result: list[dict[str, str]] = []
-        for row in rows[-limit:]:
-            if not isinstance(row, dict):
-                continue
-            text = " ".join(str(row.get("text") or "").split())
-            if text:
-                result.append({
-                    "at": " ".join(str(row.get("at") or row.get("sentAt") or "").split()),
-                    "speaker": " ".join(str(row.get("speaker") or "上下文参与者").split()),
-                    "text": text,
-                })
-        return result
 
     def _safe_memory(self, value: Any) -> dict[str, Any]:
         """保留有助于持续推理的工作记忆，并丢弃所有控制面字段。"""
@@ -92,6 +78,127 @@ class MasterTaskContextBuilder:
             if value:
                 return value
         return ""
+
+
+    def _normalize_messages(self, rows: list[dict[str, Any]], *, limit: int) -> list[dict[str, Any]]:
+        """把任务上下文整理成模型可读的聊天时间线。
+
+        这里必须保留时间戳、说话人、方向和来源。Agent 需要知道“谁在什么时候说了什么”，
+        才能判断自己是否已经发过消息、对方是否已经回复、任务是否已经推进到可结束状态。
+        """
+        result: list[dict[str, Any]] = []
+        for row in rows[-limit:]:
+            if not isinstance(row, dict):
+                continue
+
+            # 主控台输入的是任务指令，不是目标会话里的真实聊天内容，不能混入对话上下文。
+            origin = self._read_row_text(row, "messageOrigin", "origin").upper()
+            if origin in {"USER_COMMAND", "DESKTOP_COMMAND", "WORKSPACE_COMMAND"}:
+                continue
+
+            text = self._read_row_text(row, "text", "content", "rawMessage", "raw_message")
+            if not text:
+                continue
+
+            role = self._normalize_role(row)
+            speaker = self._read_row_text(row, "speaker", "senderName", "sender", "nickname", "displayName")
+            if not speaker or speaker.lower() == "unknown":
+                speaker = role
+
+            result.append({
+                "at": self._read_row_text(row, "at", "sentAt", "timestamp", "receivedAt"),
+                "role": role,
+                "speaker": speaker,
+                "direction": self._read_row_text(row, "direction"),
+                "actorType": self._read_row_text(row, "actorType", "actor_type"),
+                "messageOrigin": self._read_row_text(row, "messageOrigin", "origin"),
+                "eventId": self._read_row_text(
+                    row,
+                    "eventId",
+                    "event_id",
+                    "platformMessageId",
+                    "platform_message_id",
+                    "clientMessageId",
+                    "client_message_id",
+                    "id",
+                ),
+                "platformMessageId": self._read_row_text(row, "platformMessageId", "platform_message_id"),
+                "clientMessageId": self._read_row_text(row, "clientMessageId", "client_message_id"),
+                "text": text,
+            })
+        return result
+
+    def _safe_action_ledger(self, value: Any) -> list[dict[str, Any]]:
+        """保留最近工具动作账本，避免 Agent 忘记自己刚刚已经发送或结束过任务。"""
+        if not isinstance(value, list):
+            return []
+
+        result: list[dict[str, Any]] = []
+        allowed_keys = {
+            "at", "tool", "action", "status", "message", "candidateMessage",
+            # 模型只需要知道“做过什么”和“为什么做”，不应该看到联系人定位字段。
+            # 联系人名称、QQ 号等路由信息留在服务端状态里，避免候选回复泄露内部称呼。
+            "reason", "eventId",
+        }
+        for row in value[-80:]:
+            if not isinstance(row, dict):
+                continue
+            item: dict[str, Any] = {}
+            for key in allowed_keys:
+                raw = row.get(key)
+                if raw is None:
+                    continue
+                text = " ".join(str(raw).split())
+                if not text:
+                    continue
+                item[key] = text[:500] if key in {"message", "candidateMessage", "reason"} else text[:120]
+            if item:
+                result.append(item)
+        return result
+
+    @staticmethod
+    def _read_row_text(source: dict[str, Any], *keys: str) -> str:
+        """从消息行里读取字段并做轻量清洗，统一处理空值、换行和多余空格。"""
+        for key in keys:
+            value = " ".join(str(source.get(key) or "").split())
+            if value:
+                return value
+        return ""
+
+    def _normalize_role(self, row: dict[str, Any]) -> str:
+        """把平台方向字段归一成人能理解的角色：我方、对方、代理或系统。"""
+        explicit_role = self._read_row_text(row, "role").strip().lower()
+        if explicit_role in {"我方", "我", "本人", "账号主人", "self", "owner", "me", "user", "account_owner"}:
+            return "我方"
+        if explicit_role in {"对方", "联系人", "peer", "contact", "external", "other"}:
+            return "对方"
+        if explicit_role in {"代理", "agent", "bot", "proxy"}:
+            return "代理"
+        if explicit_role in {"系统", "system", "tool", "workflow"}:
+            return "系统"
+
+        origin = self._read_row_text(row, "messageOrigin", "origin").upper()
+        direction = self._read_row_text(row, "direction").upper()
+        actor_type = self._read_row_text(row, "actorType", "actor_type").upper()
+        speaker = self._read_row_text(row, "speaker", "senderName", "sender", "nickname", "displayName").strip().lower()
+
+        if origin in {"AGENT", "AGENT_REPLY", "PROXY_REPLY", "BOT"} or actor_type in {"AGENT", "PROXY", "BOT"}:
+            return "代理"
+        if origin in {"SYSTEM", "TOOL", "WORKFLOW"} or actor_type in {"SYSTEM", "TOOL"}:
+            return "系统"
+        if direction in {"OUTBOUND", "SENT", "SELF", "TO_CONTACT"} or actor_type in {"SELF", "USER", "OWNER", "ME", "ACCOUNT_OWNER"}:
+            return "我方"
+        if direction in {"INBOUND", "RECEIVED", "FROM_CONTACT"} or actor_type in {"PEER", "CONTACT", "OTHER", "MEMBER"}:
+            return "对方"
+        if speaker in {"我方", "我", "本人", "账号主人", "self", "owner", "me"}:
+            return "我方"
+        if speaker in {"对方", "联系人", "peer", "contact", "external"}:
+            return "对方"
+        if speaker in {"代理", "agent", "bot", "proxy"}:
+            return "代理"
+        if speaker in {"系统", "system", "tool"}:
+            return "系统"
+        return "对方"
 
 
 class CandidateReplyGuard:

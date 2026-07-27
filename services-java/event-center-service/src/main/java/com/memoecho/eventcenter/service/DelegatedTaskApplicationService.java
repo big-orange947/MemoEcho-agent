@@ -11,6 +11,7 @@ import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.web.server.ResponseStatusException;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -25,6 +26,7 @@ public class DelegatedTaskApplicationService {
 
     private static final Set<String> RUNTIME_STATUSES = Set.of("ACTIVE", "COMPLETED", "FAILED");
     private static final Set<String> TERMINAL_STATUSES = Set.of("COMPLETED", "FAILED", "CANCELLED");
+    private static final Duration DUPLICATE_COMMAND_WINDOW = Duration.ofMinutes(3);
 
     private final DelegatedTaskIntentParser intentParser;
     private final JdbcDelegatedTaskRepository repository;
@@ -62,12 +64,12 @@ public class DelegatedTaskApplicationService {
                 userId, normalizedCommand, candidates);
         if (compilation != null && compilation.recognized()) {
             DelegatedTask compiledTask = buildCompiledTask(userId, normalizedCommand, compilation, candidates);
-            return Optional.of(DelegatedTaskResponse.from(repository.insert(compiledTask)));
+            return Optional.of(DelegatedTaskResponse.from(persistNewTask(userId, normalizedCommand, compiledTask)));
         }
 
         return intentParser.parse(userId, normalizedCommand, candidates)
                 .map(this::activateFallbackTask)
-                .map(repository::insert)
+                .map(task -> persistNewTask(userId, normalizedCommand, task))
                 .map(DelegatedTaskResponse::from);
     }
 
@@ -97,7 +99,7 @@ public class DelegatedTaskApplicationService {
         }
         List<ConversationSummaryResponse> candidates = loadAuthorizedConversationCandidates(userId);
         DelegatedTask compiledTask = buildCompiledTask(userId, normalizedCommand, compilation, candidates);
-        return DelegatedTaskResponse.from(repository.insert(compiledTask));
+        return DelegatedTaskResponse.from(persistNewTask(userId, normalizedCommand, compiledTask));
     }
 
     /**
@@ -188,6 +190,10 @@ public class DelegatedTaskApplicationService {
         return intentParser.parse(userId, task.originalCommand(), candidates)
                 .filter(resolved -> !clean(resolved.chatId()).isBlank())
                 .flatMap(resolved -> repository.bindWaitingTarget(task.id(), userId, resolved))
+                .map(bound -> {
+                    archiveOlderActiveTasks(userId, bound);
+                    return bound;
+                })
                 .orElse(task);
     }
 
@@ -336,6 +342,61 @@ public class DelegatedTaskApplicationService {
                 resolved ? "" : task.clarificationQuestion(), false, "AUTO_COMPLETE",
                 resolved ? "任务已通过本地降级解析启动" : "等待选择目标会话", "{}", "",
                 resolved ? now : null, null, "", task.createdAt(), now);
+    }
+
+    /**
+     * 保存主控台新任务的唯一入口。
+     * 这里同时处理两件事：
+     * 1. 短时间内同一会话同一命令重复提交时复用旧任务，避免双击或重试创建重复卡片；
+     * 2. 新任务激活后归档同会话旧任务，避免历史任务继续接管新消息。
+     */
+    private DelegatedTask persistNewTask(String userId, String normalizedCommand, DelegatedTask task) {
+        if (canDedupeByConversation(normalizedCommand, task)) {
+            Optional<DelegatedTask> duplicate = repository.findRecentDuplicateCommand(
+                    userId,
+                    normalizedCommand,
+                    task.platform(),
+                    task.chatType(),
+                    task.chatId(),
+                    Instant.now().minus(DUPLICATE_COMMAND_WINDOW)
+            );
+            if (duplicate.isPresent()) {
+                return duplicate.get();
+            }
+        }
+
+        DelegatedTask inserted = repository.insert(task);
+        archiveOlderActiveTasks(userId, inserted);
+        return inserted;
+    }
+
+    /** 判断是否具备按会话去重的完整条件。 */
+    private boolean canDedupeByConversation(String normalizedCommand, DelegatedTask task) {
+        return !clean(normalizedCommand).isBlank()
+                && task != null
+                && !clean(task.platform()).isBlank()
+                && !clean(task.chatType()).isBlank()
+                && !clean(task.chatId()).isBlank();
+    }
+
+    /** 归档同一会话上的旧活动任务，只保留当前任务继续接管消息。 */
+    private void archiveOlderActiveTasks(String userId, DelegatedTask currentTask) {
+        if (currentTask == null || !"ACTIVE".equals(currentTask.status())) {
+            return;
+        }
+        if (clean(currentTask.platform()).isBlank()
+                || clean(currentTask.chatType()).isBlank()
+                || clean(currentTask.chatId()).isBlank()) {
+            return;
+        }
+        repository.cancelActiveByConversation(
+                userId,
+                currentTask.platform(),
+                currentTask.chatType(),
+                currentTask.chatId(),
+                currentTask.id(),
+                "已有新的主控台委托接管该会话，旧任务已自动归档"
+        );
     }
 
     /** 读取任务并校验所有权。 */

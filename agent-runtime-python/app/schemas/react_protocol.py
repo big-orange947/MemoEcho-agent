@@ -18,9 +18,10 @@ class ModelWorkingContext:
     task_created_at: str
     current_time: str
     resolved_time_text: str
-    conversation_timeline: list[dict[str, str]] = field(default_factory=list)
-    pre_task_context: list[dict[str, str]] = field(default_factory=list)
+    conversation_timeline: list[dict[str, Any]] = field(default_factory=list)
+    pre_task_context: list[dict[str, Any]] = field(default_factory=list)
     working_memory: dict[str, Any] = field(default_factory=dict)
+    action_ledger: list[dict[str, Any]] = field(default_factory=list)
     history_access_allowed: bool = False
     available_tools: list[str] = field(default_factory=list)
 
@@ -36,6 +37,7 @@ class ModelWorkingContext:
             "conversationTimeline": self.conversation_timeline,
             "preTaskContext": self.pre_task_context,
             "workingMemory": self.working_memory,
+            "actionLedger": self.action_ledger,
             "historyAccessAllowed": self.history_access_allowed,
             "availableTools": self.available_tools,
         }

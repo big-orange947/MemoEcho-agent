@@ -27,18 +27,18 @@ class _SendQqMessageInput(_TaskProgressInput):
 
 
 class _CompleteDelegatedTaskInput(_TaskProgressInput):
-    """结束主控台委托所需的证据和完成摘要。"""
+    """模型主动结束主控台委托时提交的证据和完成摘要。"""
 
-    completionReport: Annotated[str, Field(description="说明任务为什么已经完成、拒绝或无法继续")]
+    completionReport: Annotated[str, Field(description="基于任务目标、时间线和记忆说明为什么现在可以结束")]
     outcome: Annotated[str, Field(description="完成结果，只能是 SUCCESS、REJECTED 或 BLOCKED")]
-    evidence: Annotated[list[str], Field(default_factory=list, description="支持完成结论的对方消息摘要")]
+    evidence: Annotated[list[str], Field(default_factory=list, description="支持完成结论的任务内联系人消息摘要")]
     evidenceEventIds: Annotated[
         list[str],
-        Field(description="支持完成结论的任务内对方消息 eventId 列表"),
+        Field(description="支持完成结论的任务内联系人消息 eventId 列表"),
     ]
     finalMessageInstruction: Annotated[
         str | None,
-        Field(default=None, description="仅在结束前还需自然收尾时填写")
+        Field(default=None, description="仅在结束前还需发一句自然收尾消息时填写")
     ]
 
 
@@ -75,9 +75,11 @@ def plan_update_delegated_task(**kwargs: object) -> dict[str, object]:
 
 @tool("complete_delegated_task", args_schema=_CompleteDelegatedTaskInput)
 def plan_complete_delegated_task(**kwargs: object) -> dict[str, object]:
-    """仅在任务内证据已支持成功、明确拒绝或无法继续时，声明结束主控台委托。
+    """当模型综合任务目标、任务内时间线和记忆后判断任务可以收束时，声明结束主控台委托。
 
-    工作流和 Java 服务会继续核验证据、权限和任务来源，不能仅凭模型声明结束。
+    这个工具只表达“模型主动决定结束”的意图；Python 侧不会用固定词命中来代替该判断。
+    调用前必须确认任务创建后的证据足以支持 SUCCESS、REJECTED 或 BLOCKED。若结束前仍需
+    发一句自然收尾，把表达意图写入 finalMessageInstruction。
     """
     return {"intent": "complete_delegated_task", "arguments": _public_arguments(_CompleteDelegatedTaskInput, kwargs)}
 
