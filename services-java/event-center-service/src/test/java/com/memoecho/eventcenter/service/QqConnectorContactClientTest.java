@@ -47,8 +47,10 @@ class QqConnectorContactClientTest {
         assertEquals(2, contacts.size());
         assertEquals("好友备注", contacts.get(0).name());
         assertEquals("private", contacts.get(0).type());
+        assertEquals(List.of("好友备注", "好友昵称", "10001"), contacts.get(0).aliases());
         assertEquals("项目群", contacts.get(1).name());
         assertEquals("group", contacts.get(1).type());
+        assertEquals(List.of("项目群", "20001"), contacts.get(1).aliases());
         server.verify();
     }
 

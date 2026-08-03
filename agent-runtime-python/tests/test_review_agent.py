@@ -310,9 +310,9 @@ class ReviewAgentTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.structured_result["reviewDecision"], "APPROVE", result.structured_result)
         self.assertEqual(
             result.structured_result["approvedDraft"],
-            "\u4f60\u662f\u60f3\u52a0\u5fae\u4fe1\u5417",
+            "\u4f60\u662f\u60f3\u52a0\u5fae\u4fe1\u5417\uff1f",
         )
-        self.assertEqual(result.structured_result["messageParts"], ["\u4f60\u662f\u60f3\u52a0\u5fae\u4fe1\u5417"])
+        self.assertEqual(result.structured_result["messageParts"], ["\u4f60\u662f\u60f3\u52a0\u5fae\u4fe1\u5417\uff1f"])
         self.assertNotIn("\u6211\u5148\u95ee", result.structured_result["approvedDraft"])
         self.assertTrue(result.structured_result["rewritten"])
 

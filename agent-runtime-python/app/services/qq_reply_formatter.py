@@ -7,6 +7,11 @@ import re
 class QqReplyFormatter:
     """把模型或审查 Agent 的最终文本统一整理为适合 QQ 私聊的短气泡。"""
 
+    # 主控台不受设定集的 16~24 字气泡偏好限制。这里只是“考虑分段”的目标长度，
+    # 只有文本足够长且能找到自然语义停顿时才会拆为两条，防止机械地按字数切句。
+    _MAIN_CONSOLE_SPLIT_TARGET_CHARS = 42
+    _MAIN_CONSOLE_MAX_BUBBLES = 2
+
     _STAGE_DIRECTION_CUES = (
         "挠头",
         "歪头",
@@ -105,18 +110,27 @@ class QqReplyFormatter:
                 terminal_punctuation=terminal_punctuation,
             )
 
-        # 主控台委托任务不把发送消息建模为气泡工具，也不使用固定字符数切割文本。
-        # 模型明确输出换行时才连续发送多条，否则始终保留为一条完整 QQ 消息。
+        # 主控台委托任务不把发送消息建模为气泡工具。模型用显式换行表示“连续发几条”；
+        # 当模型漏掉换行时，只对过长且存在自然停顿的文本补充一次分段。
         explicit_parts = [part.strip() for part in cleaned_text.split("\n") if part.strip()]
         # 主控台由模型显式换行表达“连续发几条”，不受设定集的拆分开关影响。
         # 该开关只保留给旧的设定集链路，避免主控台把多条自然回复压回一条。
         if len(explicit_parts) > 1:
             parts = [self._trim_chat_bubble(part, 0) for part in explicit_parts]
-            return [part for part in parts if part] or ["嗯"]
+            return self._apply_terminal_punctuation([part for part in parts if part] or ["嗯"], terminal_punctuation)
 
         single_part = "，".join(explicit_parts) if explicit_parts else cleaned_text
+        # 正常稍长的 QQ 消息允许保持完整。只有超过目标长度时，才尝试按逗号、问号或转折词拆分。
+        if len(single_part) > self._MAIN_CONSOLE_SPLIT_TARGET_CHARS:
+            parts = self._split_to_chat_bubbles(
+                single_part,
+                self._MAIN_CONSOLE_SPLIT_TARGET_CHARS,
+                self._MAIN_CONSOLE_MAX_BUBBLES,
+            )
+        else:
+            parts = [self._trim_chat_bubble(single_part, 0)]
         return self._apply_terminal_punctuation(
-            [self._trim_chat_bubble(single_part, 0)],
+            parts,
             terminal_punctuation,
         )
 
@@ -197,7 +211,10 @@ class QqReplyFormatter:
         if len(normalized) > limit or not normalized:
             return ""
         punctuation = normalized[-1]
-        if punctuation not in "。！？!?":
+        # 问句是否带问号会直接影响语义，不能按“偶尔保留标点”的规则删除。
+        if punctuation in "？?":
+            return "？"
+        if punctuation not in "。！!":
             return ""
         return punctuation if self.should_keep_terminal_punctuation(event_id) else ""
 
@@ -205,6 +222,9 @@ class QqReplyFormatter:
     def _apply_terminal_punctuation(parts: list[str], punctuation: str) -> list[str]:
         """只给单条短消息恢复抽样命中的原始句末标点，不向分段文本额外添加符号。"""
         if punctuation and len(parts) == 1 and parts[0]:
+            # 问句已在清洗阶段保留问号，不能在这里再追加一次。
+            if punctuation in ("?", "？") and parts[-1].endswith(("?", "？")):
+                return parts
             parts[-1] = f"{parts[-1]}{punctuation}"
         return parts
 
@@ -222,11 +242,13 @@ class QqReplyFormatter:
         text = re.sub(r"[~～]+", "", text)
         # 连续句点和省略号都表示一次自然停顿，不能让字符上限把后面的完整短语从中间切开。
         text = re.sub(r"(?:\.{2,}|…{1,})", "，", text)
-        text = re.sub(r"[。！？!?；;]+", "，", text)
+        # 句号、感叹号和分号改为自然停顿；问号必须保留，避免把问句误发成陈述句。
+        text = re.sub(r"[。！!；;]+", "，", text)
+        text = re.sub(r"[？?]+", "？", text)
         text = re.sub(r"[，、]+", "，", text)
         text = re.sub(r"[ \t]+", " ", text)
         text = re.sub(r"\n{2,}", "\n", text)
-        return text.strip(" \n\"'“”。，、；;！？?!~～")
+        return text.strip(" \n\"'“”。，、；;！!~～")
 
     @classmethod
     def _remove_stage_directions(cls, text: str) -> str:
@@ -249,17 +271,19 @@ class QqReplyFormatter:
 
     @staticmethod
     def _trim_chat_bubble(text: str, limit: int) -> str:
-        """去除气泡边缘的书面标点；保留完整语义，不再按照字符数截断。"""
+        """去除陈述句的书面尾标点，保留问号和完整语义，不按字符数截断。"""
         _ = limit
-        return " ".join(text.split()).strip().strip("。，、；;！？?!")
+        normalized = " ".join(text.split()).strip().strip("。，、；;！!")
+        return re.sub(r"[？?]+$", "？", normalized)
 
     @staticmethod
     def _legacy_trim_chat_bubble(text: str, limit: int) -> str:
         """仅供设定集兼容模式使用，在用户配置的字符上限处收紧单条回复。"""
-        normalized = " ".join(text.split()).strip().strip("。，、；;！？?!")
+        normalized = " ".join(text.split()).strip().strip("。，、；;！!")
+        normalized = re.sub(r"[？?]+$", "？", normalized)
         if len(normalized) <= limit:
             return normalized
-        return normalized[:limit].rstrip(" ，、；;。！？?!")
+        return normalized[:limit].rstrip(" ，、；;。！!")
 
     def _split_to_chat_bubbles(self, text: str, limit: int, max_bubbles: int = 2) -> list[str]:
         """只在自然语义边界拆分，并为单轮自动回复设置气泡数量硬上限。"""
@@ -285,7 +309,8 @@ class QqReplyFormatter:
             if not bubble:
                 break
             bubbles.append(bubble)
-            remaining = remaining[split_at:].lstrip(" ，、；;。！？?!")
+            # 问号属于上一气泡的语义，不能在这里被清掉，否则问句会变成陈述句。
+            remaining = remaining[split_at:].lstrip(" ，、；;。！!")
         return bubbles or ["嗯"]
 
     @staticmethod
@@ -311,8 +336,9 @@ class QqReplyFormatter:
 
     @staticmethod
     def _normalize_chat_bubble(text: str) -> str:
-        """只清理单个气泡边缘，不再按字符数截掉已经选定的完整语义片段。"""
-        return " ".join(text.split()).strip().strip(" 。，、；;！？?!")
+        """只清理单个气泡的陈述尾标点，保留问句边界，不截掉已选语义片段。"""
+        normalized = " ".join(text.split()).strip().strip(" 。，、；;！!")
+        return re.sub(r"[？?]+$", "？", normalized)
 
     @classmethod
     def _is_safe_reaction(cls, candidate: str) -> bool:

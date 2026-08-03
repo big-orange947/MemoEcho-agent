@@ -12,6 +12,7 @@ import org.springframework.web.client.RestClientException;
 import org.springframework.web.server.ResponseStatusException;
 
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
 
 /**
@@ -60,7 +61,13 @@ public class QqConnectorContactClient {
             String nickname = item.path("nickname").asText("");
             String remark = item.path("remark").asText("");
             if (!id.isBlank()) {
-                result.add(new QqContactResponse(id, remark.isBlank() ? nickname : remark, "private", remark));
+                result.add(new QqContactResponse(
+                        id,
+                        remark.isBlank() ? nickname : remark,
+                        "private",
+                        remark,
+                        collectAliases(remark, nickname, id)
+                ));
             }
         }
         return result;
@@ -77,10 +84,30 @@ public class QqConnectorContactClient {
             String groupName = item.path("group_name").asText("");
             String remark = item.path("group_remark").asText("");
             if (!id.isBlank()) {
-                result.add(new QqContactResponse(id, remark.isBlank() ? groupName : remark, "group", remark));
+                result.add(new QqContactResponse(
+                        id,
+                        remark.isBlank() ? groupName : remark,
+                        "group",
+                        remark,
+                        collectAliases(remark, groupName, id)
+                ));
             }
         }
         return result;
+    }
+
+    /**
+     * 汇总 NapCat 提供的备注、昵称和 QQ 号。
+     * RouterAgent 可据此匹配用户习惯使用的任意称呼，而展示名称仍只保留一个。
+     */
+    private List<String> collectAliases(String... values) {
+        LinkedHashSet<String> aliases = new LinkedHashSet<>();
+        for (String value : values) {
+            if (value != null && !value.isBlank()) {
+                aliases.add(value.trim());
+            }
+        }
+        return List.copyOf(aliases);
     }
 
     /**

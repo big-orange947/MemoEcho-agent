@@ -21,7 +21,21 @@ def test_should_build_model_context_without_control_metadata() -> None:
 
     payload = context.to_model_payload()
     assert payload["taskGoal"] == "确认明晚课程时间"
-    assert payload["conversationTimeline"] == [{"at": "2026-07-23T10:00:00+08:00", "speaker": "对方", "text": "晚上可以"}]
+    # 时间线必须保留双方角色、方向、来源和事件 ID，供 Agent 区分谁在何时说了什么。
+    assert payload["conversationTimeline"] == [
+        {
+            "at": "2026-07-23T10:00:00+08:00",
+            "role": "对方",
+            "speaker": "对方",
+            "direction": "",
+            "actorType": "",
+            "messageOrigin": "",
+            "eventId": "e-1",
+            "platformMessageId": "",
+            "clientMessageId": "",
+            "text": "晚上可以",
+        }
+    ]
     assert "taskId" not in payload
     assert "targetName" not in payload
     assert "chatId" not in payload["workingMemory"]

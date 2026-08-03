@@ -70,10 +70,21 @@ async def health() -> dict[str, str]:
 @app.post("/v1/events/handle", response_model=OrchestratorResult)
 async def handle_event(event: UnifiedEvent, background_tasks: BackgroundTasks) -> OrchestratorResult:
     """处理实时事件；代理私聊中的附件解析在响应后后台执行，不能阻塞自动回复或人工审批。"""
-    result, reused = await event_execution_registry.execute(
-        event.event_id,
-        lambda: orchestrator.handle_event(event),
-    )
+    try:
+        result, reused = await event_execution_registry.execute(
+            event.event_id,
+            lambda: orchestrator.handle_event(event),
+        )
+    except Exception:
+        # 保留原始异常响应给调用方，同时记录事件定位信息，避免客户端只看到笼统的 500。
+        logger.exception(
+            "事件处理失败：eventId=%s, platform=%s, eventType=%s, chatId=%s",
+            event.event_id,
+            event.platform,
+            event.event_type,
+            event.chat_id,
+        )
+        raise
     # 私聊社交回复已在主链路同步完成附件理解，避免响应后重复调用视觉模型。
     # 重复事件已经复用第一次执行结果，因此也不能重复创建附件后台任务。
     if not reused and event.attachments and result.route not in {"file_analysis", "social_reply"}:

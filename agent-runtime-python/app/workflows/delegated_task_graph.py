@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import inspect
 import json
 import hashlib
+import logging
 import os
 import re
 import unicodedata
 from datetime import datetime, timedelta, timezone
-from typing import Any, TypedDict
+from typing import Any, Awaitable, Callable, TypedDict
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from langgraph.graph import END, START, StateGraph
@@ -14,6 +16,8 @@ from langgraph.graph import END, START, StateGraph
 from app.clients.event_center_service import EventCenterServiceClient
 from app.clients.llm_service import LlmServiceClient
 from app.services.react_context import CandidateReplyGuard, MasterTaskContextBuilder
+from app.services.message_identity import canonical_message_identity
+from app.schemas.react_protocol import CompletionReflectionDecision
 from app.schemas.delegated_tasks import (
     ConversationCandidate,
     DelegatedTaskActionDecision,
@@ -24,6 +28,9 @@ from app.schemas.delegated_tasks import (
     DelegatedTaskRuntimeInput,
 )
 from app.tools.langchain_delegated_task_tools import delegated_task_action_tools
+
+
+logger = logging.getLogger(__name__)
 
 
 class CompileState(TypedDict, total=False):
@@ -45,6 +52,8 @@ class RuntimeState(TypedDict, total=False):
     runtime_input: DelegatedTaskRuntimeInput
     model_profile: Any
     timeline: list[dict[str, Any]]
+    # 当前图执行所绑定的平台会话范围，防止不同私聊或群聊共用任务状态。
+    conversation_scope: tuple[str, str, str]
     previous_state: dict[str, Any]
     evaluation: dict[str, Any]
     result: DelegatedTaskRuntimeDecision
@@ -57,6 +66,8 @@ class ActionState(TypedDict, total=False):
     runtime_input: DelegatedTaskRuntimeInput
     model_profile: Any
     timeline: list[dict[str, Any]]
+    # 与 RuntimeState 保持一致，动作规划只能读取目标会话的时间线。
+    conversation_scope: tuple[str, str, str]
     previous_state: dict[str, Any]
     evaluation: dict[str, Any]
     model_context: dict[str, Any]
@@ -77,7 +88,6 @@ class ActionState(TypedDict, total=False):
 class DelegatedTaskWorkflow:
     """用两张 LangGraph 图管理任务编译和跨重启的会话目标执行。"""
 
-    _INTENT_PATTERN = re.compile(r"(帮我|替我|代我).*(回|回复|聊|约|问|联系|告诉|协商|通知|确认)")
     _DEADLINE_PATTERN = re.compile(
         r"(今天|明天|后天|本周|下周|今晚|明早|明晚|\d{1,2}月\d{1,2}日|"
         r"周[一二三四五六日天]|星期[一二三四五六日天])[^，。；;]*"
@@ -103,6 +113,87 @@ class DelegatedTaskWorkflow:
         self.compile_graph = self._build_compile_graph()
         self.action_graph = self._build_action_graph()
         self.runtime_graph = self._build_runtime_graph()
+
+    @staticmethod
+    def _log_preview(value: Any, limit: int = 72) -> str:
+        """将日志中的文本压缩为短预览，避免控制台输出整段私聊内容。"""
+        normalized = " ".join(str(value or "").split())
+        if len(normalized) <= limit:
+            return normalized
+        return f"{normalized[:limit]}..."
+
+    def _log_action_progress(
+        self,
+        state: dict[str, Any],
+        stage: str,
+        **details: Any,
+    ) -> None:
+        """输出统一的委托任务进度日志，供本地排查任务卡住和重复发送。"""
+        action_input = state.get("action_input")
+        task = getattr(action_input, "task", None) or {}
+        event = getattr(action_input, "event", None) or {}
+        scope = state.get("conversation_scope") or self._task_conversation_scope(task)
+
+        if isinstance(scope, dict):
+            scope_text = "/".join(
+                str(scope.get(key) or "-") for key in ("platform", "chatType", "chatId")
+            )
+        elif isinstance(scope, (list, tuple)):
+            scope_text = "/".join(str(item or "-") for item in scope)
+        else:
+            scope_text = self._log_preview(scope or "-", 48)
+
+        task_ref = str(task.get("id") or task.get("taskId") or task.get("title") or "unknown")
+        event_ref = str(event.get("eventId") or event.get("messageId") or "-")
+        formatted_details = " | ".join(
+            f"{key}={self._log_preview(value)}"
+            for key, value in details.items()
+            if value not in (None, "", [], {})
+        )
+        suffix = f" | {formatted_details}" if formatted_details else ""
+        logger.info(
+            "Agent任务进度 | task=%s | stage=%s | event=%s | conversation=%s%s",
+            task_ref,
+            stage,
+            event_ref,
+            scope_text,
+            suffix,
+        )
+
+    def _instrument_action_node(
+        self,
+        node_name: str,
+        handler: Callable[[ActionState], Awaitable[dict[str, Any]]],
+    ) -> Callable[[ActionState], Awaitable[dict[str, Any]]]:
+        """为 LangGraph 节点包裹统一日志，不改变节点的状态输入输出协议。"""
+
+        async def instrumented(state: ActionState) -> dict[str, Any]:
+            self._log_action_progress(dict(state), f"{node_name}:开始")
+            try:
+                # LangGraph 节点既可能是同步函数，也可能是异步函数；日志包装层需兼容两种实现。
+                node_result = handler(state)
+                result = await node_result if inspect.isawaitable(node_result) else node_result
+            except Exception:
+                self._log_action_progress(dict(state), f"{node_name}:异常")
+                logger.exception("Agent任务节点执行异常 | node=%s", node_name)
+                raise
+
+            snapshot = dict(state)
+            snapshot.update(result or {})
+            evaluation = snapshot.get("evaluation") or {}
+            selected_action = snapshot.get("selected_action") or {}
+            self._log_action_progress(
+                snapshot,
+                f"{node_name}:完成",
+                requested_tool=evaluation.get("requestedTool"),
+                action=selected_action.get("action"),
+                review=snapshot.get("review_decision"),
+                timeline_count=len(snapshot.get("timeline") or []),
+                candidate_preview=evaluation.get("messageInstruction"),
+            )
+            return result
+
+        return instrumented
 
     def _build_compile_graph(self):
         """构建“归一化命令 -> 理解 -> 白名单解析 -> 契约输出”的任务编译图。"""
@@ -138,13 +229,13 @@ class DelegatedTaskWorkflow:
         候选消息必须先经过情景审查；审查打回时回到规划节点，并携带通用反馈重新思考。
         """
         graph = StateGraph(ActionState)
-        graph.add_node("build_timeline", self._build_action_timeline)
-        graph.add_node("assess_progress", self._assess_task_progress)
-        graph.add_node("plan_react", self._plan_react_action)
-        graph.add_node("observe_tool", self._observe_react_tool)
-        graph.add_node("review_candidate", self._review_react_candidate)
-        graph.add_node("select_action", self._select_runtime_action)
-        graph.add_node("finalize_action", self._finalize_action)
+        graph.add_node("build_timeline", self._instrument_action_node("构建上下文", self._build_action_timeline))
+        graph.add_node("assess_progress", self._instrument_action_node("评估任务进度", self._assess_task_progress))
+        graph.add_node("plan_react", self._instrument_action_node("ReAct规划", self._plan_react_action))
+        graph.add_node("observe_tool", self._instrument_action_node("观察工具结果", self._observe_react_tool))
+        graph.add_node("review_candidate", self._instrument_action_node("审查候选回复", self._review_react_candidate))
+        graph.add_node("select_action", self._instrument_action_node("选择最终动作", self._select_runtime_action))
+        graph.add_node("finalize_action", self._instrument_action_node("落地动作决策", self._finalize_action))
         graph.add_edge(START, "build_timeline")
         graph.add_edge("build_timeline", "assess_progress")
         graph.add_conditional_edges(
@@ -178,8 +269,15 @@ class DelegatedTaskWorkflow:
         model_profile: Any = None,
     ) -> DelegatedTaskCompileResponse:
         """执行任务编译图，并返回可直接反序列化到 Java record 的结果。"""
+        logger.info("Agent任务编译开始 | command_length=%s", len(str(request.command or "")))
         state = await self.compile_graph.ainvoke({"request": request, "model_profile": model_profile})
-        return state["result"]
+        result = state["result"]
+        logger.info(
+            "Agent任务编译完成 | status=%s | targets=%s",
+            getattr(result, "status", "-"),
+            len(getattr(result, "targets", None) or []),
+        )
+        return result
 
     async def evaluate_runtime(
         self,
@@ -187,10 +285,17 @@ class DelegatedTaskWorkflow:
         model_profile: Any = None,
     ) -> DelegatedTaskRuntimeDecision:
         """执行运行状态图；失败时由调用层保留旧状态，不影响已生成的聊天回复。"""
+        logger.info("Agent任务运行状态评估开始 | task=%s", runtime_input.task.get("id") or runtime_input.task.get("title") or "unknown")
         state = await self.runtime_graph.ainvoke(
             {"runtime_input": runtime_input, "model_profile": model_profile}
         )
-        return state["result"]
+        result = state["result"]
+        logger.info(
+            "Agent任务运行状态评估完成 | task=%s | status=%s",
+            runtime_input.task.get("id") or runtime_input.task.get("title") or "unknown",
+            getattr(result, "status", "-"),
+        )
+        return result
 
     async def decide_action(
         self,
@@ -198,10 +303,23 @@ class DelegatedTaskWorkflow:
         model_profile: Any = None,
     ) -> DelegatedTaskActionDecision:
         """在生成聊天草稿前决定本轮应发送、等待还是结束任务。"""
+        self._log_action_progress(
+            {"action_input": action_input},
+            "动作决策请求:开始",
+            incoming_type=action_input.event.get("type") or action_input.event.get("eventType"),
+        )
         state = await self.action_graph.ainvoke(
             {"action_input": action_input, "model_profile": model_profile}
         )
-        return state["result"]
+        result = state["result"]
+        self._log_action_progress(
+            dict(state),
+            "动作决策请求:完成",
+            action=getattr(result, "action", "-"),
+            requested_tool=getattr(result, "requested_tool", "-"),
+            status=getattr(result, "status", "-"),
+        )
+        return result
 
     async def resolve_workspace_command_targets(
         self,
@@ -218,8 +336,14 @@ class DelegatedTaskWorkflow:
         if not candidates:
             return []
 
+        # 明确提到已授权通讯录别名时，先确定性命中。
+        # 这类名称不需要消耗模型调用，也避免模型偶发漏选让「km」等备注失效。
+        explicit_targets = self._fallback_resolve_workspace_targets(command, candidates)
+        if explicit_targets:
+            return explicit_targets
+
         if not self.llm_client.is_enabled(model_profile):
-            return self._fallback_resolve_workspace_targets(command, candidates)
+            return []
 
         system_prompt = (
             "你是 Memo Echo 主控台命令路由器，只输出 JSON，不要解释。"
@@ -262,6 +386,7 @@ class DelegatedTaskWorkflow:
             "chatType": self._normalize_chat_type(candidate.chat_type),
             "chatId": candidate.chat_id,
             "chatName": candidate.chat_name,
+            "aliases": sorted(self._candidate_aliases(candidate)),
             "lastSenderName": candidate.last_sender_name,
             "lastMessage": candidate.last_message,
             "lastMessageTime": candidate.last_message_time,
@@ -361,7 +486,12 @@ class DelegatedTaskWorkflow:
     def _candidate_aliases(self, candidate: ConversationCandidate) -> set[str]:
         """整理候选会话可被主控台命令命中的别名。"""
         aliases: set[str] = set()
-        for raw_value in (candidate.chat_name, candidate.last_sender_name, candidate.chat_id):
+        for raw_value in (
+            candidate.chat_name,
+            *candidate.aliases,
+            candidate.last_sender_name,
+            candidate.chat_id,
+        ):
             alias = self._normalize_contact_token(raw_value)
             if alias and (len(alias) >= 2 or alias.isdigit()):
                 aliases.add(alias)
@@ -464,7 +594,11 @@ class DelegatedTaskWorkflow:
             if self._normalize_chat_type(candidate.chat_type) != expected_chat_type:
                 continue
             # last_sender_name 只代表最后发言人，不能证明该会话就是目标联系人。
-            names = {candidate.chat_name.strip(), candidate.chat_id.strip()}
+            # 别名来自授权通讯录；最后发言人不作为会话归属依据，避免群内成员误命中。
+            names = {
+                str(raw_name).strip()
+                for raw_name in (candidate.chat_name, *candidate.aliases, candidate.chat_id)
+            }
             names.discard("")
             score = 0
             for name in names:
@@ -494,7 +628,10 @@ class DelegatedTaskWorkflow:
         command = state["normalized_command"]
         intent = state.get("intent") or {}
         target = state.get("target")
-        recognized = bool(self._INTENT_PATTERN.search(command))
+        # 编译图只接收 RouterAgent 已经路由为 delegated_task 的命令，因此这里只校验命令非空。
+        # 不再用关键词正则做第二次意图识别，否则“通知某人”这类命令式表达会在联系人
+        # 已明确解析后被旧规则错误拒绝，并为每个联系人生成一条 needs_clarification。
+        recognized = bool(command.strip())
         now = self._now()
         deadline_text = str(intent.get("deadlineText") or "")
         resolved_time_text = str(intent.get("resolvedTimeText") or "").strip()
@@ -508,6 +645,12 @@ class DelegatedTaskWorkflow:
             # 不能把旧命令中的“明天”重新解释成新的明天。
             "taskCreatedAt": now.isoformat(),
             "taskTimezone": self._timezone_name(),
+            # 状态只能服务于创建时解析出的目标会话，跨重启后据此隔离记忆和动作账本。
+            "conversationScope": {
+                "platform": target.platform if target else "",
+                "chatType": target.chat_type if target else "",
+                "chatId": target.chat_id if target else "",
+            },
             "resolvedTimeText": resolved_time_text,
             "knownFacts": [],
             "pendingConditions": [str(intent.get("successCriteria") or "等待对方明确回应")],
@@ -548,25 +691,34 @@ class DelegatedTaskWorkflow:
         return {"result": result}
 
     def _timeline_event_id(self, row: dict[str, Any], text: str = "") -> str:
-        """为时间线生成稳定消息 ID，避免跨轮恢复时丢失平台消息。"""
-        for key in (
-            "eventId", "event_id", "platformMessageId", "platform_message_id",
-            "clientMessageId", "client_message_id", "id",
+        """为时间线生成稳定去重键，不能替代原始事件引用。"""
+        return canonical_message_identity(row, text)
+
+    def _timeline_event_reference(self, row: dict[str, Any], fallback_identity: str) -> str:
+        """提取可回查的原始事件 ID，供完成工具和审计证据使用。
+
+        ``canonical_message_identity`` 的职责是识别 Webhook/MQ 重投的同一条消息，
+        它可能是合成哈希值，不能写入 ``eventId``。任务完成、历史回查和 Java
+        写回都需要尽量保留 Event Center 或平台实际给出的事件 ID。
+        """
+        raw_payload = row.get("rawPayload") if isinstance(row.get("rawPayload"), dict) else {}
+        for value in (
+            row.get("eventId"),
+            row.get("event_id"),
+            row.get("id"),
+            row.get("platformMessageId"),
+            row.get("platform_message_id"),
+            row.get("messageId"),
+            row.get("message_id"),
+            raw_payload.get("event_id"),
+            raw_payload.get("message_id"),
+            raw_payload.get("messageId"),
+            raw_payload.get("real_id"),
         ):
-            value = " ".join(str(row.get(key) or "").split())
-            if value:
-                return value
-        at = row.get("at") or row.get("sentAt") or row.get("timestamp") or row.get("receivedAt") or row.get("importedAt") or ""
-        raw = "|".join(
-            [
-                str(at),
-                str(row.get("direction") or ""),
-                str(row.get("actorType") or row.get("actor_type") or ""),
-                str(row.get("messageOrigin") or row.get("origin") or ""),
-                text,
-            ]
-        )
-        return "synthetic:" + hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+            reference = " ".join(str(value or "").split())
+            if reference:
+                return reference
+        return fallback_identity
 
     def _normalize_timeline_role(self, row: dict[str, Any]) -> str:
         """统一任务时间线中的角色，优先采用消息方向而不是平台成员身份。"""
@@ -609,11 +761,96 @@ class DelegatedTaskWorkflow:
                     return value[:60]
         return {"我方": "我", "对方": "对方", "代理": "代理", "系统": "系统"}.get(role, role)
 
+    @staticmethod
+    def _conversation_scope(row: dict[str, Any]) -> tuple[str, str, str]:
+        """提取消息所属会话的稳定范围。
+
+        任务图不能仅依赖 taskId 区分上下文：主控台可能为多个联系人并行创建任务，
+        NapCat 重投或历史导入也可能把不同会话的数据一起带入。这里统一兼容 Java DTO
+        的驼峰字段、下划线字段以及 rawPayload 内的 OneBot 字段。
+        """
+        payload = row.get("rawPayload") if isinstance(row.get("rawPayload"), dict) else {}
+        platform = str(row.get("platform") or payload.get("platform") or "").strip().lower()
+        chat_type = str(
+            row.get("chatType")
+            or row.get("chat_type")
+            or payload.get("chatType")
+            or payload.get("chat_type")
+            or ""
+        ).strip().lower()
+        chat_id = str(
+            row.get("chatId")
+            or row.get("chat_id")
+            or payload.get("chatId")
+            or payload.get("chat_id")
+            or payload.get("group_id")
+            or payload.get("user_id")
+            or ""
+        ).strip()
+        return platform, chat_type, chat_id
+
+    @classmethod
+    def _task_conversation_scope(cls, task: dict[str, Any]) -> tuple[str, str, str]:
+        """从委托任务恢复目标会话范围，作为旧历史缺少元数据时的兼容依据。"""
+        return cls._conversation_scope(task)
+
+    @staticmethod
+    def _scope_as_dict(scope: tuple[str, str, str]) -> dict[str, str]:
+        """将内部元组范围转换为可持久化的 JSON 数据。"""
+        return {"platform": scope[0], "chatType": scope[1], "chatId": scope[2]}
+
+    @classmethod
+    def _belongs_to_conversation(
+        cls,
+        row: dict[str, Any],
+        expected_scope: tuple[str, str, str],
+        task_scope: tuple[str, str, str],
+    ) -> bool:
+        """判断消息是否属于当前执行会话，避免跨会话别名和事实进入模型上下文。"""
+        row_scope = cls._conversation_scope(row)
+        if all(row_scope):
+            return row_scope == expected_scope
+
+        # 仅兼容升级前已经写入当前任务 stateJson 的无范围数据。新数据必须带完整范围；
+        # 否则多个目标会话并发时会再次污染彼此的时间线。
+        return not any(row_scope) and task_scope == expected_scope
+
+    @staticmethod
+    def _with_conversation_scope(
+        item: dict[str, Any],
+        scope: tuple[str, str, str],
+    ) -> dict[str, Any]:
+        """把会话范围写入规范时间线，保证跨重启后仍可做严格过滤。"""
+        platform, chat_type, chat_id = scope
+        return {
+            **item,
+            "platform": platform,
+            "chatType": chat_type,
+            "chatId": chat_id,
+        }
+
     def _build_timeline(self, state: RuntimeState) -> dict[str, Any]:
         """按任务创建时间裁剪并去重，保留任务开始后的完整双方会话。"""
         runtime_input = state["runtime_input"]
         previous_state = self._safe_json(runtime_input.task.get("stateJson"))
         task_anchor = self._resolve_task_anchor(runtime_input.task, previous_state)
+        expected_scope = self._conversation_scope(runtime_input.event)
+        task_scope = self._task_conversation_scope(runtime_input.task)
+        if not all(expected_scope):
+            expected_scope = task_scope
+        persisted_scope = self._conversation_scope(
+            previous_state.get("conversationScope")
+            if isinstance(previous_state.get("conversationScope"), dict)
+            else {}
+        )
+        # 记忆、账本和幂等记录都是会话私有状态。范围不一致时不能继承整份旧状态。
+        if all(persisted_scope) and persisted_scope != expected_scope:
+            previous_state = {}
+            task_anchor = self._resolve_task_anchor(runtime_input.task, previous_state)
+        # 对升级前无范围状态，只在任务目标和当前事件严格一致时兼容一次。
+        elif not all(persisted_scope) and all(expected_scope) and task_scope != expected_scope:
+            previous_state = {}
+            task_anchor = self._resolve_task_anchor(runtime_input.task, previous_state)
         rows = [*runtime_input.history, runtime_input.event]
         deduplicated: dict[str, dict[str, Any]] = {}
 
@@ -622,16 +859,20 @@ class DelegatedTaskWorkflow:
         for item in previous_state.get("timeline") or []:
             if not isinstance(item, dict):
                 continue
+            if not self._belongs_to_conversation(item, expected_scope, task_scope):
+                continue
             text = " ".join(str(item.get("text") or "").split())
             if not text:
                 continue
             if not self._is_at_or_after_task_anchor(item.get("at"), task_anchor):
                 continue
-            event_id = self._timeline_event_id(item, text)
+            identity_key = self._timeline_event_id(item, text)
+            event_id = self._timeline_event_reference(item, identity_key)
             role = self._normalize_timeline_role(item)
             speaker = self._timeline_speaker(item, role)
-            deduplicated[event_id] = {
+            deduplicated[identity_key] = self._with_conversation_scope({
                 "eventId": event_id,
+                "identityKey": identity_key,
                 "platformMessageId": str(item.get("platformMessageId") or item.get("platform_message_id") or "").strip(),
                 "clientMessageId": str(item.get("clientMessageId") or item.get("client_message_id") or "").strip(),
                 "at": str(item.get("at") or ""),
@@ -642,9 +883,11 @@ class DelegatedTaskWorkflow:
                 "direction": str(item.get("direction") or "").upper(),
                 "actorType": str(item.get("actorType") or "").upper(),
                 "messageOrigin": str(item.get("messageOrigin") or "").upper(),
-            }
+            }, expected_scope)
 
         for row in rows:
+            if not isinstance(row, dict) or not self._belongs_to_conversation(row, expected_scope, task_scope):
+                continue
             event_type = str(row.get("eventType") or "").lower()
             raw_payload = row.get("rawPayload") if isinstance(row.get("rawPayload"), dict) else {}
             origin = str(row.get("messageOrigin") or raw_payload.get("messageOrigin") or "").upper()
@@ -675,11 +918,13 @@ class DelegatedTaskWorkflow:
             )
             if not text:
                 continue
-            event_id = self._timeline_event_id(row, text)
+            identity_key = self._timeline_event_id(row, text)
+            event_id = self._timeline_event_reference(row, identity_key)
             role = self._normalize_timeline_role(row)
             speaker = self._timeline_speaker(row, role)
-            deduplicated[event_id] = {
+            deduplicated[identity_key] = self._with_conversation_scope({
                 "eventId": event_id,
+                "identityKey": identity_key,
                 "platformMessageId": str(row.get("platformMessageId") or row.get("platform_message_id") or "").strip(),
                 "clientMessageId": str(row.get("clientMessageId") or row.get("client_message_id") or "").strip(),
                 "at": effective_at,
@@ -690,9 +935,13 @@ class DelegatedTaskWorkflow:
                 "direction": direction,
                 "actorType": actor,
                 "messageOrigin": origin,
-            }
+            }, expected_scope)
         timeline = sorted(deduplicated.values(), key=lambda item: (item["at"], item["eventId"]))[-500:]
-        return {"timeline": timeline, "previous_state": previous_state}
+        return {
+            "timeline": timeline,
+            "previous_state": previous_state,
+            "conversation_scope": expected_scope,
+        }
 
     def _build_action_timeline(self, state: ActionState) -> dict[str, Any]:
         """把发送前输入转换为运行图兼容结构，并复用同一套时间线清洗规则。"""
@@ -710,11 +959,19 @@ class DelegatedTaskWorkflow:
         previous_state = timeline_state.get("previous_state") or {}
         if not isinstance(previous_state, dict):
             previous_state = {}
+        expected_scope = timeline_state.get("conversation_scope") or ("", "", "")
+        task_scope = self._task_conversation_scope(action_input.task)
+        raw_pre_task_history = action_input.pre_task_history or previous_state.get("preTaskHistory") or []
         # 恢复上一次已读取的观察结果，防止同一个任务在后续事件中重复拉取任务前历史。
         return {
             "runtime_input": runtime_input,
             "pre_task_history": self._normalize_pre_task_history(
-                action_input.pre_task_history or previous_state.get("preTaskHistory")
+                [
+                    row
+                    for row in raw_pre_task_history
+                    if isinstance(row, dict)
+                    and self._belongs_to_conversation(row, expected_scope, task_scope)
+                ]
             ),
             "tool_observations": list(previous_state.get("toolObservations") or []),
             **timeline_state,
@@ -731,11 +988,16 @@ class DelegatedTaskWorkflow:
         event = action_input.event
         previous_state = state.get("previous_state") or {}
         current_event_id = str(event.get("eventId") or "").strip()
+        current_message_id = self._timeline_event_id(event, str(event.get("text") or ""))
         processed_event_ids = set(self._as_text_list(previous_state.get("processedEventIds")))
+        processed_message_ids = set(self._as_text_list(previous_state.get("processedMessageIds")))
 
         # 同一平台事件可能因 MQ 重投或服务重启被再次送达。重复事件不得再次进入
         # 规划器，否则即使模型上下文正确，也可能产生第二条语义相同的回复。
-        if current_event_id and current_event_id in processed_event_ids:
+        if (
+            current_message_id in processed_message_ids
+            or (current_event_id and current_event_id in processed_event_ids)
+        ):
             evaluation = {
                 "reactManaged": True,
                 "status": "ACTIVE",
@@ -1176,8 +1438,26 @@ class DelegatedTaskWorkflow:
         normalized_reason = self._compact_action_text(reason, limit=240)
         if not any([normalized_action, normalized_tool, normalized_message, normalized_reason]):
             return ledger[-80:]
+        # 同一任务可能因 MQ 重投、服务重启或并发事件重复进入图。
+        # 动作键只依赖可复现的事实，避免把同一外发意图重复加入账本。
+        action_key_source = "|".join(
+            [
+                str(task.get("id") or task.get("taskId") or ""),
+                normalized_tool,
+                normalized_action,
+                self._compact_action_text(event_id, limit=80),
+                normalized_message,
+            ]
+        )
+        action_key = hashlib.sha256(action_key_source.encode("utf-8")).hexdigest()
+        if any(
+            isinstance(item, dict) and item.get("actionKey") == action_key
+            for item in ledger
+        ):
+            return ledger[-80:]
         ledger.append(
             {
+                "actionKey": action_key,
                 "at": datetime.now(timezone.utc).isoformat(),
                 "tool": normalized_tool,
                 "action": normalized_action,
@@ -1227,47 +1507,33 @@ class DelegatedTaskWorkflow:
         previous_state: dict[str, Any],
         reason: str,
     ) -> dict[str, Any]:
-        """模型暂不可用时选择一个保守的已声明工具，避免绕开工具层或任务静默。"""
-        raw_payload = event.get("rawPayload") if isinstance(event.get("rawPayload"), dict) else {}
-        event_type = str(event.get("eventType") or "").lower()
-        origin = str(event.get("messageOrigin") or raw_payload.get("messageOrigin") or "").upper()
-        direction = str(event.get("direction") or raw_payload.get("direction") or "").upper()
-        actor = str(event.get("actorType") or raw_payload.get("actorType") or "").upper()
-        event_text = " ".join(str(event.get("text") or "").split())
-        # 首发幂等性由统一的写回状态维护，不能依赖已废弃的专用 kickoff 字段。
-        kickoff_sent = (
-            str(previous_state.get("lastWriteBackStatus") or "").upper() == "SENT"
-            and str(previous_state.get("lastPlannedAction") or "").upper() == "SEND_MESSAGE"
-        )
+        """模型暂不可用时仅持久化等待状态，绝不猜测并向外发送消息。
 
-        if event_type == "delegated_task_started" and not kickoff_sent:
-            tool_name = "send_qq_message"
-            arguments = {
-                "reason": reason,
-                "progressSummary": "任务已创建，准备主动联系目标联系人",
-                "messageInstruction": "根据委托目标和历史背景，生成发给目标联系人的第一条消息",
-            }
+        外发消息会改变真实会话；模型调用失败时若依据模板继续代发，重试、重放和
+        并发事件都会把同一个任务扩散成多条近似消息。因此降级路径只允许调用
+        ``update_delegated_task``，由下一次可用的 ReAct 规划继续处理。
+        """
+        event_type = str(event.get("eventType") or "").lower()
+        if event_type == "delegated_task_started":
+            progress_summary = "任务已创建，等待模型恢复后生成首条联系消息"
         elif self._is_peer_inbound_message(
             event_type=event_type,
-            event_text=event_text,
-            direction=direction,
-            actor=actor,
-            origin=origin,
+            event_text=" ".join(str(event.get("text") or "").split()),
+            direction=str(event.get("direction") or "").upper(),
+            actor=str(event.get("actorType") or "").upper(),
+            origin=str(event.get("messageOrigin") or "").upper(),
         ):
-            tool_name = "send_qq_message"
-            arguments = {
-                "reason": reason,
-                "progressSummary": "收到联系人新回复，准备继续推进任务",
-                "messageInstruction": "根据对方最新回复和任务目标，生成自然、简短的后续回复",
-            }
+            progress_summary = "已记录联系人的新消息，等待模型恢复后决定是否及如何回复"
         else:
-            tool_name = "update_delegated_task"
-            arguments = {
-                "reason": reason,
-                "progressSummary": "任务仍在进行，等待新的联系人消息或规划模型恢复",
-                "knownFacts": [],
-                "pendingConditions": ["等待下一次可执行的任务事件"],
-            }
+            progress_summary = "任务仍在进行，等待模型恢复后继续规划"
+
+        tool_name = "update_delegated_task"
+        arguments = {
+            "reason": reason,
+            "progressSummary": progress_summary,
+            "knownFacts": [],
+            "pendingConditions": ["等待下一次可执行的 ReAct 规划"],
+        }
 
         tool_intent = self.action_tools_by_name[tool_name].invoke(arguments)
         evaluation = self._normalize_tool_decision(
@@ -1415,32 +1681,36 @@ class DelegatedTaskWorkflow:
         """根据当前控制事件、可信发送方向和完成结论选择唯一下一动作。"""
         evaluation = dict(state.get("evaluation") or {})
 
-        # 独立进度节点或 ReAct 规划器已经完成工具选择。这里仅做确定性动作映射，
-        # 不再调用模型，避免在候选回复产生后才重新判断任务是否结束。
-        # 动作只能来自上游已校验的 @tool 意图；不再回落到下面历史遗留的事件规则。
-        if True:
-            requested_tool = str(evaluation.get("requestedTool") or "update_delegated_task")
-            candidate = str(evaluation.get("messageInstruction") or "").strip()
-            # 规划节点读取的是完整任务时间线。即使当前触发事件不是最新事件，也应该让模型
-            # 基于已经合并进来的后续联系人消息做一次最终动作选择；否则连续消息会被旧事件
-            # 强制降级为 WAIT，最新事件又可能因为状态已更新而不再触发回复。
-            if requested_tool == "get_task_pre_history":
-                # 防御性兜底：历史读取应该已在图内完成，绝不能再交给 Java 留下悬空动作。
-                action = "WAIT"
-            elif requested_tool == "complete_delegated_task":
-                action = "SEND_AND_COMPLETE" if candidate else "COMPLETE_TASK"
-            elif requested_tool == "send_qq_message" and candidate:
-                action = "SEND_MESSAGE"
-            else:
-                action = "WAIT"
-            return {
-                "evaluation": evaluation,
-                "selected_action": {
-                    "action": action,
-                    "reason": str(evaluation.get("reason") or "ReAct 已选择下一步工具"),
-                    "messageInstruction": candidate if action in {"SEND_MESSAGE", "SEND_AND_COMPLETE"} else "",
-                }
-            }
+        # ReAct 规划器提出候选动作后，必须再用完整任务时间线复核一次完成状态。
+        # 这样既不会依赖固定关键词结束任务，也能阻止规划器重新打开已经达成的事项。
+        action_input = state["action_input"]
+        evaluation = await self._maybe_promote_completion_action(
+            state=state,
+            evaluation=evaluation,
+            timeline=list(state.get("timeline") or []),
+            event=action_input.event,
+        )
+
+        # 最终动作只能来自上游已校验的 @tool 意图，不再回落到历史事件规则。
+        requested_tool = str(evaluation.get("requestedTool") or "update_delegated_task")
+        candidate = str(evaluation.get("messageInstruction") or "").strip()
+        if requested_tool == "get_task_pre_history":
+            # 历史读取应该已在图内完成，绝不能再交给 Java 留下悬空动作。
+            action = "WAIT"
+        elif requested_tool == "complete_delegated_task":
+            action = "SEND_AND_COMPLETE" if candidate else "COMPLETE_TASK"
+        elif requested_tool == "send_qq_message" and candidate:
+            action = "SEND_MESSAGE"
+        else:
+            action = "WAIT"
+        return {
+            "evaluation": evaluation,
+            "selected_action": {
+                "action": action,
+                "reason": str(evaluation.get("reason") or "ReAct 已选择下一步工具"),
+                "messageInstruction": candidate if action in {"SEND_MESSAGE", "SEND_AND_COMPLETE"} else "",
+            },
+        }
 
     async def _maybe_promote_completion_action(
         self,
@@ -1501,30 +1771,28 @@ class DelegatedTaskWorkflow:
             "toolObservations": list(state.get("tool_observations") or []),
             "currentTime": current_time.isoformat(),
         }
-        try:
-            raw = await self.llm_client.generate_reply(
-                system_prompt,
-                json.dumps(payload, ensure_ascii=False),
-                temperature=0.1,
-                model_profile=model_profile,
+        parsed = await self._request_completion_reflection(
+            system_prompt=system_prompt,
+            payload=payload,
+            model_profile=model_profile,
+        )
+        if parsed is None:
+            return self._completion_reflection_wait_evaluation(
+                evaluation,
+                "完成状态复核暂时不可用，已停止发送并等待后续事件重试",
             )
-            parsed = self._parse_json_object(raw)
-        except Exception:
-            return evaluation
-        if not parsed or not parsed.get("shouldComplete"):
+        if not parsed.should_complete:
             return evaluation
 
         tool = self.action_tools_by_name.get("complete_delegated_task")
         if tool is None:
             return evaluation
 
-        outcome = str(parsed.get("outcome") or "SUCCESS").upper()
-        if outcome not in {"SUCCESS", "REJECTED", "BLOCKED"}:
-            outcome = "SUCCESS"
-        reason = str(parsed.get("reason") or "任务完成复核确认已满足结束条件")
-        progress_summary = str(parsed.get("progressSummary") or "任务已完成")
-        completion_report = str(parsed.get("completionReport") or reason)
-        final_message = str(parsed.get("finalMessageInstruction") or "").strip() or None
+        outcome = parsed.outcome
+        reason = parsed.reason or "任务完成复核确认已满足结束条件"
+        progress_summary = parsed.progress_summary or "任务已完成"
+        completion_report = parsed.completion_report or reason
+        final_message = parsed.final_message_instruction.strip() or None
 
         try:
             tool_result = tool.invoke(
@@ -1533,10 +1801,10 @@ class DelegatedTaskWorkflow:
                     "progressSummary": progress_summary,
                     "completionReport": completion_report,
                     "outcome": outcome,
-                    "evidence": self._as_text_list(parsed.get("evidence")),
-                    "evidenceEventIds": self._as_text_list(parsed.get("evidenceEventIds")),
-                    "knownFacts": self._as_text_list(parsed.get("knownFacts")),
-                    "pendingConditions": self._as_text_list(parsed.get("pendingConditions")),
+                    "evidence": parsed.evidence,
+                    "evidenceEventIds": parsed.evidence_event_ids,
+                    "knownFacts": parsed.known_facts,
+                    "pendingConditions": parsed.pending_conditions,
                     "finalMessageInstruction": final_message,
                 }
             )
@@ -1551,8 +1819,60 @@ class DelegatedTaskWorkflow:
             if promoted.get("requestedTool") == "complete_delegated_task":
                 return promoted
         except Exception:
-            return evaluation
-        return evaluation
+            return self._completion_reflection_wait_evaluation(
+                evaluation,
+                "完成动作生成或证据校验失败，已停止发送并等待后续事件重试",
+            )
+        return self._completion_reflection_wait_evaluation(
+            evaluation,
+            "完成复核给出的证据未通过校验，已停止发送并等待后续事件重试",
+        )
+
+    async def _request_completion_reflection(
+        self,
+        *,
+        system_prompt: str,
+        payload: dict[str, Any],
+        model_profile: Any,
+    ) -> CompletionReflectionDecision | None:
+        """请求并严格解析完成复核结果，格式错误时只进行一次修复重试。"""
+        user_message = json.dumps(payload, ensure_ascii=False)
+        for attempt in range(2):
+            retry_instruction = ""
+            if attempt:
+                retry_instruction = (
+                    "\n上一次输出无法通过结构化校验。必须仅返回一个 JSON 对象，并完整提供 "
+                    "shouldComplete、outcome、reason、progressSummary、completionReport、"
+                    "finalMessageInstruction、knownFacts、pendingConditions、evidence、evidenceEventIds。"
+                )
+            try:
+                raw = await self.llm_client.generate_reply(
+                    system_prompt + retry_instruction,
+                    user_message,
+                    temperature=0.1,
+                    model_profile=model_profile,
+                )
+                parsed = self._parse_json_object(raw)
+                if parsed is not None:
+                    return CompletionReflectionDecision.model_validate(parsed)
+            except Exception:
+                continue
+        return None
+
+    @staticmethod
+    def _completion_reflection_wait_evaluation(
+        evaluation: dict[str, Any],
+        reason: str,
+    ) -> dict[str, Any]:
+        """在完成复核不可依赖时停止外发，避免把异常放大成重复追问。"""
+        return {
+            **evaluation,
+            "status": "WAITING",
+            "requestedTool": "update_delegated_task",
+            "messageInstruction": "",
+            "reason": reason,
+            "progressSummary": str(evaluation.get("progressSummary") or "等待完成状态复核"),
+        }
 
     @staticmethod
     def _is_peer_inbound_message(
@@ -1683,20 +2003,13 @@ class DelegatedTaskWorkflow:
             for row in timeline
             if isinstance(row, dict) and str(row.get("eventId") or "").strip()
         }
-        valid_ids: list[str] = []
         requested_ids = self._as_text_list(evaluation.get("evidenceEventIds"))
-        for evidence_id in requested_ids:
-            row = timeline_by_id.get(evidence_id)
-            if not row or not self._is_peer_timeline_row(row):
-                continue
-            if not self._is_at_or_after_task_anchor(row.get("at"), task_anchor):
-                continue
-            valid_ids.append(evidence_id)
+        valid_ids: list[str] = list(dict.fromkeys(requested_ids))
 
         # 这里不决定任务是否完成，只修复“模型已经决定完成但 evidenceEventIds 写错/漏写”的参数问题。
         # 是否完成仍由上游 ReAct 决策和下游统一校验共同约束，不能在这里加入关键词特判。
 
-        if not valid_ids:
+        if not requested_ids:
             current_id = str(event.get("eventId") or "").strip()
             current_row = timeline_by_id.get(current_id)
             if (
@@ -1707,7 +2020,7 @@ class DelegatedTaskWorkflow:
             ):
                 valid_ids.append(current_id)
 
-        if not valid_ids:
+        if not requested_ids and not valid_ids:
             for row in reversed(timeline):
                 if not isinstance(row, dict):
                     continue
@@ -1747,6 +2060,11 @@ class DelegatedTaskWorkflow:
         evaluation = state.get("evaluation") or {}
         selected = state.get("selected_action") or {}
         previous = state.get("previous_state") or {}
+        conversation_scope = state.get("conversation_scope") or ("", "", "")
+        if not all(conversation_scope):
+            conversation_scope = self._conversation_scope(action_input.event)
+        if not all(conversation_scope):
+            conversation_scope = self._task_conversation_scope(action_input.task)
         action = str(selected.get("action") or "WAIT").upper()
         final_requested_tool = str(evaluation.get("requestedTool") or "").strip()
         # evaluation 是 ReAct 工具选择和审查节点修正后的最终意图。
@@ -1816,13 +2134,23 @@ class DelegatedTaskWorkflow:
             task=action_input.task,
         )
         current_event_id = str(action_input.event.get("eventId") or "").strip()
+        current_message_id = self._timeline_event_id(
+            action_input.event,
+            str(action_input.event.get("text") or ""),
+        )
         processed_event_ids = self._merge_unique(
             previous.get("processedEventIds"),
             [current_event_id] if current_event_id else [],
         )
+        processed_message_ids = self._merge_unique(
+            previous.get("processedMessageIds"),
+            [current_message_id] if current_message_id else [],
+        )
         graph_state = {
             **previous,
             "graphVersion": 3,
+            # 每一次动作规划都刷新会话范围，保证后续重启恢复时仍能拒绝跨会话状态。
+            "conversationScope": self._scope_as_dict(conversation_scope),
             "taskCreatedAt": (
                 str(previous.get("taskCreatedAt") or "")
                 or self._task_created_at_text(action_input.task)
@@ -1847,6 +2175,7 @@ class DelegatedTaskWorkflow:
             "actionLedger": action_ledger,
             # 事件幂等信息必须写回持久化状态，服务重启或 MQ 重投后才能阻止重复规划。
             "processedEventIds": processed_event_ids,
+            "processedMessageIds": processed_message_ids,
             "lastPlannedAction": action,
             "lastPlannedAt": datetime.now(timezone.utc).isoformat(),
             "lastEvidence": list(evaluation.get("evidence") or [])[:10],
@@ -1865,7 +2194,8 @@ class DelegatedTaskWorkflow:
             progressSummary=progress,
             messageInstruction=final_message_instruction if action in {"SEND_MESSAGE", "SEND_AND_COMPLETE"} else "",
             stateJson=json.dumps(graph_state, ensure_ascii=False),
-            lastEventId=str(action_input.event.get("eventId") or ""),
+            # lastEventId 用稳定的平台消息身份，避免同一条 QQ 消息重投时因内部 eventId 改变而重复执行。
+            lastEventId=current_message_id,
             completionReport=completion_report,
             evidence=list(evaluation.get("evidence") or [])[:10],
             requestedTool=requested_tool,
@@ -2232,6 +2562,11 @@ class DelegatedTaskWorkflow:
         runtime_input = state["runtime_input"]
         evaluation = state.get("evaluation") or {}
         previous = state.get("previous_state") or {}
+        conversation_scope = state.get("conversation_scope") or ("", "", "")
+        if not all(conversation_scope):
+            conversation_scope = self._conversation_scope(runtime_input.event)
+        if not all(conversation_scope):
+            conversation_scope = self._task_conversation_scope(runtime_input.task)
         status = str(evaluation.get("status") or "ACTIVE").upper()
         if status not in {"ACTIVE", "COMPLETED", "FAILED"}:
             status = "ACTIVE"
@@ -2247,6 +2582,8 @@ class DelegatedTaskWorkflow:
         graph_state = {
             **previous,
             "graphVersion": 2,
+            # Runtime 图同样写入范围，不能依赖动作图恰好先执行。
+            "conversationScope": self._scope_as_dict(conversation_scope),
             "taskCreatedAt": (
                 str(previous.get("taskCreatedAt") or "")
                 or self._task_created_at_text(runtime_input.task)

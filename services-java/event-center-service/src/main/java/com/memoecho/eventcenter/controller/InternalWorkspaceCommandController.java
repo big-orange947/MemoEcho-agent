@@ -4,6 +4,9 @@ import com.memoecho.eventcenter.dto.WorkspaceCommandRequest;
 import com.memoecho.eventcenter.dto.WorkspaceCommandResponse;
 import com.memoecho.eventcenter.dto.ConversationSummaryResponse;
 import com.memoecho.eventcenter.dto.DelegatedTaskResponse;
+import com.memoecho.eventcenter.dto.DelegatedTaskEventClaimRequest;
+import com.memoecho.eventcenter.dto.DelegatedTaskEventClaimResponse;
+import com.memoecho.eventcenter.dto.DelegatedTaskEventCompleteRequest;
 import com.memoecho.eventcenter.dto.DelegatedTaskRuntimeCreateRequest;
 import com.memoecho.eventcenter.dto.DelegatedTaskRuntimeUpdateRequest;
 import com.memoecho.eventcenter.service.DelegatedTaskApplicationService;
@@ -105,6 +108,32 @@ public class InternalWorkspaceCommandController {
         return ResponseEntity.ok(delegatedTaskApplicationService.updateRuntime(resolvedUserId, taskId, request));
     }
 
+    /** Runtime 在执行事件前申请数据库级租约，防止重投与并发重复发送消息。 */
+    @PostMapping("/delegated/{taskId}/events/claim")
+    public ResponseEntity<DelegatedTaskEventClaimResponse> claimDelegatedTaskEvent(
+            @RequestHeader("X-Memo-Echo-Runtime-Token") String runtimeToken,
+            @RequestHeader("X-Memo-Echo-User-Id") String userId,
+            @PathVariable String taskId,
+            @RequestBody DelegatedTaskEventClaimRequest request
+    ) {
+        String resolvedUserId = userContextResolver.resolveRuntimeUser(runtimeToken, userId);
+        return ResponseEntity.ok(delegatedTaskApplicationService.claimEvent(
+                resolvedUserId, taskId, request.eventId(), request.leaseSeconds()));
+    }
+
+    /** Runtime 成功完成事件处理后关闭租约，确保后续重投不再重复执行。 */
+    @PostMapping("/delegated/{taskId}/events/complete")
+    public ResponseEntity<Void> completeDelegatedTaskEvent(
+            @RequestHeader("X-Memo-Echo-Runtime-Token") String runtimeToken,
+            @RequestHeader("X-Memo-Echo-User-Id") String userId,
+            @PathVariable String taskId,
+            @RequestBody DelegatedTaskEventCompleteRequest request
+    ) {
+        String resolvedUserId = userContextResolver.resolveRuntimeUser(runtimeToken, userId);
+        delegatedTaskApplicationService.completeEvent(resolvedUserId, taskId, request.eventId(), request.claimToken());
+        return ResponseEntity.noContent().build();
+    }
+
     /** Runtime 编译主控台命令前读取联系人白名单，客户端不能绕过该接口直接给模型任意联系人。 */
     @GetMapping("/delegated/candidates")
     public ResponseEntity<List<ConversationSummaryResponse>> listDelegatedTaskCandidates(
@@ -124,7 +153,7 @@ public class InternalWorkspaceCommandController {
     ) {
         String resolvedUserId = userContextResolver.resolveRuntimeUser(runtimeToken, userId);
         return ResponseEntity.ok(delegatedTaskApplicationService.createCompiled(
-                resolvedUserId, request.command(), request.compilation()));
+                resolvedUserId, request.command(), request.executionId(), request.compilation()));
     }
 
     /** 用户确认任务后仅进入待执行队列，不在 HTTP 请求中直接发送外部消息。 */

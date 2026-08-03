@@ -1,10 +1,13 @@
 package com.memoecho.eventcenter.service;
 
 import com.memoecho.eventcenter.dto.ConversationSummaryResponse;
+import com.memoecho.eventcenter.dto.DelegatedTaskCompilationResponse;
 import com.memoecho.eventcenter.dto.QqContactResponse;
 import com.memoecho.eventcenter.model.DelegatedTask;
 import com.memoecho.eventcenter.repository.JdbcDelegatedTaskRepository;
+import com.memoecho.eventcenter.repository.JdbcDelegatedTaskEventClaimRepository;
 import org.junit.jupiter.api.Test;
+import org.springframework.dao.DuplicateKeyException;
 
 import java.time.Instant;
 import java.util.List;
@@ -22,11 +25,12 @@ class DelegatedTaskApplicationServiceTest {
 
     private final DelegatedTaskIntentParser parser = mock(DelegatedTaskIntentParser.class);
     private final JdbcDelegatedTaskRepository repository = mock(JdbcDelegatedTaskRepository.class);
+    private final JdbcDelegatedTaskEventClaimRepository eventClaimRepository = mock(JdbcDelegatedTaskEventClaimRepository.class);
     private final EventCenterApplicationService eventCenter = mock(EventCenterApplicationService.class);
     private final QqConnectorContactClient contactClient = mock(QqConnectorContactClient.class);
     private final AgentRuntimeDispatchClient runtimeDispatchClient = mock(AgentRuntimeDispatchClient.class);
     private final DelegatedTaskApplicationService service = new DelegatedTaskApplicationService(
-            parser, repository, eventCenter, contactClient, runtimeDispatchClient);
+            parser, repository, eventClaimRepository, eventCenter, contactClient, runtimeDispatchClient);
 
     /** 创建任务时只能读取当前用户的会话摘要，不能使用全局会话列表。 */
     @Test
@@ -53,13 +57,15 @@ class DelegatedTaskApplicationServiceTest {
         when(eventCenter.findConversationSummariesForUser("freeze", null, null, null, null, null))
                 .thenReturn(List.of());
         when(contactClient.listContacts("freeze"))
-                .thenReturn(List.of(new QqContactResponse("3807050597", "km", "private", "km")));
+                .thenReturn(List.of(new QqContactResponse(
+                        "3807050597", "km", "private", "km", List.of("km", "刘畅", "3807050597"))));
         when(parser.parse(eq("freeze"), eq(command), any())).thenAnswer(invocation -> {
             List<ConversationSummaryResponse> candidates = invocation.getArgument(2);
             assertThat(candidates).singleElement().satisfies(candidate -> {
                 assertThat(candidate.chatId()).isEqualTo("3807050597");
                 assertThat(candidate.chatName()).isEqualTo("km");
                 assertThat(candidate.chatType()).isEqualTo("private");
+                assertThat(candidate.aliases()).containsExactly("km", "刘畅", "3807050597");
             });
             return Optional.of(task);
         });
@@ -68,6 +74,51 @@ class DelegatedTaskApplicationServiceTest {
         var response = service.tryCreate("freeze", command, "").orElseThrow();
 
         assertThat(response.chatId()).isEqualTo("3807050597");
+    }
+
+    /** 两个并发请求越过前置查询后撞唯一键时，应返回另一请求已经创建的任务。 */
+    @Test
+    void shouldReuseWinningTaskWhenExecutionInsertHitsUniqueKey() {
+        String command = "通知 km 明晚七点上课";
+        String executionId = "desktop-race-001";
+        DelegatedTask winner = task("task-winner", "ACTIVE", "3807050597");
+        DelegatedTaskCompilationResponse compilation = new DelegatedTaskCompilationResponse(
+                true,
+                "CONVERSATION_GOAL",
+                "km",
+                "qq",
+                "private",
+                "3807050597",
+                "km",
+                "通知 km 明晚七点上课",
+                "对方确认收到通知",
+                "明晚七点",
+                0.95d,
+                "",
+                false,
+                "AUTO_COMPLETE",
+                "准备通知对方",
+                "{}"
+        );
+        when(eventCenter.findConversationSummariesForUser("freeze", null, null, null, null, null))
+                .thenReturn(List.of());
+        when(contactClient.listContacts("freeze"))
+                .thenReturn(List.of(new QqContactResponse(
+                        "3807050597", "km", "private", "km", List.of("km", "3807050597"))));
+        // 第一次查询模拟两个请求同时未发现记录；唯一键冲突后的第二次查询返回赢家。
+        when(repository.findBySourceExecutionAndTarget(
+                "freeze", executionId, "qq", "private", "3807050597"
+        )).thenReturn(Optional.empty(), Optional.of(winner));
+        when(repository.findRecentDuplicateCommand(
+                eq("freeze"), eq(command), eq("qq"), eq("private"), eq("3807050597"), any(Instant.class)
+        )).thenReturn(Optional.empty());
+        when(repository.insert(any(DelegatedTask.class)))
+                .thenThrow(new DuplicateKeyException("simulated race"));
+
+        var response = service.createCompiled("freeze", command, executionId, compilation);
+
+        assertThat(response.id()).isEqualTo("task-winner");
+        verify(repository).insert(any(DelegatedTask.class));
     }
 
     /** 修复上线后，刷新列表应自动恢复此前因兼容字符未命中的待选联系人任务。 */

@@ -10,6 +10,8 @@ import com.memoecho.eventcenter.dto.UnifiedEventPayload;
 import com.memoecho.eventcenter.dto.WorkspaceCommandAgentResponse;
 import com.memoecho.eventcenter.dto.WorkspaceCommandRequest;
 import com.memoecho.eventcenter.dto.WorkspaceCommandResponse;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.web.server.ResponseStatusException;
@@ -22,6 +24,8 @@ import java.util.UUID;
 
 @Service
 public class WorkspaceCommandApplicationService {
+
+    private static final Logger log = LoggerFactory.getLogger(WorkspaceCommandApplicationService.class);
 
     private static final Set<String> ALLOWED_ROUTES = Set.of(
             "social_reply",
@@ -53,10 +57,17 @@ public class WorkspaceCommandApplicationService {
     public WorkspaceCommandResponse execute(String userId, WorkspaceCommandRequest request) {
         String commandId = "desktop:command:" + UUID.randomUUID();
         String requestedRoute = normalizeRoute(request.requestedRoute());
+        // commandId 同时是跨 Java、Python 和任务状态回写的 executionId，便于一次命令的全链路检索。
+        log.info("主控台委托闭环 | executionId={} | stage=command_received | userId={} | requestedRoute={} | promptLength={}",
+                commandId,
+                userId,
+                requestedRoute == null ? "auto" : requestedRoute,
+                request.prompt().trim().length());
         ObjectNode rawPayload = objectMapper.createObjectNode();
         rawPayload.put("source", "desktop-client");
         rawPayload.put("userId", userId);
         rawPayload.put("commandId", commandId);
+        rawPayload.put("executionId", commandId);
         // 主控台命令统一交给 Python Runtime/LangGraph 编译，Java 不再用关键词规则提前创建任务。
         rawPayload.put("allowTaskCreation", true);
         if (requestedRoute != null) {
@@ -79,7 +90,17 @@ public class WorkspaceCommandApplicationService {
                 rawPayload
         );
 
-        return toResponse(commandId, eventCenterApplicationService.ingest(event).dispatch());
+        EventIngestResponse ingestResponse = eventCenterApplicationService.ingest(event);
+        DispatchResult dispatch = ingestResponse.dispatch();
+        log.info("主控台委托闭环 | executionId={} | stage=event_dispatched | eventId={} | accepted={} | duplicate={} | attempted={} | httpStatus={} | hasDispatchError={}",
+                commandId,
+                ingestResponse.eventId(),
+                ingestResponse.accepted(),
+                ingestResponse.duplicate(),
+                dispatch != null && dispatch.attempted(),
+                dispatch == null ? null : dispatch.httpStatus(),
+                dispatch != null && dispatch.error() != null && !dispatch.error().isBlank());
+        return toResponse(commandId, dispatch);
     }
 
     /**

@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import os
+import unicodedata
 from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
@@ -37,6 +38,7 @@ from app.services.slow_channel_buffer import SlowChannelBuffer
 from app.services.conversation_state_service import ConversationStateService
 from app.services.conversation_task_completion import ConversationTaskCompletionService
 from app.services.media_analysis_service import MediaAnalysisService
+from app.services.message_identity import canonical_message_identity, is_runtime_generated_message
 from app.services.schedule_intent_classifier import SemanticScheduleIntentClassifier
 from app.skills.resolver import SkillResolver
 from app.tools.extract_file_text_tool import ExtractFileTextTool
@@ -92,10 +94,10 @@ class OrchestratorService:
         )
         # 同一委托会话可能在极短时间内连续收到多条消息。用递增版本号做轻量合并，
         # 让旧事件主动让位给最新事件，避免分别对两条补充消息生成两次回复。
-        self._delegated_inbound_versions: dict[str, int] = {}
+        self._delegated_conversation_versions: dict[str, int] = {}
         # 防抖窗口结束后，模型生成和平台回写仍可能继续数秒。保留最近事件 ID，
         # 让旧事件在真正发送前再做一次失效检查，而不是仅依赖 450ms 防抖。
-        self._delegated_inbound_latest_event_ids: dict[str, str] = {}
+        self._delegated_conversation_latest_event_ids: dict[str, str] = {}
         self._delegated_inbound_debounce_seconds = 0.45
 
     @classmethod
@@ -219,17 +221,56 @@ class OrchestratorService:
         """判断事件是否来自主控台自然语言输入框，主控台命令不能当作普通聊天消息处理。"""
         return event.platform == "desktop" and event.event_type == "desktop_command"
 
+    @staticmethod
+    def _log_delegated_trace(
+        stage: str,
+        *,
+        execution_id: str,
+        event: UnifiedEvent | None = None,
+        task_id: str | None = None,
+        **fields: Any,
+    ) -> None:
+        """记录主控台委托闭环的结构化阶段日志，避免输出聊天正文、密钥等敏感内容。"""
+        resolved_task_id = task_id or ""
+        if not resolved_task_id and event is not None:
+            payload = event.raw_payload or {}
+            resolved_task_id = str(payload.get("delegatedTaskId") or event.delegated_task_id or "")
+        safe_fields = {key: value for key, value in fields.items() if value is not None}
+        logger.info(
+            "主控台委托闭环 | executionId=%s | taskId=%s | eventId=%s | stage=%s | data=%s",
+            execution_id,
+            resolved_task_id or "-",
+            event.event_id if event is not None else "-",
+            stage,
+            json.dumps(safe_fields, ensure_ascii=False, default=str, separators=(",", ":")),
+        )
+
     async def _handle_desktop_workspace_command(self, event: UnifiedEvent) -> OrchestratorResult:
         """处理主控台命令：读取联系人白名单、交给 LangGraph 编译任务，并在目标明确时主动启动。"""
-        execution_id = f"desktop-command:{uuid4()}"
+        raw_payload = event.raw_payload or {}
+        execution_id = str(
+            raw_payload.get("executionId")
+            or raw_payload.get("commandId")
+            or f"desktop-command:{uuid4()}"
+        )
         user_id = EventCenterServiceClient.resolve_event_user_id(event)
         command = (event.text or "").strip()
+        self._log_delegated_trace(
+            "command_received",
+            execution_id=execution_id,
+            event=event,
+            userId=user_id,
+            commandLength=len(command),
+            requestedRoute=str(raw_payload.get("requestedRoute") or "auto"),
+        )
         if not command:
             return OrchestratorResult(
                 execution_id=execution_id,
                 status="failed",
                 route="delegated_task",
                 summary="主控台命令为空",
+                results=[],
+                final_reply="请告诉我希望我处理什么事情",
             )
         if self.event_center_client is None:
             return OrchestratorResult(
@@ -237,12 +278,20 @@ class OrchestratorService:
                 status="failed",
                 route="delegated_task",
                 summary="Event Center 未配置，无法创建委托任务",
+                results=[],
+                final_reply="暂时无法创建委托任务，请稍后重试",
             )
 
         try:
             candidates = await self.event_center_client.list_delegated_task_candidates(user_id)
         except Exception as exception:
-            logger.warning("读取主控台委托候选会话失败：userId=%s, error=%s", user_id, exception)
+            self._log_delegated_trace(
+                "candidate_load_failed",
+                execution_id=execution_id,
+                event=event,
+                userId=user_id,
+                errorType=type(exception).__name__,
+            )
             return OrchestratorResult(
                 execution_id=execution_id,
                 status="failed",
@@ -257,27 +306,80 @@ class OrchestratorService:
                         need_confirmation=True,
                     )
                 ],
+                final_reply="读取联系人失败，暂时无法创建委托任务",
             )
 
         if not candidates:
+            self._log_delegated_trace(
+                "candidate_load_completed",
+                execution_id=execution_id,
+                event=event,
+                userId=user_id,
+                candidateCount=0,
+            )
             return OrchestratorResult(
                 execution_id=execution_id,
                 status="failed",
                 route="delegated_task",
                 summary="没有可用联系人候选，请先完成 QQ 连接和联系人同步",
+                results=[],
+                final_reply="没有可用联系人，请先完成 QQ 连接和联系人同步",
             )
 
         model_result = await self._safe_resolve_workspace_command_model(user_id)
         model_profile = model_result.profile if model_result else None
         # 主控台命令的目标解析统一交给 Python Runtime 的路由器。
         # Java 侧只负责提供授权候选，避免本地正则把“km预约”等动作词误拼进联系人名称。
-        target_candidates = await self.delegated_task_workflow.resolve_workspace_command_targets(
-            command=command,
-            candidates=candidates,
-            model_profile=model_profile,
+        self._log_delegated_trace(
+            "candidate_load_completed",
+            execution_id=execution_id,
+            event=event,
+            userId=user_id,
+            candidateCount=len(candidates),
+            modelConfigured=bool(model_profile),
         )
+        try:
+            target_candidates = await self.delegated_task_workflow.resolve_workspace_command_targets(
+                command=command,
+                candidates=candidates,
+                model_profile=model_profile,
+            )
+        except Exception as exception:
+            self._log_delegated_trace(
+                "target_resolution_failed",
+                execution_id=execution_id,
+                event=event,
+                userId=user_id,
+                errorType=type(exception).__name__,
+            )
+            return OrchestratorResult(
+                execution_id=execution_id,
+                status="failed",
+                route="delegated_task",
+                summary="委托目标解析失败",
+                results=[],
+                final_reply="暂时无法确认需要联系的对象，请稍后重试或补充联系人信息",
+            )
         candidate_batches = [[candidate] for candidate in target_candidates] if target_candidates else [candidates]
         target_resolved_by_router = bool(target_candidates)
+        self._log_delegated_trace(
+            "targets_resolved",
+            execution_id=execution_id,
+            event=event,
+            candidateCount=len(candidates),
+            targetCount=len(target_candidates),
+            batchCount=len(candidate_batches),
+            targetResolvedByRouter=target_resolved_by_router,
+            targets=[
+                {
+                    "platform": candidate.platform,
+                    "chatType": candidate.chat_type,
+                    "chatId": candidate.chat_id,
+                    "chatName": candidate.chat_name,
+                }
+                for candidate in target_candidates
+            ],
+        )
         created_tasks: list[dict[str, Any]] = []
         results: list[AgentResult] = []
 
@@ -290,6 +392,16 @@ class OrchestratorService:
                     targetResolvedByRouter=target_resolved_by_router,
                 )
                 compilation = await self.delegated_task_workflow.compile_task(compile_request, model_profile)
+                self._log_delegated_trace(
+                    "task_compiled",
+                    execution_id=execution_id,
+                    event=event,
+                    batchIndex=index,
+                    batchSize=len(batch),
+                    recognized=compilation.recognized,
+                    # 兼容尚未返回 needs_clarification 字段的旧版 Runtime 响应。
+                    needsClarification=bool(getattr(compilation, "needs_clarification", False)),
+                )
                 if not compilation.recognized:
                     results.append(
                         AgentResult(
@@ -303,10 +415,27 @@ class OrchestratorService:
                     )
                     continue
 
-                task = await self.event_center_client.create_delegated_task(user_id, command, compilation)
+                task = await self.event_center_client.create_delegated_task(
+                    user_id,
+                    command,
+                    compilation,
+                    execution_id=execution_id,
+                )
                 created_tasks.append(task)
                 task_id = str(task.get("id") or f"{execution_id}:task:{index}")
                 task_status = str(task.get("status") or "CREATED")
+                self._log_delegated_trace(
+                    "task_created",
+                    execution_id=execution_id,
+                    event=event,
+                    task_id=task_id,
+                    taskStatus=task_status,
+                    chatId=task.get("chatId"),
+                    chatType=task.get("chatType"),
+                    targetName=task.get("targetName"),
+                    batchIndex=index,
+                    batchCount=len(candidate_batches),
+                )
                 results.append(
                     AgentResult(
                         task_id=task_id,
@@ -332,9 +461,16 @@ class OrchestratorService:
                     )
                 )
                 if task_status.upper() == "ACTIVE":
-                    self._trigger_delegated_task_start(user_id, task)
+                    self._trigger_delegated_task_start(user_id, task, execution_id)
             except Exception as exception:
-                logger.exception("主控台委托任务创建失败：userId=%s, command=%s", user_id, command)
+                self._log_delegated_trace(
+                    "task_create_failed",
+                    execution_id=execution_id,
+                    event=event,
+                    batchIndex=index,
+                    errorType=type(exception).__name__,
+                )
+                logger.exception("主控台委托任务创建失败：executionId=%s, batchIndex=%s", execution_id, index)
                 results.append(
                     AgentResult(
                         task_id=f"{execution_id}:failed:{index}",
@@ -345,12 +481,26 @@ class OrchestratorService:
                     )
                 )
 
+        status = "success" if created_tasks else "failed"
+        self._log_delegated_trace(
+            "command_finished",
+            execution_id=execution_id,
+            event=event,
+            status=status,
+            taskCount=len(created_tasks),
+            resultCount=len(results),
+        )
         return OrchestratorResult(
             execution_id=execution_id,
-            status="success" if created_tasks else "failed",
+            status=status,
             route="delegated_task",
             summary=f"已创建 {len(created_tasks)} 个委托任务" if created_tasks else "未能创建委托任务",
             results=results,
+            final_reply=(
+                f"已创建 {len(created_tasks)} 个委托任务，正在开始执行"
+                if created_tasks
+                else "未能创建委托任务，请检查联系人或补充更具体的要求"
+            ),
             write_back_actions=[f"delegated_task_created:{len(created_tasks)}"] if created_tasks else [],
         )
 
@@ -427,15 +577,21 @@ class OrchestratorService:
         ignored_chars = set(" \t\r\n，,。.!！?？、:：;；@")
         return "".join(char.lower() for char in str(value).strip() if char not in ignored_chars)
 
-    def _trigger_delegated_task_start(self, user_id: str, task: dict[str, Any]) -> None:
+    def _trigger_delegated_task_start(
+        self,
+        user_id: str,
+        task: dict[str, Any],
+        execution_id: str | None = None,
+    ) -> None:
         """目标明确后异步投递一个内部启动事件，让委托任务运行图主动发起第一轮对话。"""
         task_id = str(task.get("id") or "").strip()
         chat_id = str(task.get("chatId") or "").strip()
         if not task_id or not chat_id:
             return
+        resolved_execution_id = execution_id or task_id
         now = datetime.now(timezone.utc).isoformat()
         start_event = UnifiedEvent(
-            eventId=f"runtime:delegated-start:{task_id}:{uuid4()}",
+            eventId=f"runtime:delegated-start:{task_id}",
             platform=str(task.get("platform") or "qq"),
             scene="delegated_task",
             eventType="delegated_task_started",
@@ -453,6 +609,7 @@ class OrchestratorService:
                 "userId": user_id,
                 "requestedRoute": "social_reply",
                 "delegatedTaskId": task_id,
+                "executionId": resolved_execution_id,
                 "controlEvent": True,
             },
             actorType="SYSTEM",
@@ -466,21 +623,85 @@ class OrchestratorService:
             direction="INTERNAL",
             delegatedTaskId=task_id,
         )
+        self._log_delegated_trace(
+            "start_event_enqueued",
+            execution_id=resolved_execution_id,
+            event=start_event,
+            task_id=task_id,
+            chatId=chat_id,
+            chatType=start_event.chat_type,
+        )
         asyncio.create_task(self._run_delegated_task_start_event(start_event))
 
     async def _run_delegated_task_start_event(self, event: UnifiedEvent) -> None:
         """后台执行内部启动事件，失败时只记录日志，不阻塞主控台命令响应。"""
+        execution_id = str((event.raw_payload or {}).get("executionId") or event.delegated_task_id or event.event_id)
+        self._log_delegated_trace(
+            "start_event_started",
+            execution_id=execution_id,
+            event=event,
+        )
         try:
             await self.handle_event(event)
-        except Exception:
+            self._log_delegated_trace(
+                "start_event_finished",
+                execution_id=execution_id,
+                event=event,
+            )
+        except Exception as exception:
+            self._log_delegated_trace(
+                "start_event_failed",
+                execution_id=execution_id,
+                event=event,
+                errorType=type(exception).__name__,
+            )
             logger.exception("委托任务启动事件执行失败：eventId=%s, taskId=%s", event.event_id, event.delegated_task_id)
 
     async def handle_event(self, event: UnifiedEvent) -> OrchestratorResult:
         # 这个函数的作用是驱动单次事件从粗路由、设定命中、执行到回写的完整主流程。
         if self._is_desktop_workspace_command(event):
             return await self._handle_desktop_workspace_command(event)
+        # 在任何模型调用前登记联系人新消息。相同会话后续抵达的消息会立即使旧推理失效，
+        # 即使旧任务尚未完成解析、还没有拿到对应的 delegated_task 也不会继续发送。
+        inbound_conversation_version = self._register_delegated_peer_inbound(event)
         delegated_task = await self._get_active_delegated_task(event)
-        execution_id = str(delegated_task.get("id") or uuid4()) if delegated_task else str(uuid4())
+        requested_execution_id = str(
+            (event.raw_payload or {}).get("executionId")
+            or (event.raw_payload or {}).get("commandId")
+            or ""
+        ).strip()
+        execution_id = requested_execution_id or (str(delegated_task.get("id") or uuid4()) if delegated_task else str(uuid4()))
+        if delegated_task:
+            self._log_delegated_trace(
+                "task_event_received",
+                execution_id=execution_id,
+                event=event,
+                task_id=str(delegated_task.get("id") or ""),
+                eventType=event.event_type,
+                direction=event.direction,
+                controlEvent=bool((event.raw_payload or {}).get("controlEvent")),
+            )
+        delegated_claim_token: str | None = None
+        if delegated_task:
+            delegated_claim_token = await self._claim_delegated_event(event, delegated_task)
+            if delegated_claim_token == "":
+                self._log_delegated_trace(
+                    "task_event_claim_skipped",
+                    execution_id=execution_id,
+                    event=event,
+                    task_id=str(delegated_task.get("id") or ""),
+                )
+                return OrchestratorResult(
+                    execution_id=execution_id,
+                    status="success",
+                    route="social_reply",
+                    summary="Delegated event is already leased or completed.",
+                    results=[],
+                    final_reply="",
+                    write_back_actions=["delegated_task_event:skipped"],
+                    notification=None,
+                    verified_memory_ids=[],
+                )
         base_preliminary_route = "social_reply" if delegated_task else self.router.route(event)
         semantic_intent = (
             SemanticIntentDecision()
@@ -499,7 +720,15 @@ class OrchestratorService:
         if self.memory_candidate_extractor is not None:
             # 长期记忆提取独立于当前路由异步执行；未授权、非 OWNER 或无模型时内部会直接跳过。
             self.memory_candidate_extractor.schedule(event, profile_match, resolved_model_profile)
-        plan = self.planner.build_plan(route)
+        # 主控台委托已经由任务决策图确定动作，不再交给旧 Planner 二次规划。
+        # 这样可以避免历史 plan 中的额外 Agent 重复生成回复或重复调用发送工具。
+        if delegated_task:
+            execution_steps = (("social", "reply"), ("review", "review"))
+            execution_mode = "delegated_react"
+        else:
+            plan = self.planner.build_plan(route)
+            execution_steps = tuple((step.agent, step.action) for step in plan.steps)
+            execution_mode = plan.mode
         current_media_analysis = []
         if route == "social_reply" and event.attachments:
             # 会话绑定模型负责生成回复；图片理解优先解析独立的视觉路由，避免纯文本模型收到 image_url 后报错。
@@ -542,7 +771,7 @@ class OrchestratorService:
             # 主控台委托先由任务图决定发送、等待或结束，不能先生成回复再补做状态判断。
             if (
                 self._is_delegated_peer_inbound(event)
-                and not await self._wait_for_latest_delegated_inbound(event, delegated_task)
+                and not await self._wait_for_latest_delegated_inbound(event, inbound_conversation_version)
             ):
                 delegated_action = self._build_superseded_delegated_wait_action(event, delegated_task)
             else:
@@ -551,6 +780,40 @@ class OrchestratorService:
                     task=delegated_task,
                     history_context=history_context,
                     model_profile=resolved_model_profile,
+                )
+            if delegated_action:
+                self._log_delegated_trace(
+                    "task_action_decided",
+                    execution_id=execution_id,
+                    event=event,
+                    task_id=str(delegated_task.get("id") or ""),
+                    action=delegated_action.action,
+                    source=getattr(delegated_action, "source", ""),
+                )
+            if (
+                delegated_action
+                and self._is_delegated_write_back_superseded(event, delegated_task)
+            ):
+                logger.info(
+                    "跳过已过期的委托状态写入：taskId=%s, eventId=%s",
+                    delegated_task.get("id"),
+                    event.event_id,
+                )
+                await self._complete_delegated_event(
+                    event,
+                    delegated_task,
+                    delegated_claim_token,
+                )
+                return OrchestratorResult(
+                    execution_id=execution_id,
+                    status="success",
+                    route=route,
+                    summary="A newer contact message arrived; the older delegated decision was discarded.",
+                    results=[],
+                    final_reply="",
+                    write_back_actions=["delegated_task_action:superseded"],
+                    notification=None,
+                    verified_memory_ids=[],
                 )
             if delegated_action and delegated_action.action not in {"SEND_MESSAGE", "SEND_AND_COMPLETE"}:
                 decision_result = AgentResult(
@@ -566,10 +829,23 @@ class OrchestratorService:
                     decision=delegated_action,
                     results=[decision_result],
                 )
+                self._log_delegated_trace(
+                    "task_action_persisted",
+                    execution_id=execution_id,
+                    event=event,
+                    task_id=str(delegated_task.get("id") or ""),
+                    action=delegated_action.action,
+                    persisted=persisted,
+                )
                 action_name = delegated_action.action.lower()
                 write_back_actions = [f"delegated_task_action:{action_name}"]
                 if persisted:
                     write_back_actions.append(f"delegated_task_runtime_updated:{action_name}")
+                await self._complete_delegated_event(
+                    event,
+                    delegated_task,
+                    delegated_claim_token,
+                )
                 return OrchestratorResult(
                     execution_id=execution_id,
                     status="success",
@@ -618,9 +894,9 @@ class OrchestratorService:
 
         results: list[AgentResult] = []
         previous_results: dict[str, dict] = {}
-        for step in plan.steps:
-            # 这个循环的作用是按 planner 生成的步骤顺序逐个执行 agent，并把前序结果回灌给后续步骤。
-            agent = self.agents[step.agent]
+        for agent_name, action in execution_steps:
+            # 普通路由执行 Planner 步骤；委托路由固定执行生成与审查，避免旧编排介入。
+            agent = self.agents[agent_name]
             step_context = base_context.model_copy(
                 update={
                     "metadata": {
@@ -629,9 +905,9 @@ class OrchestratorService:
                     }
                 }
             )
-            result = await agent.run(step_context, step.action)
+            result = await agent.run(step_context, action)
             results.append(result)
-            previous_results[step.agent] = result.structured_result
+            previous_results[agent_name] = result.structured_result
 
         handoff = next((result for result in results if result.structured_result.get("handoffRequired")), None)
         if handoff is not None:
@@ -663,6 +939,11 @@ class OrchestratorService:
                 delegated_task.get("id"),
                 event.event_id,
             )
+            await self._complete_delegated_event(
+                event,
+                delegated_task,
+                delegated_claim_token,
+            )
             return OrchestratorResult(
                 execution_id=execution_id,
                 status="success",
@@ -675,14 +956,31 @@ class OrchestratorService:
                 verified_memory_ids=self._verified_memory_ids(verified_memories),
             )
 
+        # 回复生成期间，ReAct 图已经更新了任务工作记忆。发送层必须读取这份最新状态，
+        # 否则并发唤醒会看不到刚刚发送的内容，进而把相同消息再次写回 QQ。
+        write_back_task = delegated_task
+        if delegated_task and delegated_action and getattr(delegated_action, "state_json", ""):
+            write_back_task = {
+                **delegated_task,
+                "stateJson": delegated_action.state_json,
+            }
         write_back_actions = await self._write_back_if_needed(
             event,
             route,
             results,
             final_reply,
             profile_match,
-            delegated_task,
+            write_back_task,
         )
+        if delegated_task:
+            self._log_delegated_trace(
+                "reply_writeback_finished",
+                execution_id=execution_id,
+                event=event,
+                task_id=str(delegated_task.get("id") or ""),
+                writeBackCount=len(write_back_actions),
+                replyGenerated=bool(final_reply and final_reply != "No reply was generated."),
+            )
         # 完成度判断在平台回写之后执行。即使模型判断或状态提交失败，也不能阻断已经生成的正常回复。
         task_completion = None
         if delegated_task:
@@ -699,6 +997,13 @@ class OrchestratorService:
             if delegated_update:
                 status = str(delegated_update.get("status") or "ACTIVE").lower()
                 write_back_actions.append(f"delegated_task_runtime_updated:{status}")
+                self._log_delegated_trace(
+                    "task_runtime_updated",
+                    execution_id=execution_id,
+                    event=event,
+                    task_id=str(delegated_task.get("id") or ""),
+                    status=status,
+                )
         else:
             task_completion = await self._evaluate_task_completion(
                 event,
@@ -711,12 +1016,18 @@ class OrchestratorService:
         if task_completion and task_completion.get("requested"):
             write_back_actions.append("conversation_task_completion_requested")
         notification = self._build_notification_decision(results)
+        if delegated_task:
+            await self._complete_delegated_event(
+                event,
+                delegated_task,
+                delegated_claim_token,
+            )
 
         return OrchestratorResult(
             execution_id=execution_id,
             status="success",
             route=route,
-            summary=f"Plan executed in {plan.mode} mode with {len(plan.steps)} step(s).",
+            summary=f"Plan executed in {execution_mode} mode with {len(execution_steps)} step(s).",
             results=results,
             final_reply=final_reply,
             write_back_actions=write_back_actions,
@@ -742,6 +1053,85 @@ class OrchestratorService:
             )
             return None
 
+    async def _claim_delegated_event(
+        self,
+        event: UnifiedEvent,
+        task: dict,
+    ) -> str | None:
+        """抢占一条委托事件，避免多个 Runtime 实例重复执行同一轮副作用。
+
+        返回 ``None`` 表示当前客户端尚未提供租约接口，主要用于兼容旧测试替身；
+        返回空字符串表示租约已被其他执行占用，本轮必须直接退出。
+        """
+        if self.event_center_client is None:
+            return None
+        claim = getattr(self.event_center_client, "claim_delegated_task_event", None)
+        if not callable(claim):
+            return None
+        task_id = str(task.get("id") or "").strip()
+        event_id = self._stable_event_identity(event)
+        if not task_id or not event_id:
+            logger.warning(
+                "委托事件缺少租约标识，拒绝执行：taskId=%s, eventId=%s",
+                task_id,
+                event_id,
+            )
+            return ""
+        try:
+            result = await claim(event, task_id, event_id, 120)
+        except Exception as exception:
+            logger.warning(
+                "抢占委托事件失败，拒绝本轮执行：taskId=%s, eventId=%s, error=%s",
+                task_id,
+                event_id,
+                type(exception).__name__,
+            )
+            return ""
+        if not bool(result.get("claimed")):
+            logger.info(
+                "委托事件已由其他执行占用：taskId=%s, eventId=%s, status=%s",
+                task_id,
+                event_id,
+                result.get("status"),
+            )
+            return ""
+        claim_token = str(result.get("claimToken") or "").strip()
+        if not claim_token:
+            logger.warning(
+                "委托事件租约缺少 claimToken，拒绝执行：taskId=%s, eventId=%s",
+                task_id,
+                event_id,
+            )
+            return ""
+        return claim_token
+
+    async def _complete_delegated_event(
+        self,
+        event: UnifiedEvent,
+        task: dict,
+        claim_token: str | None,
+    ) -> None:
+        """在本轮委托的状态写入和消息副作用全部完成后提交事件租约。"""
+        if not claim_token or self.event_center_client is None:
+            return
+        complete = getattr(self.event_center_client, "complete_delegated_task_event", None)
+        if not callable(complete):
+            return
+        task_id = str(task.get("id") or "").strip()
+        event_id = self._stable_event_identity(event)
+        if not task_id or not event_id:
+            return
+        try:
+            await complete(event, task_id, event_id, claim_token)
+        except Exception as exception:
+            # 平台副作用已经完成，提交失败只能保留租约等待超时，不能再次执行发送。
+            logger.error(
+                "提交委托事件租约失败：taskId=%s, eventId=%s, error=%s",
+                task_id,
+                event_id,
+                type(exception).__name__,
+            )
+
     async def _load_delegated_task_history(
         self,
         event: UnifiedEvent,
@@ -749,7 +1139,7 @@ class OrchestratorService:
         task: dict,
     ) -> list[dict]:
         """读取委托任务的可信双方时间线；服务异常时保留内存历史继续执行。"""
-        history = list(fallback_history)
+        history = self._filter_delegated_history_for_event(fallback_history, event, task)
         task_id = str(task.get("id") or "").strip()
         task_state = self._delegated_task_state(task)
         task_created_at = str(
@@ -758,7 +1148,7 @@ class OrchestratorService:
         if self.event_center_client is None:
             return history
         try:
-            return await self.event_center_client.list_conversation_messages(
+            rows = await self.event_center_client.list_conversation_messages(
                 event.chat_id,
                 platform=event.platform,
                 chat_type=event.chat_type,
@@ -767,6 +1157,7 @@ class OrchestratorService:
                 user_id=self._resolve_event_user_id(event),
                 after=task_created_at or None,
             )
+            return self._filter_delegated_history_for_event(rows, event, task)
         except Exception as exception:
             logger.warning(
                 "读取委托历史失败，使用当前内存上下文继续决策：taskId=%s, error=%s",
@@ -790,7 +1181,7 @@ class OrchestratorService:
         if not task_created_at:
             return []
         try:
-            return await self.event_center_client.list_conversation_messages(
+            rows = await self.event_center_client.list_conversation_messages(
                 event.chat_id,
                 platform=event.platform,
                 chat_type=event.chat_type,
@@ -798,6 +1189,7 @@ class OrchestratorService:
                 user_id=self._resolve_event_user_id(event),
                 before=task_created_at,
             )
+            return self._filter_delegated_history_for_event(rows, event, task)
         except Exception as exception:
             logger.warning(
                 "读取任务前背景失败，继续使用任务内记忆：taskId=%s, error=%s",
@@ -820,6 +1212,66 @@ class OrchestratorService:
             return {}
         return parsed if isinstance(parsed, dict) else {}
 
+    @staticmethod
+    def _conversation_scope_from_row(row: dict) -> tuple[str, str, str]:
+        """从事件、历史行或任务对象读取会话范围，兼容 Java/OneBot 字段命名。"""
+        payload = row.get("rawPayload") if isinstance(row.get("rawPayload"), dict) else {}
+        platform = str(row.get("platform") or payload.get("platform") or "").strip().lower()
+        chat_type = str(
+            row.get("chatType")
+            or row.get("chat_type")
+            or payload.get("chatType")
+            or payload.get("chat_type")
+            or ""
+        ).strip().lower()
+        chat_id = str(
+            row.get("chatId")
+            or row.get("chat_id")
+            or payload.get("chatId")
+            or payload.get("chat_id")
+            or payload.get("group_id")
+            or payload.get("user_id")
+            or ""
+        ).strip()
+        return platform, chat_type, chat_id
+
+    @classmethod
+    def _filter_delegated_history_for_event(
+        cls,
+        rows: list[dict] | None,
+        event: UnifiedEvent,
+        task: dict,
+    ) -> list[dict]:
+        """只保留当前目标会话的双方消息，阻断跨会话昵称和事实污染。"""
+        expected = cls._conversation_scope_from_row(event.model_dump(by_alias=True))
+        task_scope = cls._conversation_scope_from_row(task)
+        filtered: list[dict] = []
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            if not cls._delegated_history_row_matches_scope(row, expected, task_scope):
+                continue
+            filtered.append(row)
+        return filtered
+
+    @classmethod
+    def _delegated_history_row_matches_scope(
+        cls,
+        row: dict,
+        expected_scope: tuple[str, str, str],
+        task_scope: tuple[str, str, str],
+    ) -> bool:
+        """判断一条历史或状态行是否属于当前委托会话。
+
+        任务运行期产生的新时间线都会带完整 scope。仅为兼容升级前的旧状态，才允许
+        完全没有 scope 的行继续用于“任务自身 scope 与当前事件 scope 一致”的任务；
+        缺一部分字段的行无法可靠归属，必须拒绝，不能猜测后混入其他私聊或群聊。
+        """
+        row_scope = cls._conversation_scope_from_row(row)
+        if all(row_scope):
+            return row_scope == expected_scope
+        return row_scope == ("", "", "") and task_scope == expected_scope
+
     @classmethod
     def _delegated_task_history_access_allowed(cls, task: dict) -> bool:
         """读取主控台任务的历史授权，默认只允许按需读取有限背景。"""
@@ -838,7 +1290,7 @@ class OrchestratorService:
         history_context: list[dict],
         model_profile,
     ):
-        """在 SocialAgent 运行前恢复背景并决定发送、等待或结束，失败时采用安全的事件方向回退。"""
+        """在 SocialAgent 运行前恢复背景并决定发送、等待或结束。"""
         task_id = str(task.get("id") or "").strip()
         history = await self._load_delegated_task_history(event, history_context, task)
         task_state = self._delegated_task_state(task)
@@ -876,30 +1328,19 @@ class OrchestratorService:
             return decision
         except Exception as exception:
             logger.warning(
-                "委托动作决策失败，按当前事件方向保守回退：taskId=%s, eventId=%s, error=%s",
+                "委托动作决策失败，本轮安全等待：taskId=%s, eventId=%s, error=%s",
                 task_id,
                 event.event_id,
                 type(exception).__name__,
             )
-            # 决策图异常时，任务创建事件和联系人入站消息仍可继续，其他事件禁止触发自动回复。
-            event_type = str(event.event_type or "").lower()
-            if event_type == "delegated_task_started" or self._is_delegated_peer_inbound(event):
-                return DelegatedTaskActionDecision(
-                    action="SEND_MESSAGE",
-                    reason="决策图不可用，按已授权任务和真实入站事件继续执行",
-                    messageInstruction="根据委托目标和可信历史生成下一条消息",
-                    stateJson=str(task.get("stateJson") or "{}"),
-                    lastEventId=event.event_id,
-                    requestedTool="send_qq_message",
-                )
-            # 非联系人入站事件必须显式返回 WAIT。返回 None 会让旧回复链继续运行，
-            # 导致代理自己的出站回执、内部状态事件再次触发自动回复。
+            # 决策图异常时不能伪造 SEND_MESSAGE。等待会保留任务和当前记忆，
+            # 下一条可信事件到达后再由模型重新决定，避免故障被放大成重复发送。
             return DelegatedTaskActionDecision(
                 action="WAIT",
-                reason="决策图不可用，当前事件不具备继续对话的可信触发条件",
-                progressSummary=str(task.get("progressSummary") or "等待联系人回复"),
+                reason="决策图不可用，本轮不执行外部副作用",
+                progressSummary=str(task.get("progressSummary") or "等待下一次可靠决策"),
                 stateJson=str(task.get("stateJson") or "{}"),
-                lastEventId=event.event_id,
+                lastEventId=self._stable_event_identity(event),
                 requestedTool="update_delegated_task",
             )
 
@@ -917,7 +1358,10 @@ class OrchestratorService:
         origin = str(raw_payload.get("messageOrigin") or "").upper()
         if not (event.text or "").strip() or event_type != "message":
             return False
-        if direction == "OUTBOUND" or actor in {"OWNER", "AGENT", "SYSTEM"}:
+        event_row = event.model_dump(by_alias=True)
+        if is_runtime_generated_message(event_row):
+            return False
+        if direction == "OUTBOUND" or actor in {"AGENT", "SYSTEM"}:
             return False
         if origin in {
             "INTERNAL",
@@ -931,40 +1375,173 @@ class OrchestratorService:
             return True
         return origin in {"EXTERNAL", "PLATFORM"}
 
+    @staticmethod
+    def _stable_event_identity(event: UnifiedEvent) -> str:
+        """返回平台重投期间保持不变的事件身份，供并发合并和工具幂等使用。"""
+        return canonical_message_identity(
+            event.model_dump(by_alias=True),
+            str(event.text or ""),
+        )
+
+    @staticmethod
+    def _normalize_outbound_text(value: str) -> str:
+        """规范化待发送文本，使空白、全半角和大小写差异不会绕过重复检测。"""
+        normalized = unicodedata.normalize("NFKC", str(value or ""))
+        return "".join(normalized.split()).casefold()
+
+    @classmethod
+    def _outbound_payload_digest(cls, payload: dict) -> str:
+        """计算消息内容摘要；同一内容在不同事件中仍会得到相同摘要。"""
+        message = payload.get("message")
+        if isinstance(message, str):
+            source = message
+        else:
+            segments = payload.get("segments") or message or []
+            source = json.dumps(
+                segments,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        normalized = cls._normalize_outbound_text(source)
+        return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:24]
+
+    @staticmethod
+    def _conversation_idempotency_scope(event: UnifiedEvent) -> str:
+        """返回会话级发送作用域，供主控台并行委托共享幂等键。
+
+        主控台的一条自然语言命令可能被拆成多个目标会话任务，也可能因重试短暂出现
+        同一会话的并行任务。这里不能再使用任务 ID 作为发送作用域，否则每个任务都会
+        拥有独立的发送键并重复写入 QQ。普通设定集回复不使用此作用域，避免把不同轮次
+        的正常重复表达永久抑制。
+        """
+        identity = ":".join(
+            (
+                str(event.platform or "unknown").strip().lower(),
+                str(event.chat_type or "unknown").strip().lower(),
+                str(event.chat_id or "unknown").strip(),
+            )
+        )
+        return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:20]
+
+    @classmethod
+    def _delegated_turn_anchor(cls, event: UnifiedEvent, task: dict | None) -> str:
+        """确定当前对话轮次。
+
+        新的联系人入站消息会开启新轮次；没有新入站时，任务可主动发送不同内容，
+        但同一内容始终落到同一个幂等键，避免并发事件造成重复发送。
+        """
+        state = cls._delegated_task_state(task or {})
+        expected_scope = cls._conversation_scope_from_row(event.model_dump(by_alias=True))
+        task_scope = cls._conversation_scope_from_row(task or {})
+        timeline = state.get("timeline")
+        if isinstance(timeline, list):
+            for item in reversed(timeline):
+                if not isinstance(item, dict):
+                    continue
+                if not cls._delegated_history_row_matches_scope(
+                    item,
+                    expected_scope,
+                    task_scope,
+                ):
+                    continue
+                direction = str(item.get("direction") or "").upper()
+                actor = str(item.get("actorType") or "").upper()
+                role = str(item.get("role") or "").lower()
+                if direction != "INBOUND" and actor not in {"CONTACT", "PEER"} and role not in {
+                    "peer",
+                    "contact",
+                    "other",
+                }:
+                    continue
+                identity = next(
+                    (
+                        str(item.get(key) or "").strip()
+                        for key in ("eventId", "platformMessageId", "clientMessageId", "at")
+                        if str(item.get(key) or "").strip()
+                    ),
+                    "",
+                )
+                if identity:
+                    return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:20]
+
+        if task and cls._is_delegated_peer_inbound(event):
+            identity = cls._stable_event_identity(event)
+        else:
+            # 没有新的对方消息时仍允许 Agent 主动发言，但同一会话的并行任务必须共享
+            # 同一轮次锚点，不能因为任务 ID 不同而绕过下方的幂等控制。
+            identity = "conversation-open"
+        return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:20]
+
+    @classmethod
+    def _outbound_already_recorded(cls, task: dict | None, turn_anchor: str, digest: str) -> bool:
+        """检查持久化任务状态，防止进程重启后再次发送同一轮的相同内容。"""
+        ledger = cls._delegated_task_state(task or {}).get("outboundLedger")
+        if not isinstance(ledger, list):
+            return False
+        return any(
+            isinstance(item, dict)
+            and str(item.get("turnAnchor") or "") == turn_anchor
+            and str(item.get("contentDigest") or "") == digest
+            for item in ledger
+        )
+
+    def _register_delegated_peer_inbound(self, event: UnifiedEvent) -> int | None:
+        """登记联系人消息版本，使同一会话的旧推理在发送前自动失效。
+
+        版本键只使用 platform、chatType 与 chatId，不能绑定任务 ID。用户可在同一联系人
+        会话中新建、结束或切换任务；若版本仍绑定任务，旧任务的模型调用会绕过防抖继续发送。
+        """
+        if not self._is_delegated_peer_inbound(event):
+            return None
+        execution_key = self._delegated_conversation_execution_scope(event)
+        if not execution_key:
+            return None
+        event_id = self._stable_event_identity(event)
+        if self._delegated_conversation_latest_event_ids.get(execution_key) == event_id:
+            return self._delegated_conversation_versions.get(execution_key, 0)
+        version = self._delegated_conversation_versions.get(execution_key, 0) + 1
+        self._delegated_conversation_versions[execution_key] = version
+        self._delegated_conversation_latest_event_ids[execution_key] = event_id
+        return version
+
     async def _wait_for_latest_delegated_inbound(
         self,
         event: UnifiedEvent,
-        task: dict,
+        registered_version: int | None,
     ) -> bool:
-        """等待短暂合并窗口，只有同一任务内最新的联系人消息才继续生成回复。"""
-        task_id = str(task.get("id") or "").strip()
-        if not task_id:
+        """等待短暂合并窗口后，确认当前消息仍是该会话最新的一条联系人消息。"""
+        execution_key = self._delegated_conversation_execution_scope(event)
+        if not execution_key or registered_version is None:
             return True
-
-        version = self._delegated_inbound_versions.get(task_id, 0) + 1
-        self._delegated_inbound_versions[task_id] = version
-        self._delegated_inbound_latest_event_ids[task_id] = event.event_id
         await self.sleeper(self._delegated_inbound_debounce_seconds)
-        is_latest = self._delegated_inbound_versions.get(task_id) == version
-        return is_latest
+        return (
+            self._delegated_conversation_versions.get(execution_key) == registered_version
+            and self._delegated_conversation_latest_event_ids.get(execution_key)
+            == self._stable_event_identity(event)
+        )
 
-    def _is_latest_delegated_inbound(self, event: UnifiedEvent, task: dict) -> bool:
-        """确认当前事件仍是该委托会话最新的联系人入站消息。
+    @classmethod
+    def _delegated_conversation_execution_scope(cls, event: UnifiedEvent) -> str:
+        """生成会话级执行键，隔离不同私聊和群聊的异步推理状态。"""
+        platform, chat_type, chat_id = cls._conversation_scope_from_row(event.model_dump(by_alias=True))
+        if not all((platform, chat_type, chat_id)):
+            return ""
+        return f"{platform}:{chat_type}:{chat_id}"
 
-        函数在真正回写 QQ 前调用。它只保护同一常驻 Python 进程中的并发事件；
-        服务重启后由事件幂等键和任务时间线负责避免重复执行。
-        """
-        task_id = str(task.get("id") or "").strip()
-        if not task_id:
+    def _is_latest_delegated_inbound(self, event: UnifiedEvent) -> bool:
+        """确认当前联系人消息仍是该会话最新事件，防止过期推理写入平台。"""
+        execution_key = self._delegated_conversation_execution_scope(event)
+        if not execution_key:
             return True
-        latest_event_id = self._delegated_inbound_latest_event_ids.get(task_id)
-        return not latest_event_id or latest_event_id == event.event_id
+        latest_event_id = self._delegated_conversation_latest_event_ids.get(execution_key)
+        return not latest_event_id or latest_event_id == self._stable_event_identity(event)
 
     def _is_delegated_write_back_superseded(self, event: UnifiedEvent, task: dict | None) -> bool:
         """判断委托任务回写是否已经被同一会话里的更新联系人消息覆盖。"""
         if not task:
             return False
-        return self._is_delegated_peer_inbound(event) and not self._is_latest_delegated_inbound(event, task)
+        return self._is_delegated_peer_inbound(event) and not self._is_latest_delegated_inbound(event)
 
     @staticmethod
     def _build_superseded_delegated_wait_action(
@@ -977,7 +1554,7 @@ class OrchestratorService:
             reason="同一会话收到更新的联系人消息，本事件已合并到最新上下文",
             progressSummary=str(task.get("progressSummary") or "等待合并后的最新联系人消息"),
             stateJson=str(task.get("stateJson") or "{}"),
-            lastEventId=event.event_id,
+            lastEventId=self._stable_event_identity(event),
             requestedTool="update_delegated_task",
         )
 
@@ -1004,7 +1581,10 @@ class OrchestratorService:
             task_id=task_id,
             allowed_tools=frozenset({"update_delegated_task", "complete_delegated_task"}),
         )
-        idempotency_key = f"delegated:{task_id}:{decision.last_event_id or event.event_id}:{requested_tool}"
+        # decision 可能来自兼容分支并携带临时 eventId。任务状态和工具副作用统一使用
+        # 平台稳定消息身份，确保同一条 QQ 消息被 Webhook/MQ 重投时只提交一次。
+        stable_event_id = self._stable_event_identity(event)
+        idempotency_key = f"delegated:{task_id}:{stable_event_id}:{requested_tool}"
         try:
             response = await self.tools.ainvoke(
                 requested_tool,
@@ -1015,7 +1595,7 @@ class OrchestratorService:
                     "task_id": task_id,
                     "progress_summary": decision.progress_summary,
                     "state_json": decision.state_json,
-                    "last_event_id": decision.last_event_id or event.event_id,
+                    "last_event_id": stable_event_id,
                     "completion_report": decision.completion_report,
                 },
             )
@@ -1074,7 +1654,7 @@ class OrchestratorService:
             # 旧运行图做第二次判断，否则会把“已确认/将结束”等状态重新覆盖成等待。
             if self._is_react_managed_delegated_action(delegated_action):
                 if getattr(delegated_action, "action", "") == "SEND_AND_COMPLETE":
-                    if self._qq_write_back_succeeded(write_back_actions):
+                    if self._qq_write_back_effectively_succeeded(write_back_actions):
                         return await self._persist_delegated_task_decision(
                             event=event,
                             task=task,
@@ -1087,7 +1667,7 @@ class OrchestratorService:
                         decision=self._build_react_post_send_wait_action(
                             event,
                             delegated_action,
-                            sent=False,
+                            write_back_actions=write_back_actions,
                         ),
                         results=results,
                     )
@@ -1099,14 +1679,14 @@ class OrchestratorService:
                         decision=self._build_react_post_send_wait_action(
                             event,
                             delegated_action,
-                            sent=self._qq_write_back_succeeded(write_back_actions),
+                            write_back_actions=write_back_actions,
                         ),
                         results=results,
                     )
 
             if (
                 getattr(delegated_action, "action", "") == "SEND_AND_COMPLETE"
-                and self._qq_write_back_succeeded(write_back_actions)
+                and self._qq_write_back_effectively_succeeded(write_back_actions)
             ):
                 return await self._persist_delegated_task_decision(
                     event=event,
@@ -1159,7 +1739,7 @@ class OrchestratorService:
         event: UnifiedEvent,
         action: DelegatedTaskActionDecision,
         *,
-        sent: bool,
+        write_back_actions: list[str],
     ) -> DelegatedTaskActionDecision:
         """把 ReAct 的发送动作转换为可持久化的 ACTIVE 状态更新。
 
@@ -1167,10 +1747,27 @@ class OrchestratorService:
         的 workingMemory、证据和待满足条件，并只更新本轮已发送或发送失败的信息。
         """
         state = self._delegated_task_state({"stateJson": action.state_json})
-        state["lastWriteBackEventId"] = event.event_id
-        state["lastWriteBackStatus"] = "SENT" if sent else "FAILED"
+        stable_event_id = self._stable_event_identity(event)
+        sent = self._qq_write_back_effectively_succeeded(write_back_actions)
+        duplicate_suppressed = any(
+            str(item or "").startswith("qq_write_back_skipped:duplicate_outbound:")
+            for item in write_back_actions
+        )
+        state["lastWriteBackEventId"] = stable_event_id
+        state["lastWriteBackStatus"] = "DEDUPLICATED" if duplicate_suppressed else ("SENT" if sent else "FAILED")
         state["lastPlannedAction"] = "SEND_MESSAGE"
         state["lastPlannedAt"] = state.get("lastPlannedAt") or ""
+        ledger = list(state.get("outboundLedger") or [])
+        for record in self._outbound_write_back_records(write_back_actions):
+            if any(
+                isinstance(existing, dict)
+                and existing.get("turnAnchor") == record["turnAnchor"]
+                and existing.get("contentDigest") == record["contentDigest"]
+                for existing in ledger
+            ):
+                continue
+            ledger.append(record)
+        state["outboundLedger"] = ledger[-80:]
         if sent:
             progress = action.progress_summary or "已发送消息，等待联系人回复"
         else:
@@ -1180,7 +1777,7 @@ class OrchestratorService:
             reason=action.reason or "已记录 ReAct 发送结果",
             progressSummary=progress,
             stateJson=json.dumps(state, ensure_ascii=False),
-            lastEventId=action.last_event_id or event.event_id,
+            lastEventId=stable_event_id,
             completionReport="",
             evidence=list(action.evidence or []),
             requestedTool="update_delegated_task",
@@ -1202,9 +1799,49 @@ class OrchestratorService:
             action_text = str(action or "").strip()
             if not action_text.startswith("qq_write_back_sent:"):
                 continue
-            status = action_text.split(":", 1)[1].strip().lower()
+            parts = action_text.split(":")
+            status = parts[1].strip().lower() if len(parts) > 1 else ""
             return status not in {"", "unknown", "failed", "error"}
         return False
+
+    @staticmethod
+    def _outbound_write_back_records(write_back_actions: list[str]) -> list[dict]:
+        """从发送结果中提取可持久化的轮次与内容摘要。"""
+        records: list[dict] = []
+        for action in write_back_actions:
+            parts = str(action or "").split(":")
+            if len(parts) >= 5 and parts[0] == "qq_write_back_sent":
+                records.append(
+                    {
+                        "turnAnchor": parts[2],
+                        "contentDigest": parts[3],
+                        "sentAt": datetime.now(timezone.utc).isoformat(),
+                        "triggerEventId": parts[4],
+                    }
+                )
+                continue
+            # 并发分支命中相同工具幂等键时，平台只会真实发送一次。命中方也要
+            # 落下相同账本记录，避免后提交的状态覆盖先提交分支的发送记录。
+            if len(parts) >= 4 and parts[:2] == ["qq_write_back_skipped", "duplicate_outbound"]:
+                records.append(
+                    {
+                        "turnAnchor": parts[2],
+                        "contentDigest": parts[3],
+                        "sentAt": datetime.now(timezone.utc).isoformat(),
+                        "triggerEventId": "",
+                    }
+                )
+        return records
+
+    @classmethod
+    def _qq_write_back_effectively_succeeded(cls, write_back_actions: list[str]) -> bool:
+        """真实发送成功或命中已发送幂等记录，都视为本轮副作用已经完成。"""
+        if cls._qq_write_back_succeeded(write_back_actions):
+            return True
+        return any(
+            str(action or "").startswith("qq_write_back_skipped:duplicate_outbound:")
+            for action in write_back_actions
+        )
 
     async def _evaluate_task_completion(
         self,
@@ -1336,9 +1973,18 @@ class OrchestratorService:
                     event.event_id,
                 )
                 return ["qq_write_back_skipped:delegated_superseded"]
-            task_scope = str((delegated_task or {}).get("id") or route)
-            idempotency_key = f"runtime:{event.event_id}:{task_scope}"
+            stable_event_id = self._stable_event_identity(event)
+            turn_anchor = self._delegated_turn_anchor(event, delegated_task)
+            if delegated_task is not None:
+                # 主控台任务必须以会话而非 taskId 去重。多个并行任务面对同一联系人、
+                # 同一轮对话和同一候选文本时，只允许一次真正的平台发送。
+                task_scope = f"conversation:{self._conversation_idempotency_scope(event)}"
+            else:
+                # 设定集自动回复保持事件级作用域，允许后续不同时间的正常重复表达。
+                task_scope = f"event:{stable_event_id}"
             responses = []
+            send_actions: list[str] = []
+            call_keys: list[str] = []
             for index, source_payload in enumerate(payloads):
                 if self._is_delegated_write_back_superseded(event, delegated_task):
                     logger.info(
@@ -1349,7 +1995,21 @@ class OrchestratorService:
                     )
                     return ["qq_write_back_skipped:delegated_superseded"]
                 message_payload = dict(source_payload)
-                call_key = f"{idempotency_key}:message:{index}"
+                content_digest = self._outbound_payload_digest(message_payload)
+                call_key = f"runtime:{task_scope}:turn:{turn_anchor}:content:{content_digest}"
+                call_keys.append(call_key)
+                if self._outbound_already_recorded(delegated_task, turn_anchor, content_digest):
+                    logger.info(
+                        "QQ 自动回写抑制重复内容：taskId=%s, turn=%s, digest=%s, index=%s",
+                        (delegated_task or {}).get("id"),
+                        turn_anchor,
+                        content_digest,
+                        index,
+                    )
+                    send_actions.append(
+                        f"qq_write_back_skipped:duplicate_outbound:{turn_anchor}:{content_digest}"
+                    )
+                    continue
                 message_payload["client_message_id"] = call_key
                 message_payload["correlation_id"] = event.event_id
                 # 所有平台发送均由 LangChain 工具执行；设定集和主控台仅在授权来源上不同。
@@ -1365,6 +2025,10 @@ class OrchestratorService:
                     arguments=message_payload,
                 )
                 responses.append(response)
+                status = str(response.get("status", "unknown"))
+                send_actions.append(
+                    f"qq_write_back_sent:{status}:{turn_anchor}:{content_digest}:{stable_event_id}"
+                )
                 if index < len(payloads) - 1:
                     await self.sleeper(self._resolve_inter_bubble_delay_seconds(event, index))
             for result in results:
@@ -1372,7 +2036,7 @@ class OrchestratorService:
                     result.tool_calls.append(
                         ToolCallRecord(
                             tool="send_qq_message",
-                            arguments={"messages": payloads, "idempotencyKey": idempotency_key},
+                            arguments={"messages": payloads, "idempotencyKeys": call_keys},
                         )
                     )
                     break
@@ -1381,8 +2045,7 @@ class OrchestratorService:
                 actions.append(f"qq_write_back_delayed:{delay_seconds}s")
             if len(payloads) > 1:
                 actions.append(f"qq_write_back_split:{len(payloads)}")
-            status = responses[-1].get("status", "unknown") if responses else "unknown"
-            actions.append(f"qq_write_back_sent:{status}")
+            actions.extend(send_actions)
             return actions
         except KeyError:
             return ["qq_write_back_skipped:tool_not_registered"]

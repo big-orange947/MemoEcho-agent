@@ -12,6 +12,8 @@ class ConversationCandidate(BaseModel):
     chat_type: str = Field(alias="chatType")
     chat_id: str = Field(alias="chatId")
     chat_name: str = Field(default="", alias="chatName")
+    # 通讯录备注、昵称和群名等可检索别名；缺失时保持兼容旧版 Java 响应。
+    aliases: list[str] = Field(default_factory=list, alias="aliases")
     last_sender_name: str = Field(default="", alias="lastSenderName")
     last_message: str = Field(default="", alias="lastMessage")
     last_message_time: str = Field(default="", alias="lastMessageTime")

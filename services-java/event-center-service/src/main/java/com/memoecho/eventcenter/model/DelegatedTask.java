@@ -10,10 +10,21 @@ import java.time.Instant;
  */
 public record DelegatedTask(
         String id,
+        String workflowId,
+        String stepKey,
+        int stepOrder,
+        String stepRole,
+        String stepInstruction,
+        String dependsOnJson,
+        String requiredFactsJson,
+        String producesFactsJson,
+        String resultJson,
+        long activationVersion,
         String userId,
         String taskType,
         String status,
         String originalCommand,
+        String sourceExecutionId,
         String targetQuery,
         String platform,
         String chatType,
@@ -42,8 +53,28 @@ public record DelegatedTask(
             String objective, String successCriteria, String deadlineText, double confidence,
             String clarificationQuestion, boolean requiresConfirmation, Instant createdAt, Instant updatedAt
     ) {
-        this(id, userId, taskType, status, originalCommand, targetQuery, platform, chatType, chatId,
+        this(id, null, "", 0, "ACTION", "", "[]", "[]", "[]", "{}", 0,
+                userId, taskType, status, originalCommand, null, targetQuery, platform, chatType, chatId,
                 targetName, objective, successCriteria, deadlineText, confidence, clarificationQuestion,
                 requiresConfirmation, "AUTO_COMPLETE", "", "{}", "", null, null, "", createdAt, updatedAt);
+    }
+
+    /**
+     * 为旧的单任务创建链路提供兼容构造器。
+     * 新主控台链路必须使用包含工作流字段的完整构造器。
+     */
+    public DelegatedTask(
+            String id, String userId, String taskType, String status, String originalCommand,
+            String sourceExecutionId, String targetQuery, String platform, String chatType, String chatId,
+            String targetName, String objective, String successCriteria, String deadlineText, double confidence,
+            String clarificationQuestion, boolean requiresConfirmation, String executionMode,
+            String progressSummary, String stateJson, String lastEventId, Instant startedAt,
+            Instant completedAt, String completionReport, Instant createdAt, Instant updatedAt
+    ) {
+        this(id, null, "", 0, "ACTION", "", "[]", "[]", "[]", "{}", 0,
+                userId, taskType, status, originalCommand, sourceExecutionId, targetQuery, platform,
+                chatType, chatId, targetName, objective, successCriteria, deadlineText, confidence,
+                clarificationQuestion, requiresConfirmation, executionMode, progressSummary, stateJson,
+                lastEventId, startedAt, completedAt, completionReport, createdAt, updatedAt);
     }
 }

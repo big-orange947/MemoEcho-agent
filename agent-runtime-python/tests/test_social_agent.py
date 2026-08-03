@@ -575,7 +575,8 @@ class SocialAgentTest(unittest.IsolatedAsyncioTestCase):
             "social-parenthesized-fact",
         )
 
-        self.assertEqual(message_parts, ["会员一个月15还卖吗"])
+        # 问号承载真实提问语义，QQ 私聊中应保留而不是清洗成陈述句。
+        self.assertEqual(message_parts, ["会员一个月15还卖吗？"])
 
     async def test_should_only_rarely_keep_short_reply_terminal_punctuation(self) -> None:
         """短私聊默认去除句末标点，仅在稳定的低概率抽样命中时保留原始标点。"""

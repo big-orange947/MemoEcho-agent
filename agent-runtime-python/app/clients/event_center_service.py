@@ -4,6 +4,7 @@ import asyncio
 import os
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -74,6 +75,63 @@ class EventCenterServiceClient:
             raise ValueError("active delegated task response must be an object")
         return payload
 
+    async def claim_delegated_task_event(
+        self,
+        event: UnifiedEvent,
+        task_id: str,
+        event_id: str,
+        lease_seconds: int = 120,
+    ) -> dict[str, Any]:
+        """抢占委托事件的执行租约，保证多个 Runtime 实例不会重复处理同一条消息。"""
+        normalized_task_id = task_id.strip()
+        normalized_event_id = event_id.strip()
+        if not normalized_task_id or not normalized_event_id:
+            raise ValueError("task_id and event_id are required")
+        async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+            response = await client.post(
+                (
+                    f"{self.base_url}/internal/workspace/commands/delegated/"
+                    f"{quote(normalized_task_id, safe='')}/events/claim"
+                ),
+                json={
+                    "eventId": normalized_event_id,
+                    "leaseSeconds": max(1, lease_seconds),
+                },
+                headers=self._runtime_headers(self.resolve_event_user_id(event)),
+            )
+        response.raise_for_status()
+        result = response.json()
+        if not isinstance(result, dict):
+            raise ValueError("delegated event claim response must be an object")
+        return result
+
+    async def complete_delegated_task_event(
+        self,
+        event: UnifiedEvent,
+        task_id: str,
+        event_id: str,
+        claim_token: str,
+    ) -> None:
+        """确认委托事件已经处理完成，使后续重复投递只能读取完成态而不能再次执行。"""
+        normalized_task_id = task_id.strip()
+        normalized_event_id = event_id.strip()
+        normalized_claim_token = claim_token.strip()
+        if not normalized_task_id or not normalized_event_id or not normalized_claim_token:
+            raise ValueError("task_id, event_id and claim_token are required")
+        async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+            response = await client.post(
+                (
+                    f"{self.base_url}/internal/workspace/commands/delegated/"
+                    f"{quote(normalized_task_id, safe='')}/events/complete"
+                ),
+                json={
+                    "eventId": normalized_event_id,
+                    "claimToken": normalized_claim_token,
+                },
+                headers=self._runtime_headers(self.resolve_event_user_id(event)),
+            )
+        response.raise_for_status()
+
     async def update_delegated_task_runtime(
         self,
         event: UnifiedEvent,
@@ -126,10 +184,12 @@ class EventCenterServiceClient:
         user_id: str,
         command: str,
         compilation: DelegatedTaskCompileResponse,
+        execution_id: str | None = None,
     ) -> dict[str, Any]:
         """把 LangGraph 编译出的任务提交给 Event Center，由 Java 做白名单校验和持久化。"""
         payload = {
             "command": command,
+            "executionId": execution_id,
             "compilation": compilation.model_dump(by_alias=True),
         }
         async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:

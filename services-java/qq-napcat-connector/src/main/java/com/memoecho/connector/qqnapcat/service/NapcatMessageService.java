@@ -12,13 +12,16 @@ public class NapcatMessageService {
 
     private final NapcatApiClient apiClient;
     private final OutboundMessageRegistry outboundMessageRegistry;
+    private final OutboundRequestDeduplicator requestDeduplicator;
 
     public NapcatMessageService(
             NapcatApiClient apiClient,
-            OutboundMessageRegistry outboundMessageRegistry
+            OutboundMessageRegistry outboundMessageRegistry,
+            OutboundRequestDeduplicator requestDeduplicator
     ) {
         this.apiClient = apiClient;
         this.outboundMessageRegistry = outboundMessageRegistry;
+        this.requestDeduplicator = requestDeduplicator;
     }
 
     /** 发送群消息，并登记 Runtime 提供的消息关联身份。 */
@@ -31,10 +34,13 @@ public class NapcatMessageService {
         String normalizedText = normalizeMessage(message);
         outboundMessageRegistry.registerPending(
                 "group", String.valueOf(groupId), normalizedText, clientMessageId, correlationId);
-        NapcatApiResponse<JsonNode> response = apiClient.call(
-                "send_group_msg",
-                Map.of("group_id", groupId, "message", message),
-                JsonNode.class
+        NapcatApiResponse<JsonNode> response = requestDeduplicator.execute(
+                clientMessageId,
+                () -> apiClient.call(
+                        "send_group_msg",
+                        Map.of("group_id", groupId, "message", message),
+                        JsonNode.class
+                )
         );
         registerCompletedMessage(
                 "group", String.valueOf(groupId), normalizedText, clientMessageId, correlationId, response);
@@ -51,10 +57,13 @@ public class NapcatMessageService {
         String normalizedText = normalizeMessage(message);
         outboundMessageRegistry.registerPending(
                 "private", String.valueOf(userId), normalizedText, clientMessageId, correlationId);
-        NapcatApiResponse<JsonNode> response = apiClient.call(
-                "send_private_msg",
-                Map.of("user_id", userId, "message", message),
-                JsonNode.class
+        NapcatApiResponse<JsonNode> response = requestDeduplicator.execute(
+                clientMessageId,
+                () -> apiClient.call(
+                        "send_private_msg",
+                        Map.of("user_id", userId, "message", message),
+                        JsonNode.class
+                )
         );
         registerCompletedMessage(
                 "private", String.valueOf(userId), normalizedText, clientMessageId, correlationId, response);

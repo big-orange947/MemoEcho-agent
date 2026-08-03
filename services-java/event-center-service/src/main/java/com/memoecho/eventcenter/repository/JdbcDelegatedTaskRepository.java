@@ -28,15 +28,19 @@ public class JdbcDelegatedTaskRepository {
     public DelegatedTask insert(DelegatedTask task) {
         jdbcTemplate.update("""
                         INSERT INTO delegated_task (
-                            id, user_id, task_type, status, original_command, target_query,
+                            id, workflow_id, step_key, step_order, step_role, step_instruction,
+                            depends_on_json, required_facts_json, produces_facts_json, result_json, activation_version,
+                            user_id, task_type, status, original_command, source_execution_id, target_query,
                             platform, chat_type, chat_id, target_name, objective, success_criteria,
                             deadline_text, confidence, clarification_question, requires_confirmation,
                             execution_mode, progress_summary, state_json, last_event_id, started_at,
                             completed_at, completion_report, created_at, updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
-                task.id(), task.userId(), task.taskType(), task.status(), task.originalCommand(),
-                task.targetQuery(), task.platform(), task.chatType(), task.chatId(), task.targetName(),
+                task.id(), task.workflowId(), task.stepKey(), task.stepOrder(), task.stepRole(), task.stepInstruction(),
+                task.dependsOnJson(), task.requiredFactsJson(), task.producesFactsJson(), task.resultJson(),
+                task.activationVersion(), task.userId(), task.taskType(), task.status(), task.originalCommand(),
+                task.sourceExecutionId(), task.targetQuery(), task.platform(), task.chatType(), task.chatId(), task.targetName(),
                 task.objective(), task.successCriteria(), task.deadlineText(), task.confidence(),
                 task.clarificationQuestion(), task.requiresConfirmation(), task.executionMode(),
                 task.progressSummary(), task.stateJson(), task.lastEventId(), timestamp(task.startedAt()),
@@ -64,6 +68,40 @@ public class JdbcDelegatedTaskRepository {
                 id,
                 userId
         ).stream().findFirst();
+    }
+
+    /**
+     * 读取父工作流下的全部步骤，并保持规划顺序稳定。
+     * 执行器只能通过该顺序判断依赖和展示时间线，不能再把每个联系人当成互不相关的任务。
+     */
+    public List<DelegatedTask> findByWorkflowId(String workflowId) {
+        return jdbcTemplate.query("""
+                SELECT * FROM delegated_task
+                WHERE workflow_id = ?
+                ORDER BY step_order ASC, created_at ASC
+                """, rowMapper, workflowId);
+    }
+
+    /**
+     * 按主控台执行 ID 和目标会话读取任务。
+     * 数据库唯一索引与该查询共同保证并发重试时返回已经创建的任务，而不是重复创建。
+     */
+    public Optional<DelegatedTask> findBySourceExecutionAndTarget(
+            String userId,
+            String sourceExecutionId,
+            String platform,
+            String chatType,
+            String chatId
+    ) {
+        return jdbcTemplate.query("""
+                SELECT * FROM delegated_task
+                WHERE user_id = ? AND source_execution_id = ?
+                  AND platform = ? AND chat_type = ? AND chat_id = ?
+                ORDER BY created_at DESC
+                LIMIT 1
+                """, rowMapper, userId, sourceExecutionId, platform, chatType, chatId)
+                .stream()
+                .findFirst();
     }
 
     /**
@@ -181,8 +219,14 @@ public class JdbcDelegatedTaskRepository {
         @Override
         public DelegatedTask mapRow(ResultSet rs, int rowNum) throws SQLException {
             return new DelegatedTask(
-                    rs.getString("id"), rs.getString("user_id"), rs.getString("task_type"),
-                    rs.getString("status"), rs.getString("original_command"), rs.getString("target_query"),
+                    rs.getString("id"), rs.getString("workflow_id"), text(rs, "step_key", ""),
+                    rs.getInt("step_order"), text(rs, "step_role", "ACTION"),
+                    text(rs, "step_instruction", ""), text(rs, "depends_on_json", "[]"),
+                    text(rs, "required_facts_json", "[]"), text(rs, "produces_facts_json", "[]"),
+                    text(rs, "result_json", "{}"), rs.getLong("activation_version"),
+                    rs.getString("user_id"), rs.getString("task_type"),
+                    rs.getString("status"), rs.getString("original_command"), rs.getString("source_execution_id"),
+                    rs.getString("target_query"),
                     rs.getString("platform"), rs.getString("chat_type"), rs.getString("chat_id"),
                     rs.getString("target_name"), rs.getString("objective"), rs.getString("success_criteria"),
                     rs.getString("deadline_text"), rs.getDouble("confidence"),
@@ -193,6 +237,12 @@ public class JdbcDelegatedTaskRepository {
                     rs.getString("completion_report"),
                     rs.getTimestamp("created_at").toInstant(), rs.getTimestamp("updated_at").toInstant()
             );
+        }
+
+        /** 将迁移前历史行的 NULL 字段转换成稳定的领域默认值。 */
+        private static String text(ResultSet rs, String column, String fallback) throws SQLException {
+            String value = rs.getString(column);
+            return value == null ? fallback : value;
         }
     }
 

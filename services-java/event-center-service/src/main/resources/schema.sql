@@ -268,6 +268,7 @@ CREATE TABLE IF NOT EXISTS delegated_task (
     task_type VARCHAR(64) NOT NULL,
     status VARCHAR(64) NOT NULL,
     original_command CLOB NOT NULL,
+    source_execution_id VARCHAR(160) NULL,
     target_query VARCHAR(255) NOT NULL DEFAULT '',
     platform VARCHAR(64) NOT NULL DEFAULT '',
     chat_type VARCHAR(32) NOT NULL DEFAULT '',
@@ -296,3 +297,5 @@ CREATE INDEX IF NOT EXISTS idx_delegated_task_user_status
     ON delegated_task (user_id, status, updated_at);
 CREATE INDEX IF NOT EXISTS idx_delegated_task_conversation_active
     ON delegated_task (user_id, platform, chat_type, chat_id, status, updated_at);
+CREATE UNIQUE INDEX IF NOT EXISTS uk_delegated_task_source_target
+    ON delegated_task (user_id, source_execution_id, platform, chat_type, chat_id);

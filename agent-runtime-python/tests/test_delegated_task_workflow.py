@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import unittest
+from types import SimpleNamespace
 
 from app.schemas.delegated_tasks import (
     ConversationCandidate,
@@ -45,6 +46,20 @@ class ToolCallingLlmClient:
         if "情景一致性审查器" in system_prompt:
             return json.dumps(
                 {"verdict": "APPROVE", "feedback": "", "revisedCandidateMessage": ""},
+                ensure_ascii=False,
+            )
+        if "COMPLETION_REFLECTION" in system_prompt:
+            # 常规工具选择测试并不模拟任务完成，因此完成复核应明确返回“继续执行”。
+            return json.dumps(
+                {
+                    "shouldComplete": False,
+                    "reason": "完成条件尚未满足",
+                    "progressSummary": "继续推进当前任务",
+                    "knownFacts": [],
+                    "pendingConditions": ["等待联系人确认"],
+                    "evidence": [],
+                    "evidenceEventIds": [],
+                },
                 ensure_ascii=False,
             )
 
@@ -97,6 +112,20 @@ class NativeToolCallingLlmClient:
     ) -> str:
         """只允许审查节点调用；规划阶段如果调用到这里，测试会通过记录发现。"""
         self.generate_calls.append({"systemPrompt": system_prompt, "userMessage": user_message})
+        if "COMPLETION_REFLECTION" in system_prompt:
+            # 原生 tool calling 与完成复核是两个独立阶段，测试替身需要同时模拟两者。
+            return json.dumps(
+                {
+                    "shouldComplete": False,
+                    "reason": "完成条件尚未满足",
+                    "progressSummary": "继续推进当前任务",
+                    "knownFacts": [],
+                    "pendingConditions": ["等待联系人确认"],
+                    "evidence": [],
+                    "evidenceEventIds": [],
+                },
+                ensure_ascii=False,
+            )
         return json.dumps(
             {"verdict": "APPROVE", "feedback": "", "revisedCandidateMessage": ""},
             ensure_ascii=False,
@@ -188,9 +217,20 @@ class PreTaskHistoryEventCenterClient:
 class CompletionReflectionLlmClient:
     """先选择继续回复，再由完成复核节点判断任务是否应该结束。"""
 
-    def __init__(self) -> None:
-        # 记录模型调用，确保测试能验证完成复核节点确实参与了决策。
+    def __init__(self, completion_decision: dict | None = None) -> None:
+        # 允许测试按具体会话注入完成判断，同时保留默认课程预约场景。
         self.calls: list[dict] = []
+        self.completion_decision = completion_decision or {
+            "shouldComplete": True,
+            "reason": "联系人已经明确确认课程时间",
+            "progressSummary": "课程时间已确认",
+            "completionReport": "已确认今晚七点到九点上课",
+            "finalMessageInstruction": "今晚见",
+            "knownFacts": ["课程时间为 2026-07-23 晚上七点到九点"],
+            "pendingConditions": [],
+            "evidence": ["好的 明晚七点到九点见", "好的 那就这么定了"],
+            "evidenceEventIds": ["peer-confirm-yesterday", "peer-confirm-today"],
+        }
 
     def is_enabled(self, model_profile=None) -> bool:
         """测试模型始终可用。"""
@@ -211,20 +251,7 @@ class CompletionReflectionLlmClient:
                 ensure_ascii=False,
             )
         if "COMPLETION_REFLECTION" in system_prompt:
-            return json.dumps(
-                {
-                    "shouldComplete": True,
-                    "reason": "联系人已经明确确认课程时间",
-                    "progressSummary": "课程时间已确认",
-                    "completionReport": "已确认今晚七点到九点上课",
-                    "finalMessageInstruction": "今晚见",
-                    "knownFacts": ["课程时间为 2026-07-23 晚上七点到九点"],
-                    "pendingConditions": [],
-                    "evidence": ["好的 明晚七点到九点见", "好的 那就这么定了"],
-                    "evidenceEventIds": ["peer-confirm-yesterday", "peer-confirm-today"],
-                },
-                ensure_ascii=False,
-            )
+            return json.dumps(self.completion_decision, ensure_ascii=False)
         return json.dumps(
             {
                 "tool": "send_qq_message",
@@ -288,6 +315,80 @@ class DelegatedTaskWorkflowTest(unittest.IsolatedAsyncioTestCase):
         """为每个测试创建一套独立的 LangGraph 工作流。"""
         self.workflow = DelegatedTaskWorkflow(DisabledLlmClient())
 
+    def test_timeline_should_only_keep_current_conversation(self) -> None:
+        """同一任务状态混入其他会话时，时间线必须在图入口被隔离。"""
+        task = {
+            "id": "task-private-km",
+            "platform": "qq",
+            "chatType": "private",
+            "chatId": "3807050597",
+            "createdAt": "2026-07-28T10:00:00+08:00",
+            "stateJson": json.dumps(
+                {
+                    "conversationScope": {
+                        "platform": "qq",
+                        "chatType": "private",
+                        "chatId": "3807050597",
+                    },
+                    "timeline": [
+                        {
+                            "eventId": "wrong-conversation",
+                            "platform": "qq",
+                            "chatType": "private",
+                            "chatId": "10002",
+                            "role": "peer",
+                            "text": "小号会话里的内容不应进入 km 的记忆",
+                            "at": "2026-07-28T10:01:00+08:00",
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+        }
+        runtime_input = SimpleNamespace(
+            task=task,
+            history=[
+                {
+                    "eventId": "history-wrong-conversation",
+                    "platform": "qq",
+                    "chatType": "private",
+                    "chatId": "10002",
+                    "role": "peer",
+                    "text": "不能串进当前会话",
+                    "receivedAt": "2026-07-28T10:02:00+08:00",
+                },
+                {
+                    "eventId": "history-current-conversation",
+                    "platform": "qq",
+                    "chatType": "private",
+                    "chatId": "3807050597",
+                    "role": "peer",
+                    "text": "km 会话中的历史消息",
+                    "receivedAt": "2026-07-28T10:03:00+08:00",
+                },
+            ],
+            event={
+                "eventId": "current-conversation-event",
+                "platform": "qq",
+                "chatType": "private",
+                "chatId": "3807050597",
+                "direction": "INBOUND",
+                "actorType": "CONTACT",
+                "text": "当前消息",
+                "receivedAt": "2026-07-28T10:04:00+08:00",
+            },
+        )
+
+        timeline_state = self.workflow._build_timeline({"runtime_input": runtime_input})
+
+        timeline = timeline_state["timeline"]
+        self.assertEqual(("qq", "private", "3807050597"), timeline_state["conversation_scope"])
+        self.assertEqual(
+            {"history-current-conversation", "current-conversation-event"},
+            {row["eventId"] for row in timeline},
+        )
+        self.assertTrue(all(row["chatId"] == "3807050597" for row in timeline))
+
     async def test_workspace_router_should_select_multiple_private_contacts_without_group_marker(self) -> None:
         """主控台 Router 应能把一条自然语言命令拆成多个私聊目标。"""
         candidates = [
@@ -309,6 +410,116 @@ class DelegatedTaskWorkflowTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(["3807050597", "10002"], [item.chat_id for item in result])
         self.assertEqual(["private", "private"], [item.chat_type for item in result])
+
+    async def test_workspace_router_should_match_real_qq_aliases_for_multiple_contacts(self) -> None:
+        """真实 QQ 备注和特殊昵称必须同时参与路由，且不能误选同名群聊。"""
+        candidates = [
+            ConversationCandidate.model_validate(
+                {
+                    "platform": "qq",
+                    "chatType": "private",
+                    "chatId": "2597164807",
+                    "chatName": "小号",
+                    "aliases": ["小号", "freeze", "2597164807"],
+                }
+            ),
+            ConversationCandidate.model_validate(
+                {
+                    "platform": "qq",
+                    "chatType": "private",
+                    "chatId": "3807050597",
+                    "chatName": "㎞",
+                    "aliases": ["㎞", "3807050597"],
+                }
+            ),
+            ConversationCandidate.model_validate(
+                {
+                    "platform": "qq",
+                    "chatType": "group",
+                    "chatId": "777376261",
+                    "chatName": "小号、㎞、哈吉仙",
+                    "aliases": ["小号、㎞、哈吉仙", "777376261"],
+                }
+            ),
+        ]
+
+        result = await self.workflow.resolve_workspace_command_targets(
+            "通知一下小号和km明天晚上有课，别忘记了",
+            candidates,
+        )
+
+        self.assertEqual(["2597164807", "3807050597"], [item.chat_id for item in result])
+        self.assertTrue(all(item.chat_type == "private" for item in result))
+
+    async def test_workspace_router_should_resolve_console_course_notice_to_two_private_contacts(self) -> None:
+        """主控台真实测试命令必须按出现顺序命中两个私聊，不能误选包含同名成员的群聊。"""
+        candidates = [
+            ConversationCandidate.model_validate(
+                {
+                    "platform": "qq",
+                    "chatType": "private",
+                    "chatId": "3807050597",
+                    "chatName": "㎞",
+                    "aliases": ["㎞", "km", "刘畅", "3807050597"],
+                }
+            ),
+            ConversationCandidate.model_validate(
+                {
+                    "platform": "qq",
+                    "chatType": "private",
+                    "chatId": "2597164807",
+                    "chatName": "小号",
+                    "aliases": ["小号", "freeze", "2597164807"],
+                }
+            ),
+            ConversationCandidate.model_validate(
+                {
+                    "platform": "qq",
+                    "chatType": "group",
+                    "chatId": "777376261",
+                    "chatName": "小号、㎞、哈吉仙",
+                    "aliases": ["小号、㎞、哈吉仙", "777376261"],
+                }
+            ),
+        ]
+
+        result = await self.workflow.resolve_workspace_command_targets(
+            "通知 km 和小号今晚有课",
+            candidates,
+        )
+
+        self.assertEqual(["3807050597", "2597164807"], [item.chat_id for item in result])
+        self.assertEqual(["private", "private"], [item.chat_type for item in result])
+
+    async def test_workspace_router_should_resolve_explicit_contact_alias_before_llm(self) -> None:
+        """命令明确给出通讯录备注时，必须优先本地命中，不能依赖模型猜测。"""
+
+        class UnexpectedRouterLlmClient:
+            def is_enabled(self, model_profile=None) -> bool:
+                return True
+
+            async def generate_reply(self, *args, **kwargs) -> str:
+                raise AssertionError("明确联系人不应调用模型路由")
+
+        workflow = DelegatedTaskWorkflow(UnexpectedRouterLlmClient())
+        candidates = [
+            ConversationCandidate.model_validate(
+                {
+                    "platform": "qq",
+                    "chatType": "private",
+                    "chatId": "3807050597",
+                    "chatName": "刘畅",
+                    "aliases": ["km", "刘畅"],
+                }
+            )
+        ]
+
+        result = await workflow.resolve_workspace_command_targets(
+            "问km明天能不能一起吃饭",
+            candidates,
+        )
+
+        self.assertEqual(["3807050597"], [item.chat_id for item in result])
 
     async def test_workspace_router_should_select_group_only_with_group_marker(self) -> None:
         """只有命令显式出现群聊语义时，Router 才应把同名群作为目标。"""
@@ -405,6 +616,32 @@ class DelegatedTaskWorkflowTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(graph_state["taskCreatedAt"])
         self.assertEqual("Asia/Shanghai", graph_state["taskTimezone"])
         self.assertIn("任务创建时解析", graph_state["resolvedTimeText"])
+
+    async def test_should_compile_router_resolved_imperative_notification(self) -> None:
+        """验证 RouterAgent 已确认联系人后，命令式通知可以直接编译为委托任务。"""
+        request = DelegatedTaskCompileRequest.model_validate(
+            {
+                "userId": "user-1",
+                "command": "通知 km 和小号今晚有课",
+                "targetResolvedByRouter": True,
+                "conversations": [
+                    {
+                        "platform": "qq",
+                        "chatType": "private",
+                        "chatId": "3807050597",
+                        "chatName": "㎞",
+                        "aliases": ["㎞", "km", "3807050597"],
+                    }
+                ],
+            }
+        )
+
+        result = await self.workflow.compile_task(request)
+
+        self.assertTrue(result.recognized)
+        self.assertEqual("3807050597", result.chat_id)
+        self.assertEqual("㎞", result.target_name)
+        self.assertEqual("", result.clarification_question)
 
     async def test_should_resolve_ascii_query_against_qq_compatibility_character_name(self) -> None:
         """QQ 昵称为兼容字符“㎞”时，用户输入普通 km 仍应命中该私聊。"""
@@ -749,8 +986,8 @@ class DelegatedTaskWorkflowTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(["peer-answer"], [item["eventId"] for item in state["timeline"]])
         self.assertNotIn("帮我和km约一下明天下午的课程", str(state))
 
-    async def test_action_graph_should_proactively_send_when_task_starts(self) -> None:
-        """任务创建后即使联系人尚未发言，也必须选择发送工具主动开启对话。"""
+    async def test_action_graph_should_not_send_when_model_is_unavailable(self) -> None:
+        """模型不可用时只能保存等待状态，不能以固定模板替用户主动发消息。"""
         action_input = DelegatedTaskActionInput.model_validate(
             {
                 "task": {
@@ -774,12 +1011,12 @@ class DelegatedTaskWorkflowTest(unittest.IsolatedAsyncioTestCase):
 
         result = await self.workflow.decide_action(action_input)
 
-        self.assertEqual("SEND_MESSAGE", result.action)
-        self.assertEqual("send_qq_message", result.requested_tool)
-        self.assertIn("第一条消息", result.message_instruction)
+        self.assertEqual("WAIT", result.action)
+        self.assertEqual("update_delegated_task", result.requested_tool)
+        self.assertEqual("", result.message_instruction)
 
-    async def test_action_graph_should_ignore_old_completion_when_new_task_starts(self) -> None:
-        """新任务启动不能使用旧会话中的收尾表达直接完成，必须先主动联系目标联系人。"""
+    async def test_action_graph_should_not_reuse_old_history_when_model_is_unavailable(self) -> None:
+        """新任务启动且模型不可用时，不得借旧会话或兜底模板产生外发消息。"""
         action_input = DelegatedTaskActionInput.model_validate(
             {
                 "task": {
@@ -812,8 +1049,8 @@ class DelegatedTaskWorkflowTest(unittest.IsolatedAsyncioTestCase):
 
         result = await self.workflow.decide_action(action_input)
 
-        self.assertEqual("SEND_MESSAGE", result.action)
-        self.assertEqual("send_qq_message", result.requested_tool)
+        self.assertEqual("WAIT", result.action)
+        self.assertEqual("update_delegated_task", result.requested_tool)
 
     async def test_runtime_should_not_complete_from_old_history_on_startup(self) -> None:
         """运行时写回同样只能由本轮联系人入站消息完成，启动事件仅记录主动开场状态。"""
@@ -966,7 +1203,9 @@ class DelegatedTaskWorkflowTest(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-        self.assertEqual("SEND_MESSAGE", peer_result.action)
+        # 没有模型明确选择工具时，联系人来信也只能进入等待，不能由程序猜测并代发消息。
+        self.assertEqual("WAIT", peer_result.action)
+        self.assertEqual("update_delegated_task", peer_result.requested_tool)
         self.assertEqual("WAIT", agent_result.action)
 
     async def test_action_graph_should_reply_with_merged_timeline_when_current_event_is_stale(self) -> None:
@@ -1182,8 +1421,8 @@ class DelegatedTaskWorkflowTest(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-        self.assertEqual("SEND_MESSAGE", result.action)
-        self.assertEqual("send_qq_message", result.requested_tool)
+        self.assertEqual("WAIT", result.action)
+        self.assertEqual("update_delegated_task", result.requested_tool)
 
     async def test_action_graph_should_not_treat_agent_echo_as_peer_without_direction(self) -> None:
         """即使 direction 缺失，Agent 自身回显也只能等待，不能形成自动回复循环。"""
@@ -1379,8 +1618,8 @@ class DelegatedTaskWorkflowTest(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-        self.assertEqual("SEND_MESSAGE", result.action)
-        self.assertEqual("send_qq_message", result.requested_tool)
+        self.assertEqual("WAIT", result.action)
+        self.assertEqual("update_delegated_task", result.requested_tool)
 
     async def test_action_graph_should_not_complete_without_model_tool_call(self) -> None:
         """未配置模型时，即使文本看似收尾也只能继续对话，程序不得猜测任务完成。"""
@@ -1407,11 +1646,11 @@ class DelegatedTaskWorkflowTest(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-        self.assertEqual("SEND_MESSAGE", result.action)
-        self.assertEqual("send_qq_message", result.requested_tool)
+        self.assertEqual("WAIT", result.action)
+        self.assertEqual("update_delegated_task", result.requested_tool)
 
-    async def test_action_graph_should_fallback_complete_when_reflection_returns_invalid_json(self) -> None:
-        """完成复核模型不可用时，若任务后上下文已有明确收尾证据，应保守结束主控台任务。"""
+    async def test_action_graph_should_wait_when_reflection_returns_invalid_json(self) -> None:
+        """完成复核模型不可用时必须停止发送，不能继续追问或猜测完成状态。"""
         workflow = DelegatedTaskWorkflow(BrokenCompletionReflectionLlmClient())
         result = await workflow.decide_action(
             DelegatedTaskActionInput.model_validate(
@@ -1457,11 +1696,10 @@ class DelegatedTaskWorkflowTest(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-        self.assertEqual("COMPLETE_TASK", result.action)
-        self.assertEqual("complete_delegated_task", result.requested_tool)
+        self.assertEqual("WAIT", result.action)
+        self.assertEqual("update_delegated_task", result.requested_tool)
         self.assertEqual("", result.message_instruction)
-        self.assertIn("好的 那明晚七点到九点见", result.completion_report)
-        self.assertIn("好的 那明晚七点到九点见", result.evidence)
+        self.assertIn("完成状态复核", result.reason)
 
     async def test_action_graph_should_not_fallback_complete_counteroffer_question(self) -> None:
         """完成复核失败时，仍在反问或协商的消息不能被兜底逻辑误判为完成。"""
@@ -1499,8 +1737,8 @@ class DelegatedTaskWorkflowTest(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-        self.assertEqual("SEND_MESSAGE", result.action)
-        self.assertEqual("send_qq_message", result.requested_tool)
+        self.assertEqual("WAIT", result.action)
+        self.assertEqual("update_delegated_task", result.requested_tool)
 
     async def test_action_graph_should_reject_completion_with_stale_evidence(self) -> None:
         """模型若只引用任务创建前的旧联系人消息，程序必须拒绝结束。"""
@@ -1697,7 +1935,7 @@ class DelegatedTaskWorkflowTest(unittest.IsolatedAsyncioTestCase):
             ["好的 明晚七点到九点见", "好的 那就这么定了"],
             [item["text"] for item in model_payload["conversationTimeline"]],
         )
-        self.assertIn("到了目标日期当天应说‘今晚’", llm_client.calls[-1]["systemPrompt"])
+        self.assertIn("相对时间表述必须结合消息时间戳", llm_client.calls[-1]["systemPrompt"])
 
 
     async def test_should_observe_pre_task_history_inside_react_graph_before_replanning(self) -> None:
@@ -1809,6 +2047,83 @@ class DelegatedTaskWorkflowTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("complete_delegated_task", result.requested_tool)
         self.assertEqual("今晚见", result.message_instruction)
         self.assertIn("peer-confirm-today", result.tool_arguments.get("evidenceEventIds", []))
+        self.assertTrue(any("COMPLETION_REFLECTION" in item["systemPrompt"] for item in llm_client.calls))
+
+    async def test_action_graph_should_finish_confirmed_game_invitation_without_reopening_topic(self) -> None:
+        """双方已接受邀约且联系人明确收尾时，应结束任务而不是再次询问同一安排。"""
+        llm_client = CompletionReflectionLlmClient(
+            {
+                "shouldComplete": True,
+                "outcome": "SUCCESS",
+                "reason": "双方已经接受同一时间的邀约，联系人随后明确确认见面",
+                "progressSummary": "今晚十点的游戏邀约已经确认",
+                "completionReport": "已约好今晚十点一起玩游戏",
+                "finalMessageInstruction": "",
+                "knownFacts": ["双方约定今晚十点一起玩游戏"],
+                "pendingConditions": [],
+                "evidence": ["今晚十点三角洲 来不来", "好 十点见"],
+                "evidenceEventIds": ["peer-invite", "peer-final-confirm"],
+            }
+        )
+        workflow = DelegatedTaskWorkflow(llm_client)
+
+        result = await workflow.decide_action(
+            DelegatedTaskActionInput.model_validate(
+                {
+                    "task": {
+                        "id": "task-game-invitation",
+                        "createdAt": "2026-07-28T20:10:00+08:00",
+                        "objective": "和联系人约今晚十点一起玩游戏",
+                        "successCriteria": "双方明确接受今晚十点的邀约",
+                        "deadlineText": "今晚十点",
+                        "stateJson": json.dumps(
+                            {
+                                "taskCreatedAt": "2026-07-28T20:10:00+08:00",
+                                "taskTimezone": "Asia/Shanghai",
+                                "timeline": [
+                                    {
+                                        "eventId": "peer-invite",
+                                        "at": "2026-07-28T20:15:00+08:00",
+                                        "speaker": "对方",
+                                        "text": "今晚十点三角洲 来不来",
+                                        "eventType": "message",
+                                        "direction": "INBOUND",
+                                        "actorType": "CONTACT",
+                                        "messageOrigin": "PLATFORM",
+                                    },
+                                    {
+                                        "eventId": "owner-accept",
+                                        "at": "2026-07-28T20:16:00+08:00",
+                                        "speaker": "我方",
+                                        "text": "可以",
+                                        "eventType": "message",
+                                        "direction": "OUTBOUND",
+                                        "actorType": "ACCOUNT_OWNER",
+                                        "messageOrigin": "AGENT",
+                                    },
+                                ],
+                            },
+                            ensure_ascii=False,
+                        ),
+                    },
+                    "history": [],
+                    "event": {
+                        "eventId": "peer-final-confirm",
+                        "eventType": "message",
+                        "sentAt": "2026-07-28T20:17:00+08:00",
+                        "direction": "INBOUND",
+                        "actorType": "CONTACT",
+                        "messageOrigin": "PLATFORM",
+                        "text": "好 十点见",
+                    },
+                }
+            )
+        )
+
+        self.assertEqual("COMPLETE_TASK", result.action)
+        self.assertEqual("complete_delegated_task", result.requested_tool)
+        self.assertEqual("", result.message_instruction)
+        self.assertIn("peer-final-confirm", result.tool_arguments.get("evidenceEventIds", []))
         self.assertTrue(any("COMPLETION_REFLECTION" in item["systemPrompt"] for item in llm_client.calls))
 
     def test_completion_validation_should_accept_persisted_peer_evidence_when_current_event_is_not_peer(self) -> None:

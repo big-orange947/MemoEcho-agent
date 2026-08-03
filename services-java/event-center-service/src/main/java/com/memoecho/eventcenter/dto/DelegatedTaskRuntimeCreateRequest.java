@@ -10,6 +10,7 @@ import jakarta.validation.constraints.NotNull;
  */
 public record DelegatedTaskRuntimeCreateRequest(
         @NotBlank String command,
+        String executionId,
         @NotNull @Valid DelegatedTaskCompilationResponse compilation
 ) {
 }
