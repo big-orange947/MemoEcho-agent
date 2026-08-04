@@ -35,7 +35,7 @@ public class JdbcDelegatedTaskRepository {
                             deadline_text, confidence, clarification_question, requires_confirmation,
                             execution_mode, progress_summary, state_json, last_event_id, started_at,
                             completed_at, completion_report, created_at, updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                 task.id(), task.workflowId(), task.stepKey(), task.stepOrder(), task.stepRole(), task.stepInstruction(),
                 task.dependsOnJson(), task.requiredFactsJson(), task.producesFactsJson(), task.resultJson(),
@@ -212,6 +212,44 @@ public class JdbcDelegatedTaskRepository {
                 """, status, progressSummary, stateJson, lastEventId, completionReport,
                 Timestamp.from(now), terminal, Timestamp.from(now), Timestamp.from(now), id, userId);
         return findByIdAndUserId(id, userId);
+    }
+
+    /**
+     * 仅允许 ACTIVE 步骤完成一次。
+     * 返回 0 表示步骤已被其他回调推进，调用方必须重新读取状态而不能重复执行副作用。
+     */
+    public int completeWorkflowStep(
+            String workflowId,
+            String stepKey,
+            String userId,
+            String resultJson,
+            String progressSummary,
+            Instant completedAt
+    ) {
+        return jdbcTemplate.update("""
+                UPDATE delegated_task
+                SET status = 'COMPLETED', result_json = ?, progress_summary = ?,
+                    completion_report = ?, completed_at = ?, updated_at = ?
+                WHERE workflow_id = ? AND step_key = ? AND user_id = ? AND status = 'ACTIVE'
+                """, resultJson, progressSummary, progressSummary, Timestamp.from(completedAt),
+                Timestamp.from(completedAt), workflowId, stepKey, userId);
+    }
+
+    /** 依赖和事实均满足时，将 BLOCKED 步骤幂等激活。 */
+    public int activateWorkflowStep(
+            String workflowId,
+            String stepKey,
+            String userId,
+            String progressSummary,
+            Instant startedAt
+    ) {
+        return jdbcTemplate.update("""
+                UPDATE delegated_task
+                SET status = 'ACTIVE', progress_summary = ?, started_at = COALESCE(started_at, ?),
+                    activation_version = activation_version + 1, updated_at = ?
+                WHERE workflow_id = ? AND step_key = ? AND user_id = ? AND status = 'BLOCKED'
+                """, progressSummary, Timestamp.from(startedAt), Timestamp.from(startedAt),
+                workflowId, stepKey, userId);
     }
 
     /** 将数据库行恢复成领域对象。 */

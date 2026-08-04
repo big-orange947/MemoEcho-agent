@@ -4,6 +4,7 @@ import com.memoecho.eventcenter.dto.DelegatedTaskResponse;
 import com.memoecho.eventcenter.dto.WorkspaceCommandResponse;
 import com.memoecho.eventcenter.service.LocalUserContextResolver;
 import com.memoecho.eventcenter.service.DelegatedTaskApplicationService;
+import com.memoecho.eventcenter.service.DelegatedWorkflowApplicationService;
 import com.memoecho.eventcenter.service.WorkspaceCommandApplicationService;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -32,6 +33,9 @@ class InternalWorkspaceCommandControllerTest {
 
     @MockBean
     private DelegatedTaskApplicationService delegatedTaskApplicationService;
+
+    @MockBean
+    private DelegatedWorkflowApplicationService delegatedWorkflowApplicationService;
 
     @MockBean
     private LocalUserContextResolver userContextResolver;

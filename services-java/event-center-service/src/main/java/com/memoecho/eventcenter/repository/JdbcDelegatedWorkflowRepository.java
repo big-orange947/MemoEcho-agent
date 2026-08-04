@@ -8,6 +8,7 @@ import org.springframework.stereotype.Repository;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Timestamp;
+import java.time.Instant;
 import java.util.List;
 import java.util.Optional;
 
@@ -44,6 +45,36 @@ public class JdbcDelegatedWorkflowRepository {
         return jdbcTemplate.query(
                 "SELECT * FROM delegated_workflow WHERE id = ? AND user_id = ?",
                 rowMapper, id, userId).stream().findFirst();
+    }
+
+    /**
+     * 锁定父工作流，串行化同一工作流的步骤完成回调。
+     * 数据库行锁只在上层事务中有效，用于避免并发回调重复解锁后继步骤。
+     */
+    public Optional<DelegatedWorkflow> findByIdAndUserIdForUpdate(String id, String userId) {
+        return jdbcTemplate.query(
+                "SELECT * FROM delegated_workflow WHERE id = ? AND user_id = ? FOR UPDATE",
+                rowMapper, id, userId).stream().findFirst();
+    }
+
+    /** 更新父工作流运行态、共享事实和终态时间。 */
+    public int updateRuntimeState(
+            String id,
+            String userId,
+            String status,
+            String factsJson,
+            String progressSummary,
+            String failureReason,
+            Instant updatedAt,
+            Instant completedAt
+    ) {
+        return jdbcTemplate.update("""
+                UPDATE delegated_workflow
+                SET status = ?, facts_json = ?, progress_summary = ?, failure_reason = ?,
+                    updated_at = ?, completed_at = ?
+                WHERE id = ? AND user_id = ?
+                """, status, factsJson, progressSummary, failureReason,
+                Timestamp.from(updatedAt), completedAt == null ? null : Timestamp.from(completedAt), id, userId);
     }
 
     /** 按主控台执行 ID 查询，用于 HTTP 重试和客户端重复点击的幂等复用。 */

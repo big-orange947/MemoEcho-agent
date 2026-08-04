@@ -262,8 +262,40 @@ CREATE UNIQUE INDEX IF NOT EXISTS uk_cognition_card_scope
 CREATE INDEX IF NOT EXISTS idx_cognition_card_user_updated
     ON conversation_cognition_card (user_id, updated_at);
 
+CREATE TABLE IF NOT EXISTS delegated_workflow (
+    id VARCHAR(64) PRIMARY KEY,
+    user_id VARCHAR(128) NOT NULL,
+    source_execution_id VARCHAR(160) NULL,
+    original_command CLOB NOT NULL,
+    title VARCHAR(255) NOT NULL DEFAULT '',
+    workflow_type VARCHAR(32) NOT NULL,
+    status VARCHAR(32) NOT NULL,
+    plan_json CLOB NOT NULL,
+    facts_json CLOB NOT NULL,
+    progress_summary CLOB NOT NULL,
+    failure_reason CLOB NOT NULL,
+    created_at TIMESTAMP NOT NULL,
+    updated_at TIMESTAMP NOT NULL,
+    completed_at TIMESTAMP NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uk_delegated_workflow_execution
+    ON delegated_workflow (user_id, source_execution_id);
+CREATE INDEX IF NOT EXISTS idx_delegated_workflow_user_status
+    ON delegated_workflow (user_id, status, updated_at);
+
 CREATE TABLE IF NOT EXISTS delegated_task (
     id VARCHAR(64) PRIMARY KEY,
+    workflow_id VARCHAR(64) NULL,
+    step_key VARCHAR(128) NOT NULL DEFAULT '',
+    step_order INT NOT NULL DEFAULT 0,
+    step_role VARCHAR(32) NOT NULL DEFAULT 'ACTION',
+    step_instruction CLOB NULL,
+    depends_on_json CLOB NULL,
+    required_facts_json CLOB NULL,
+    produces_facts_json CLOB NULL,
+    result_json CLOB NULL,
+    activation_version BIGINT NOT NULL DEFAULT 0,
     user_id VARCHAR(128) NOT NULL,
     task_type VARCHAR(64) NOT NULL,
     status VARCHAR(64) NOT NULL,
@@ -288,7 +320,9 @@ CREATE TABLE IF NOT EXISTS delegated_task (
     completed_at TIMESTAMP NULL,
     completion_report CLOB NOT NULL DEFAULT '',
     created_at TIMESTAMP NOT NULL,
-    updated_at TIMESTAMP NOT NULL
+    updated_at TIMESTAMP NOT NULL,
+    CONSTRAINT fk_delegated_task_workflow
+        FOREIGN KEY (workflow_id) REFERENCES delegated_workflow(id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_delegated_task_user_created
@@ -299,3 +333,7 @@ CREATE INDEX IF NOT EXISTS idx_delegated_task_conversation_active
     ON delegated_task (user_id, platform, chat_type, chat_id, status, updated_at);
 CREATE UNIQUE INDEX IF NOT EXISTS uk_delegated_task_source_target
     ON delegated_task (user_id, source_execution_id, platform, chat_type, chat_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uk_delegated_task_workflow_step
+    ON delegated_task (workflow_id, step_key);
+CREATE INDEX IF NOT EXISTS idx_delegated_task_workflow_status
+    ON delegated_task (workflow_id, status, step_order);

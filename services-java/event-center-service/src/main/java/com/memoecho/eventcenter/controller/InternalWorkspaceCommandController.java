@@ -9,7 +9,11 @@ import com.memoecho.eventcenter.dto.DelegatedTaskEventClaimResponse;
 import com.memoecho.eventcenter.dto.DelegatedTaskEventCompleteRequest;
 import com.memoecho.eventcenter.dto.DelegatedTaskRuntimeCreateRequest;
 import com.memoecho.eventcenter.dto.DelegatedTaskRuntimeUpdateRequest;
+import com.memoecho.eventcenter.dto.DelegatedWorkflowCreateRequest;
+import com.memoecho.eventcenter.dto.DelegatedWorkflowResponse;
+import com.memoecho.eventcenter.dto.DelegatedWorkflowStepCompleteRequest;
 import com.memoecho.eventcenter.service.DelegatedTaskApplicationService;
+import com.memoecho.eventcenter.service.DelegatedWorkflowApplicationService;
 import com.memoecho.eventcenter.service.LocalUserContextResolver;
 import com.memoecho.eventcenter.service.WorkspaceCommandApplicationService;
 import jakarta.validation.Valid;
@@ -31,6 +35,7 @@ public class InternalWorkspaceCommandController {
 
     private final WorkspaceCommandApplicationService applicationService;
     private final DelegatedTaskApplicationService delegatedTaskApplicationService;
+    private final DelegatedWorkflowApplicationService delegatedWorkflowApplicationService;
     private final LocalUserContextResolver userContextResolver;
 
     /**
@@ -39,10 +44,12 @@ public class InternalWorkspaceCommandController {
     public InternalWorkspaceCommandController(
             WorkspaceCommandApplicationService applicationService,
             DelegatedTaskApplicationService delegatedTaskApplicationService,
+            DelegatedWorkflowApplicationService delegatedWorkflowApplicationService,
             LocalUserContextResolver userContextResolver
     ) {
         this.applicationService = applicationService;
         this.delegatedTaskApplicationService = delegatedTaskApplicationService;
+        this.delegatedWorkflowApplicationService = delegatedWorkflowApplicationService;
         this.userContextResolver = userContextResolver;
     }
 
@@ -154,6 +161,61 @@ public class InternalWorkspaceCommandController {
         String resolvedUserId = userContextResolver.resolveRuntimeUser(runtimeToken, userId);
         return ResponseEntity.ok(delegatedTaskApplicationService.createCompiled(
                 resolvedUserId, request.command(), request.executionId(), request.compilation()));
+    }
+
+    /**
+     * Runtime 提交一条主控台命令生成的完整工作流。Java 会在一次事务内校验 DAG、联系人和事实依赖。
+     */
+    @PostMapping("/delegated-workflows/runtime")
+    public ResponseEntity<DelegatedWorkflowResponse> createDelegatedWorkflowFromRuntime(
+            @RequestHeader("X-Memo-Echo-Runtime-Token") String runtimeToken,
+            @RequestHeader("X-Memo-Echo-User-Id") String userId,
+            @Valid @RequestBody DelegatedWorkflowCreateRequest request
+    ) {
+        String resolvedUserId = userContextResolver.resolveRuntimeUser(runtimeToken, userId);
+        return ResponseEntity.ok(delegatedWorkflowApplicationService.create(resolvedUserId, request));
+    }
+
+    /**
+     * Runtime 回报步骤完成结果。服务层会原子合并事实、解锁后继步骤并判断父工作流是否结束。
+     */
+    @PostMapping("/delegated-workflows/{workflowId}/steps/{stepKey}/complete")
+    public ResponseEntity<DelegatedWorkflowResponse> completeDelegatedWorkflowStep(
+            @RequestHeader("X-Memo-Echo-Runtime-Token") String runtimeToken,
+            @RequestHeader("X-Memo-Echo-User-Id") String userId,
+            @PathVariable String workflowId,
+            @PathVariable String stepKey,
+            @Valid @RequestBody DelegatedWorkflowStepCompleteRequest request
+    ) {
+        String resolvedUserId = userContextResolver.resolveRuntimeUser(runtimeToken, userId);
+        return ResponseEntity.ok(delegatedWorkflowApplicationService.completeStep(
+                resolvedUserId, workflowId, stepKey, request));
+    }
+
+    /**
+     * 查询当前用户最近的父工作流，供客户端按“一条命令一张卡片”展示执行进度。
+     */
+    @GetMapping("/delegated-workflows")
+    public ResponseEntity<List<DelegatedWorkflowResponse>> listDelegatedWorkflows(
+            @RequestHeader(name = "Authorization", required = false) String authorization,
+            @RequestHeader(name = "X-Memo-Echo-User-Id", defaultValue = "local-user") String userId,
+            @RequestParam(defaultValue = "20") int limit
+    ) {
+        String resolvedUserId = userContextResolver.resolve(authorization, userId);
+        return ResponseEntity.ok(delegatedWorkflowApplicationService.list(resolvedUserId, limit));
+    }
+
+    /**
+     * 读取单个父工作流及其有序步骤，用户归属在服务层再次校验。
+     */
+    @GetMapping("/delegated-workflows/{workflowId}")
+    public ResponseEntity<DelegatedWorkflowResponse> getDelegatedWorkflow(
+            @RequestHeader(name = "Authorization", required = false) String authorization,
+            @RequestHeader(name = "X-Memo-Echo-User-Id", defaultValue = "local-user") String userId,
+            @PathVariable String workflowId
+    ) {
+        String resolvedUserId = userContextResolver.resolve(authorization, userId);
+        return ResponseEntity.ok(delegatedWorkflowApplicationService.get(resolvedUserId, workflowId));
     }
 
     /** 用户确认任务后仅进入待执行队列，不在 HTTP 请求中直接发送外部消息。 */
