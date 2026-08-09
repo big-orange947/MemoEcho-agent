@@ -5,7 +5,7 @@ import unittest
 from types import SimpleNamespace
 
 from app.memory.manager import MemoryManager
-from app.orchestrator.service import OrchestratorService
+from app.orchestrator.service import DelegatedWorkflowCompletionError, OrchestratorService
 from app.planner.service import PlannerService
 from app.router.service import RouterService
 from app.schemas.events import Sender, UnifiedEvent
@@ -104,6 +104,8 @@ class DummyEventCenterServiceClient:
         self.delegated_event_claim_allowed = True
         self.delegated_event_claims: list[dict] = []
         self.delegated_event_completions: list[dict] = []
+        self.delegated_workflow_completions: list[dict] = []
+        self.delegated_workflow_completion_error: Exception | None = None
 
     async def match_conversation_profile(self, event: UnifiedEvent, route: str) -> ConversationProfileMatchResult | None:
         # 这个函数的作用是模拟设定集匹配接口，并记录参与匹配的消息和预判 route。
@@ -181,6 +183,30 @@ class DummyEventCenterServiceClient:
                 "claimToken": claim_token,
             }
         )
+
+    async def complete_delegated_workflow_step(
+        self,
+        event: UnifiedEvent,
+        workflow_id: str,
+        step_key: str,
+        *,
+        produced_facts: dict,
+        result_summary: str,
+        result: object,
+    ) -> dict:
+        """模拟父工作流步骤完成接口，并支持注入回调异常验证消息重试。"""
+        if self.delegated_workflow_completion_error is not None:
+            raise self.delegated_workflow_completion_error
+        completion = {
+            "eventId": event.event_id,
+            "workflowId": workflow_id,
+            "stepKey": step_key,
+            "producedFacts": produced_facts,
+            "resultSummary": result_summary,
+            "result": result,
+        }
+        self.delegated_workflow_completions.append(completion)
+        return {"id": workflow_id, "status": "RUNNING"}
 
 
 class DummyDelegatedTaskRuntimeTool:
@@ -855,10 +881,6 @@ class OrchestratorWriteBackTest(unittest.IsolatedAsyncioTestCase):
             event_center_client=event_center_client,
         )
         service.delegated_task_workflow = WorkspaceCommandWorkflow()
-        started_tasks: list[tuple[str, dict, str | None]] = []
-        service._trigger_delegated_task_start = (
-            lambda user_id, task, execution_id=None: started_tasks.append((user_id, task, execution_id))
-        )
         event = UnifiedEvent(
             eventId="desktop:command:workspace-create-task",
             platform="desktop",
@@ -879,9 +901,8 @@ class OrchestratorWriteBackTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.status, "success")
         self.assertEqual(result.final_reply, "已创建 1 个委托任务，正在开始执行")
         self.assertEqual(result.write_back_actions, ["delegated_task_created:1"])
-        self.assertEqual(len(started_tasks), 1)
-        self.assertEqual(started_tasks[0][0], "freeze")
-        self.assertEqual(started_tasks[0][2], "desktop-e2e-001")
+        # 委托任务的首次执行统一由 Java outbox 激活，Python 不再维护本地异步启动旁路。
+        self.assertFalse(hasattr(service, "_trigger_delegated_task_start"))
         self.assertEqual(event_center_client.created_execution_ids, ["desktop-e2e-001"])
 
     async def test_workspace_command_should_create_and_start_one_task_per_private_contact(self) -> None:
@@ -973,12 +994,6 @@ class OrchestratorWriteBackTest(unittest.IsolatedAsyncioTestCase):
             event_center_client=event_center_client,
         )
         service.delegated_task_workflow = MultiContactWorkflow()
-        started_tasks: list[tuple[str, str, str | None]] = []
-        service._trigger_delegated_task_start = (
-            lambda user_id, task, execution_id=None: started_tasks.append(
-                (user_id, str(task["chatId"]), execution_id)
-            )
-        )
         event = UnifiedEvent(
             eventId="desktop:command:notify-course",
             platform="desktop",
@@ -1004,12 +1019,11 @@ class OrchestratorWriteBackTest(unittest.IsolatedAsyncioTestCase):
             [str(task["chatId"]) for task in event_center_client.created_tasks],
         )
         self.assertEqual(
-            [
-                ("freeze", "3807050597", "desktop-notify-course-001"),
-                ("freeze", "2597164807", "desktop-notify-course-001"),
-            ],
-            started_tasks,
+            ["desktop-notify-course-001", "desktop-notify-course-001"],
+            [task["sourceExecutionId"] for task in event_center_client.created_tasks],
         )
+        # 多联系人任务同样只负责持久化，不能在 Python 进程内重复触发首次执行。
+        self.assertFalse(hasattr(service, "_trigger_delegated_task_start"))
 
     async def test_should_intersect_profile_tools_with_skill_tool_policy(self) -> None:
         # 这个测试函数的作用是验证会话 profile 的工具白名单会和 skill 自带的工具白名单取交集，避免暴露越权工具。
@@ -1574,6 +1588,170 @@ class OrchestratorWriteBackTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(response)
         self.assertEqual("ACTIVE", response["status"])
         self.assertEqual("ACTIVE", event_center_client.delegated_runtime_updates[-1]["status"])
+
+    async def test_should_complete_parent_workflow_step_with_declared_facts_only(self) -> None:
+        """子任务完成时只向父工作流提交步骤声明的事实，不泄漏临时推理状态。"""
+        event_center_client = DummyEventCenterServiceClient()
+        service = OrchestratorService(
+            router=RouterService(),
+            planner=PlannerService(),
+            tools=ToolRegistry(),
+            memory=MemoryManager(),
+            slow_channel_buffer=SlowChannelBuffer(window_seconds=600, max_messages=10),
+            event_center_client=event_center_client,
+        )
+        event = UnifiedEvent(
+            eventId="qq:message:private:workflow-complete",
+            platform="qq",
+            scene="life",
+            eventType="message",
+            chatType="private",
+            chatId="3807050597",
+            sender=Sender(id="3807050597", name="km", role=None),
+            text="今晚七点可以",
+            attachments=[],
+            mentions=[],
+            timestamp="2026-08-08T18:30:00+08:00",
+            rawPayload={"userId": "freeze", "messageOrigin": "EXTERNAL"},
+        )
+        decision = SimpleNamespace(
+            action="COMPLETE_TASK",
+            requested_tool="complete_delegated_task",
+            progress_summary="已确认课程时间",
+            completion_report="km 确认今晚七点可以上课",
+            state_json=(
+                '{"producedFacts":{"scheduled_time":"2026-08-08T19:00:00+08:00",'
+                '"contact_name":"km","internal_note":"不要提交"}}'
+            ),
+            evidence=["对方回复今晚七点可以"],
+        )
+        task = {
+            "id": "child-task-001",
+            "workflowId": "workflow-001",
+            "stepKey": "collect-course-time",
+            "producesFacts": ["scheduled_time", "contact_name"],
+        }
+
+        response = await service._persist_delegated_task_decision(
+            event=event,
+            task=task,
+            decision=decision,
+        )
+
+        self.assertEqual("workflow-001", response["id"])
+        self.assertEqual(1, len(event_center_client.delegated_workflow_completions))
+        completion = event_center_client.delegated_workflow_completions[0]
+        self.assertEqual(
+            {
+                "scheduled_time": "2026-08-08T19:00:00+08:00",
+                "contact_name": "km",
+            },
+            completion["producedFacts"],
+        )
+        self.assertNotIn("internal_note", completion["producedFacts"])
+
+    async def test_should_reject_parent_workflow_completion_when_declared_fact_is_missing(self) -> None:
+        """父步骤要求的事实不完整时保持子任务可重试，不能误推进依赖步骤。"""
+        event_center_client = DummyEventCenterServiceClient()
+        service = OrchestratorService(
+            router=RouterService(),
+            planner=PlannerService(),
+            tools=ToolRegistry(),
+            memory=MemoryManager(),
+            slow_channel_buffer=SlowChannelBuffer(window_seconds=600, max_messages=10),
+            event_center_client=event_center_client,
+        )
+        event = UnifiedEvent(
+            eventId="qq:message:private:workflow-missing-fact",
+            platform="qq",
+            scene="life",
+            eventType="message",
+            chatType="private",
+            chatId="3807050597",
+            sender=Sender(id="3807050597", name="km", role=None),
+            text="可以",
+            attachments=[],
+            mentions=[],
+            timestamp="2026-08-08T18:31:00+08:00",
+            rawPayload={"userId": "freeze", "messageOrigin": "EXTERNAL"},
+        )
+        decision = SimpleNamespace(
+            action="COMPLETE_TASK",
+            requested_tool="complete_delegated_task",
+            progress_summary="尝试完成",
+            completion_report="",
+            state_json='{"producedFacts":{"contact_name":"km"}}',
+            evidence=[],
+        )
+        task = {
+            "id": "child-task-002",
+            "workflowId": "workflow-001",
+            "stepKey": "collect-course-time",
+            "producesFacts": ["scheduled_time", "contact_name"],
+        }
+
+        with self.assertRaisesRegex(
+            DelegatedWorkflowCompletionError,
+            "scheduled_time",
+        ):
+            await service._persist_delegated_task_decision(
+                event=event,
+                task=task,
+                decision=decision,
+            )
+
+        self.assertEqual([], event_center_client.delegated_workflow_completions)
+
+    async def test_should_surface_parent_workflow_callback_failure_for_message_retry(self) -> None:
+        """父工作流回调失败必须向上抛出，让消息基础设施重试而不是静默丢失完成事件。"""
+        event_center_client = DummyEventCenterServiceClient()
+        event_center_client.delegated_workflow_completion_error = RuntimeError("event center unavailable")
+        service = OrchestratorService(
+            router=RouterService(),
+            planner=PlannerService(),
+            tools=ToolRegistry(),
+            memory=MemoryManager(),
+            slow_channel_buffer=SlowChannelBuffer(window_seconds=600, max_messages=10),
+            event_center_client=event_center_client,
+        )
+        event = UnifiedEvent(
+            eventId="qq:message:private:workflow-callback-failed",
+            platform="qq",
+            scene="life",
+            eventType="message",
+            chatType="private",
+            chatId="3807050597",
+            sender=Sender(id="3807050597", name="km", role=None),
+            text="今晚七点可以",
+            attachments=[],
+            mentions=[],
+            timestamp="2026-08-08T18:32:00+08:00",
+            rawPayload={"userId": "freeze", "messageOrigin": "EXTERNAL"},
+        )
+        decision = SimpleNamespace(
+            action="COMPLETE_TASK",
+            requested_tool="complete_delegated_task",
+            progress_summary="已确认课程时间",
+            completion_report="已确认",
+            state_json='{"producedFacts":{"scheduled_time":"2026-08-08T19:00:00+08:00"}}',
+            evidence=["对方明确确认"],
+        )
+        task = {
+            "id": "child-task-003",
+            "workflowId": "workflow-001",
+            "stepKey": "collect-course-time",
+            "producesFacts": ["scheduled_time"],
+        }
+
+        with self.assertRaisesRegex(
+            DelegatedWorkflowCompletionError,
+            "父工作流步骤完成回调失败",
+        ):
+            await service._persist_delegated_task_decision(
+                event=event,
+                task=task,
+                decision=decision,
+            )
 
 
 if __name__ == "__main__":

@@ -9,6 +9,10 @@ from app.schemas.conversation_progress import ConversationProgressRequest, Conve
 from app.schemas.conversation_cognition import ConversationCognitionRequest, ConversationCognitionResponse
 from app.schemas.events import UnifiedEvent
 from app.schemas.delegated_tasks import DelegatedTaskCompileRequest, DelegatedTaskCompileResponse
+from app.schemas.delegated_workflows import (
+    DelegatedWorkflowStepExecutionRequest,
+    DelegatedWorkflowStepExecutionResponse,
+)
 from app.schemas.results import OrchestratorResult
 from app.schemas.group_operations import (
     GroupOperationApprovalResponse,
@@ -110,6 +114,17 @@ async def compile_delegated_task(
             # Event Center 或模型配置暂时不可用时继续走图内保守规则，不阻断用户创建任务。
             logger.warning("委托任务模型解析失败，改用本地规则。error=%s", type(exception).__name__)
     return await orchestrator.delegated_task_workflow.compile_task(request, model_profile)
+
+
+@app.post(
+    "/v1/delegated-workflows/steps/execute",
+    response_model=DelegatedWorkflowStepExecutionResponse,
+)
+async def execute_delegated_workflow_step(
+    request: DelegatedWorkflowStepExecutionRequest,
+) -> DelegatedWorkflowStepExecutionResponse:
+    """消费 Java outbox 的显式步骤触发，过期激活版本只确认消费而不产生副作用。"""
+    return await orchestrator.execute_delegated_workflow_step(request)
 
 
 @app.post("/v1/conversations/progress", response_model=ConversationProgressResponse)

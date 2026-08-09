@@ -7,6 +7,7 @@ import com.memoecho.eventcenter.model.DelegatedTask;
 import com.memoecho.eventcenter.model.DelegatedWorkflow;
 import com.memoecho.eventcenter.repository.JdbcDelegatedTaskRepository;
 import com.memoecho.eventcenter.repository.JdbcDelegatedWorkflowRepository;
+import com.memoecho.eventcenter.repository.JdbcDelegatedWorkflowStepDispatchRepository;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 
@@ -34,11 +35,13 @@ class DelegatedWorkflowApplicationServiceTest {
     private final JdbcDelegatedWorkflowRepository workflowRepository =
             mock(JdbcDelegatedWorkflowRepository.class);
     private final JdbcDelegatedTaskRepository taskRepository = mock(JdbcDelegatedTaskRepository.class);
+    private final JdbcDelegatedWorkflowStepDispatchRepository dispatchRepository =
+            mock(JdbcDelegatedWorkflowStepDispatchRepository.class);
     private final DelegatedTaskApplicationService taskApplicationService =
             mock(DelegatedTaskApplicationService.class);
     private final ObjectMapper objectMapper = new ObjectMapper().findAndRegisterModules();
     private final DelegatedWorkflowApplicationService service = new DelegatedWorkflowApplicationService(
-            workflowRepository, taskRepository, taskApplicationService, objectMapper);
+            workflowRepository, taskRepository, dispatchRepository, taskApplicationService, objectMapper);
 
     /**
      * 验证根步骤完成后，共享事实会写回父工作流，并且满足依赖和事实条件的后继步骤会被激活。
@@ -85,6 +88,9 @@ class DelegatedWorkflowApplicationServiceTest {
                 contains("1/2"), eq(""), any(Instant.class), isNull());
         verify(taskRepository).activateWorkflowStep(
                 eq(WORKFLOW_ID), eq("notify_contact"), eq(USER_ID), any(), any(Instant.class));
+        verify(dispatchRepository).enqueue(
+                eq(WORKFLOW_ID), eq("notify_contact"), eq(1L),
+                eq("task-notify_contact"), eq(USER_ID), any(Instant.class));
         assertThat(objectMapper.readTree(factsCaptor.getValue()).path("availability").asText())
                 .isEqualTo("晚上七点");
         assertThat(response.status()).isEqualTo("RUNNING");

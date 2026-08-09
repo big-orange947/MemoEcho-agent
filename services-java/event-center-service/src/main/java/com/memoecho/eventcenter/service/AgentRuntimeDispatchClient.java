@@ -6,6 +6,7 @@ import com.memoecho.eventcenter.dto.DispatchResult;
 import com.memoecho.eventcenter.dto.ConversationMessageResponse;
 import com.memoecho.eventcenter.dto.ConversationSummaryResponse;
 import com.memoecho.eventcenter.dto.DelegatedTaskCompilationResponse;
+import com.memoecho.eventcenter.dto.DelegatedWorkflowStepExecutionRequest;
 import com.memoecho.eventcenter.dto.UnifiedEventPayload;
 import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Component;
@@ -53,6 +54,28 @@ public class AgentRuntimeDispatchClient {
             return new DispatchResult(true, ex.getStatusCode().value(), null, ex.getMessage());
         } catch (RestClientException ex) {
             return new DispatchResult(true, null, null, ex.getMessage());
+        }
+    }
+
+    /**
+     * 显式执行一个工作流步骤，并把 HTTP 结果完整交给 outbox 调度器判断是否重试。
+     */
+    public DispatchResult executeDelegatedWorkflowStep(DelegatedWorkflowStepExecutionRequest request) {
+        if (!properties.isEnabled()) {
+            return new DispatchResult(false, null, null, "Agent Runtime 当前未启用");
+        }
+        try {
+            ResponseEntity<JsonNode> response = restClient.post()
+                    .uri(properties.getBaseUrl() + properties.getDelegatedWorkflowStepExecutePath())
+                    .body(request)
+                    .retrieve()
+                    .toEntity(JsonNode.class);
+            return new DispatchResult(true, response.getStatusCode().value(), response.getBody(), null);
+        } catch (RestClientResponseException exception) {
+            return new DispatchResult(
+                    true, exception.getStatusCode().value(), null, exception.getResponseBodyAsString());
+        } catch (RestClientException exception) {
+            return new DispatchResult(true, null, null, exception.getMessage());
         }
     }
 

@@ -40,6 +40,7 @@ event-center:
       base-url: http://127.0.0.1:8000
       handle-path: /v1/events/handle
       progress-path: /v1/conversations/progress
+      delegated-workflow-step-execute-path: /v1/delegated-workflows/steps/execute
     retry:
       enabled: ${EVENT_CENTER_DISPATCH_RETRY_ENABLED:true}
       # 包含首次同步派发；默认最多再自动尝试三次。
@@ -48,6 +49,13 @@ event-center:
       max-delay-seconds: ${EVENT_CENTER_DISPATCH_MAX_DELAY_SECONDS:60}
       poll-interval-ms: ${EVENT_CENTER_DISPATCH_POLL_INTERVAL_MS:1000}
       batch-size: ${EVENT_CENTER_DISPATCH_RETRY_BATCH_SIZE:20}
+  delegated-workflow-dispatch:
+    enabled: ${EVENT_CENTER_WORKFLOW_DISPATCH_ENABLED:true}
+    poll-interval-ms: ${EVENT_CENTER_WORKFLOW_DISPATCH_POLL_INTERVAL_MS:1000}
+    batch-size: ${EVENT_CENTER_WORKFLOW_DISPATCH_BATCH_SIZE:20}
+    lease-seconds: ${EVENT_CENTER_WORKFLOW_DISPATCH_LEASE_SECONDS:60}
+    initial-retry-seconds: ${EVENT_CENTER_WORKFLOW_DISPATCH_INITIAL_RETRY_SECONDS:2}
+    max-retry-seconds: ${EVENT_CENTER_WORKFLOW_DISPATCH_MAX_RETRY_SECONDS:60}
   conversation-profiles:
     seed-defaults: true
   skills:

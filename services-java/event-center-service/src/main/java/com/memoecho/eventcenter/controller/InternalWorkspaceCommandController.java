@@ -177,6 +177,19 @@ public class InternalWorkspaceCommandController {
     }
 
     /**
+     * Runtime 读取工作流最新快照，用于执行步骤前核对状态和激活版本。
+     */
+    @GetMapping("/delegated-workflows/{workflowId}/runtime")
+    public ResponseEntity<DelegatedWorkflowResponse> getDelegatedWorkflowForRuntime(
+            @RequestHeader("X-Memo-Echo-Runtime-Token") String runtimeToken,
+            @RequestHeader("X-Memo-Echo-User-Id") String userId,
+            @PathVariable String workflowId
+    ) {
+        String resolvedUserId = userContextResolver.resolveRuntimeUser(runtimeToken, userId);
+        return ResponseEntity.ok(delegatedWorkflowApplicationService.get(resolvedUserId, workflowId));
+    }
+
+    /**
      * Runtime 回报步骤完成结果。服务层会原子合并事实、解锁后继步骤并判断父工作流是否结束。
      */
     @PostMapping("/delegated-workflows/{workflowId}/steps/{stepKey}/complete")

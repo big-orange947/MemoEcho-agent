@@ -166,6 +166,62 @@ class EventCenterServiceClient:
             raise ValueError("delegated task runtime response must be an object")
         return result
 
+    async def complete_delegated_workflow_step(
+        self,
+        event: UnifiedEvent,
+        workflow_id: str,
+        step_key: str,
+        *,
+        produced_facts: dict[str, Any],
+        result_summary: str,
+        result: object,
+    ) -> dict[str, Any]:
+        """提交子任务产出的精确事实，并由 Java 在同一事务内推进父工作流。"""
+        normalized_workflow_id = workflow_id.strip()
+        normalized_step_key = step_key.strip()
+        if not normalized_workflow_id or not normalized_step_key:
+            raise ValueError("workflow_id and step_key are required")
+
+        async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+            response = await client.post(
+                (
+                    f"{self.base_url}/internal/workspace/commands/delegated-workflows/"
+                    f"{quote(normalized_workflow_id, safe='')}/steps/"
+                    f"{quote(normalized_step_key, safe='')}/complete"
+                ),
+                json={
+                    "producedFacts": produced_facts,
+                    "resultSummary": result_summary,
+                    "result": result,
+                },
+                headers=self._runtime_headers(self.resolve_event_user_id(event)),
+            )
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise ValueError("delegated workflow completion response must be an object")
+        return payload
+
+    async def get_delegated_workflow_runtime(self, user_id: str, workflow_id: str) -> dict[str, Any]:
+        """读取工作流最新快照，供 Runtime 执行前校验步骤状态和激活版本。"""
+        normalized_workflow_id = workflow_id.strip()
+        if not normalized_workflow_id:
+            raise ValueError("workflow_id is required")
+
+        async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+            response = await client.get(
+                (
+                    f"{self.base_url}/internal/workspace/commands/delegated-workflows/"
+                    f"{quote(normalized_workflow_id, safe='')}/runtime"
+                ),
+                headers=self._runtime_headers(user_id),
+            )
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise ValueError("delegated workflow runtime response must be an object")
+        return payload
+
     async def list_delegated_task_candidates(self, user_id: str) -> list[ConversationCandidate]:
         """读取 Runtime 可以选择的会话白名单，包含 NapCat 联系人和 Event Center 已知会话。"""
         async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:

@@ -1,7 +1,5 @@
 package com.memoecho.eventcenter.dto;
 
-import com.memoecho.eventcenter.model.DelegatedTask;
-
 import java.time.Instant;
 import java.util.List;
 
@@ -16,6 +14,7 @@ public record DelegatedWorkflowStepResponse(
         List<String> requiredFacts,
         List<String> producesFacts,
         String status,
+        long activationVersion,
         String targetName,
         String platform,
         String chatType,

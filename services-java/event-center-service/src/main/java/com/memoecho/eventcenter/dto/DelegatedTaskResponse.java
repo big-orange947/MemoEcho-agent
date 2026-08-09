@@ -1,6 +1,10 @@
 package com.memoecho.eventcenter.dto;
 
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.memoecho.eventcenter.model.DelegatedTask;
+
+import java.util.List;
 
 /** 客户端可见的委托任务摘要，不暴露后续执行器的内部状态或模型上下文。 */
 public record DelegatedTaskResponse(
@@ -27,8 +31,15 @@ public record DelegatedTaskResponse(
         String completedAt,
         String completionReport,
         String createdAt,
-        String updatedAt
+        String updatedAt,
+        String workflowId,
+        String stepKey,
+        List<String> producesFacts
 ) {
+    private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
+    private static final TypeReference<List<String>> STRING_LIST_TYPE = new TypeReference<>() {
+    };
+
     /** 将领域对象转换成稳定的 API 响应。 */
     public static DelegatedTaskResponse from(DelegatedTask task) {
         return new DelegatedTaskResponse(
@@ -38,7 +49,20 @@ public record DelegatedTaskResponse(
                 task.requiresConfirmation(), task.executionMode(), task.progressSummary(), task.stateJson(),
                 task.lastEventId(), task.startedAt() == null ? null : task.startedAt().toString(),
                 task.completedAt() == null ? null : task.completedAt().toString(), task.completionReport(),
-                task.createdAt().toString(), task.updatedAt().toString()
+                task.createdAt().toString(), task.updatedAt().toString(), task.workflowId(), task.stepKey(),
+                readStringList(task.producesFactsJson())
         );
+    }
+
+    /** 解析步骤声明的事实键；旧数据为空或损坏时返回空列表，避免任务查询接口整体失败。 */
+    private static List<String> readStringList(String json) {
+        if (json == null || json.isBlank()) {
+            return List.of();
+        }
+        try {
+            return List.copyOf(OBJECT_MAPPER.readValue(json, STRING_LIST_TYPE));
+        } catch (Exception ignored) {
+            return List.of();
+        }
     }
 }

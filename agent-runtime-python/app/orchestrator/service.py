@@ -28,6 +28,10 @@ from app.schemas.delegated_tasks import (
     DelegatedTaskCompileRequest,
     DelegatedTaskRuntimeInput,
 )
+from app.schemas.delegated_workflows import (
+    DelegatedWorkflowStepExecutionRequest,
+    DelegatedWorkflowStepExecutionResponse,
+)
 from app.schemas.model_profiles import UserModelProfileResolveResult
 from app.schemas.profiles import ConversationProfileMatchResult
 from app.schemas.results import AgentResult, NotificationDecision, OrchestratorResult, ToolCallRecord
@@ -51,6 +55,10 @@ from app.workflows.delegated_task_graph import DelegatedTaskWorkflow
 
 
 logger = logging.getLogger(__name__)
+
+
+class DelegatedWorkflowCompletionError(RuntimeError):
+    """父工作流步骤完成回调失败；调用方必须保留当前消息以便重试。"""
 
 
 class OrchestratorService:
@@ -460,8 +468,6 @@ class OrchestratorService:
                         need_confirmation=task_status.upper() == "WAITING_TARGET",
                     )
                 )
-                if task_status.upper() == "ACTIVE":
-                    self._trigger_delegated_task_start(user_id, task, execution_id)
             except Exception as exception:
                 self._log_delegated_trace(
                     "task_create_failed",
@@ -577,85 +583,121 @@ class OrchestratorService:
         ignored_chars = set(" \t\r\n，,。.!！?？、:：;；@")
         return "".join(char.lower() for char in str(value).strip() if char not in ignored_chars)
 
-    def _trigger_delegated_task_start(
+    async def execute_delegated_workflow_step(
         self,
-        user_id: str,
-        task: dict[str, Any],
-        execution_id: str | None = None,
-    ) -> None:
-        """目标明确后异步投递一个内部启动事件，让委托任务运行图主动发起第一轮对话。"""
-        task_id = str(task.get("id") or "").strip()
-        chat_id = str(task.get("chatId") or "").strip()
-        if not task_id or not chat_id:
-            return
-        resolved_execution_id = execution_id or task_id
+        request: DelegatedWorkflowStepExecutionRequest,
+    ) -> DelegatedWorkflowStepExecutionResponse:
+        """校验 outbox 指向的激活版本，只执行当前仍然有效的工作流步骤。"""
+        if self.event_center_client is None:
+            raise RuntimeError("event-center client is required")
+
+        workflow = await self.event_center_client.get_delegated_workflow_runtime(
+            request.user_id,
+            request.workflow_id,
+        )
+        if str(workflow.get("status") or "").upper() != "RUNNING":
+            return self._ignored_workflow_step_execution(request, "workflow_not_running")
+
+        steps = workflow.get("steps")
+        step = next(
+            (
+                item
+                for item in (steps if isinstance(steps, list) else [])
+                if isinstance(item, dict)
+                and str(item.get("stepKey") or "").strip() == request.step_key
+            ),
+            None,
+        )
+        if step is None:
+            return self._ignored_workflow_step_execution(request, "step_not_found")
+        if str(step.get("taskId") or "").strip() != request.task_id:
+            return self._ignored_workflow_step_execution(request, "task_mismatch")
+        if str(step.get("status") or "").upper() != "ACTIVE":
+            return self._ignored_workflow_step_execution(request, "step_not_active")
+        try:
+            activation_version = int(step.get("activationVersion") or 0)
+        except (TypeError, ValueError):
+            activation_version = 0
+        if activation_version != request.activation_version:
+            return self._ignored_workflow_step_execution(request, "stale_activation_version")
+
+        chat_id = str(step.get("chatId") or "").strip()
+        if not chat_id:
+            return self._ignored_workflow_step_execution(request, "chat_not_resolved")
+
         now = datetime.now(timezone.utc).isoformat()
         start_event = UnifiedEvent(
-            eventId=f"runtime:delegated-start:{task_id}",
-            platform=str(task.get("platform") or "qq"),
+            eventId=request.idempotency_key,
+            platform=str(step.get("platform") or "qq"),
             scene="delegated_task",
-            eventType="delegated_task_started",
-            chatType=str(task.get("chatType") or "private"),
+            eventType="delegated_workflow_step_activated",
+            chatType=str(step.get("chatType") or "private"),
             chatId=chat_id,
-            selfId=str(task.get("accountId") or ""),
-            sender=Sender(id=user_id, name="任务发起人", role="owner"),
+            selfId="",
+            sender=Sender(id=request.user_id, name="任务发起人", role="owner"),
             text="",
             attachments=[],
             mentions=[],
             segments=[],
             timestamp=now,
             rawPayload={
-                "source": "python-runtime",
-                "userId": user_id,
+                "source": "delegated-workflow-outbox",
+                "userId": request.user_id,
                 "requestedRoute": "social_reply",
-                "delegatedTaskId": task_id,
-                "executionId": resolved_execution_id,
+                "delegatedTaskId": request.task_id,
+                "delegatedWorkflowId": request.workflow_id,
+                "delegatedWorkflowStepKey": request.step_key,
+                "activationVersion": request.activation_version,
+                "executionId": request.idempotency_key,
                 "controlEvent": True,
             },
             actorType="SYSTEM",
             platformMessageId="",
-            clientMessageId=f"runtime:delegated-start:{task_id}",
-            correlationId=task_id,
+            clientMessageId=request.idempotency_key,
+            correlationId=request.workflow_id,
             sequence=None,
             sentAt=now,
             receivedAt=now,
             importedAt=None,
             direction="INTERNAL",
-            delegatedTaskId=task_id,
+            delegatedTaskId=request.task_id,
         )
         self._log_delegated_trace(
-            "start_event_enqueued",
-            execution_id=resolved_execution_id,
+            "workflow_step_started",
+            execution_id=request.idempotency_key,
             event=start_event,
-            task_id=task_id,
-            chatId=chat_id,
-            chatType=start_event.chat_type,
+            workflowId=request.workflow_id,
+            stepKey=request.step_key,
+            activationVersion=request.activation_version,
         )
-        asyncio.create_task(self._run_delegated_task_start_event(start_event))
-
-    async def _run_delegated_task_start_event(self, event: UnifiedEvent) -> None:
-        """后台执行内部启动事件，失败时只记录日志，不阻塞主控台命令响应。"""
-        execution_id = str((event.raw_payload or {}).get("executionId") or event.delegated_task_id or event.event_id)
+        await self.handle_event(start_event)
         self._log_delegated_trace(
-            "start_event_started",
-            execution_id=execution_id,
-            event=event,
+            "workflow_step_finished",
+            execution_id=request.idempotency_key,
+            event=start_event,
+            workflowId=request.workflow_id,
+            stepKey=request.step_key,
+            activationVersion=request.activation_version,
         )
-        try:
-            await self.handle_event(event)
-            self._log_delegated_trace(
-                "start_event_finished",
-                execution_id=execution_id,
-                event=event,
-            )
-        except Exception as exception:
-            self._log_delegated_trace(
-                "start_event_failed",
-                execution_id=execution_id,
-                event=event,
-                errorType=type(exception).__name__,
-            )
-            logger.exception("委托任务启动事件执行失败：eventId=%s, taskId=%s", event.event_id, event.delegated_task_id)
+        return DelegatedWorkflowStepExecutionResponse(
+            status="executed",
+            reason="",
+            workflowId=request.workflow_id,
+            stepKey=request.step_key,
+        )
+
+    @staticmethod
+    def _ignored_workflow_step_execution(
+        request: DelegatedWorkflowStepExecutionRequest,
+        reason: str,
+    ) -> DelegatedWorkflowStepExecutionResponse:
+        """把过期或已失效的 outbox 消息确认为已消费，避免产生任何业务副作用。"""
+        return DelegatedWorkflowStepExecutionResponse(
+            status="ignored",
+            reason=reason,
+            workflowId=request.workflow_id,
+            stepKey=request.step_key,
+        )
 
     async def handle_event(self, event: UnifiedEvent) -> OrchestratorResult:
         # 这个函数的作用是驱动单次事件从粗路由、设定命中、执行到回写的完整主流程。
@@ -1575,6 +1617,13 @@ class OrchestratorService:
         requested_tool = str(decision.requested_tool or "update_delegated_task")
         if requested_tool not in {"update_delegated_task", "complete_delegated_task"}:
             raise ValueError(f"unsupported delegated task state tool: {requested_tool}")
+        workflow_id = str(task.get("workflowId") or "").strip()
+        step_key = str(task.get("stepKey") or "").strip()
+        is_workflow_completion = (
+            requested_tool == "complete_delegated_task"
+            and bool(workflow_id)
+            and bool(step_key)
+        )
         tool_context = ToolExecutionContext(
             user_id=self._resolve_event_user_id(event),
             event_id=event.event_id,
@@ -1586,33 +1635,63 @@ class OrchestratorService:
         stable_event_id = self._stable_event_identity(event)
         idempotency_key = f"delegated:{task_id}:{stable_event_id}:{requested_tool}"
         try:
-            response = await self.tools.ainvoke(
-                requested_tool,
-                context=tool_context,
-                idempotency_key=idempotency_key,
-                arguments={
-                    "event": event.model_dump(mode="json"),
-                    "task_id": task_id,
-                    "progress_summary": decision.progress_summary,
-                    "state_json": decision.state_json,
-                    "last_event_id": stable_event_id,
-                    "completion_report": decision.completion_report,
-                },
-            )
+            if is_workflow_completion:
+                produced_facts = self._delegated_workflow_produced_facts(task, decision)
+                completion_report = str(getattr(decision, "completion_report", "") or "")
+                progress_summary = str(getattr(decision, "progress_summary", "") or "")
+                response = await self.event_center_client.complete_delegated_workflow_step(
+                    event,
+                    workflow_id,
+                    step_key,
+                    produced_facts=produced_facts,
+                    result_summary=completion_report or progress_summary,
+                    result={
+                        "taskId": task_id,
+                        "action": getattr(decision, "action", "COMPLETE_TASK"),
+                        "evidence": list(getattr(decision, "evidence", []) or []),
+                        "state": self._parse_json_object(getattr(decision, "state_json", "")),
+                        "completionReport": completion_report,
+                    },
+                )
+            else:
+                response = await self.tools.ainvoke(
+                    requested_tool,
+                    context=tool_context,
+                    idempotency_key=idempotency_key,
+                    arguments={
+                        "event": event.model_dump(mode="json"),
+                        "task_id": task_id,
+                        "progress_summary": decision.progress_summary,
+                        "state_json": decision.state_json,
+                        "last_event_id": stable_event_id,
+                        "completion_report": decision.completion_report,
+                    },
+                )
             if results:
                 results[-1].tool_calls.append(
                     ToolCallRecord(
-                        tool=requested_tool,
+                        tool=(
+                            "complete_delegated_workflow_step"
+                            if is_workflow_completion
+                            else requested_tool
+                        ),
                         arguments={
                             "taskId": task_id,
                             "action": getattr(decision, "action", "RUNTIME_UPDATE"),
-                            "evidence": decision.evidence,
+                            "evidence": list(getattr(decision, "evidence", []) or []),
                             "idempotencyKey": idempotency_key,
                         },
                     )
                 )
             return response
+        except DelegatedWorkflowCompletionError:
+            raise
         except Exception as exception:
+            if is_workflow_completion:
+                raise DelegatedWorkflowCompletionError(
+                    "父工作流步骤完成回调失败: "
+                    f"workflowId={workflow_id}, stepKey={step_key}"
+                ) from exception
             logger.warning(
                 "委托任务状态持久化失败，保留数据库原状态：taskId=%s, eventId=%s, error=%s",
                 task_id,
@@ -1620,6 +1699,48 @@ class OrchestratorService:
                 type(exception).__name__,
             )
             return None
+
+    @staticmethod
+    def _parse_json_object(value: object) -> dict[str, Any]:
+        """解析状态 JSON；无效或非对象内容统一返回空对象。"""
+        if isinstance(value, dict):
+            return dict(value)
+        if not isinstance(value, str) or not value.strip():
+            return {}
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError):
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    @classmethod
+    def _delegated_workflow_produced_facts(cls, task: dict, decision) -> dict[str, Any]:
+        """只提取父步骤声明的事实；缺少任一事实时拒绝完成，禁止写入猜测。"""
+        declared = task.get("producesFacts")
+        fact_keys = (
+            [str(item).strip() for item in declared if str(item).strip()]
+            if isinstance(declared, list)
+            else []
+        )
+        if not fact_keys:
+            return {}
+
+        state = cls._parse_json_object(getattr(decision, "state_json", ""))
+        sources = [state.get("producedFacts"), state.get("knownFacts"), state]
+        facts: dict[str, Any] = {}
+        missing: list[str] = []
+        for key in fact_keys:
+            for source in sources:
+                if isinstance(source, dict) and key in source:
+                    facts[key] = source[key]
+                    break
+            else:
+                missing.append(key)
+        if missing:
+            raise DelegatedWorkflowCompletionError(
+                "父工作流步骤缺少声明事实: " + ", ".join(missing)
+            )
+        return facts
 
     async def _update_delegated_task_runtime(
         self,
@@ -1719,6 +1840,8 @@ class OrchestratorService:
                 decision=decision,
                 results=results,
             )
+        except DelegatedWorkflowCompletionError:
+            raise
         except Exception as exception:
             logger.warning(
                 "委托任务状态更新失败，保留数据库原状态：taskId=%s, eventId=%s, error=%s",

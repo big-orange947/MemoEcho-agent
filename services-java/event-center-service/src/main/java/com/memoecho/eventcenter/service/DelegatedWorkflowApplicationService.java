@@ -14,6 +14,7 @@ import com.memoecho.eventcenter.model.DelegatedTask;
 import com.memoecho.eventcenter.model.DelegatedWorkflow;
 import com.memoecho.eventcenter.repository.JdbcDelegatedTaskRepository;
 import com.memoecho.eventcenter.repository.JdbcDelegatedWorkflowRepository;
+import com.memoecho.eventcenter.repository.JdbcDelegatedWorkflowStepDispatchRepository;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -42,6 +43,7 @@ public class DelegatedWorkflowApplicationService {
 
     private final JdbcDelegatedWorkflowRepository workflowRepository;
     private final JdbcDelegatedTaskRepository taskRepository;
+    private final JdbcDelegatedWorkflowStepDispatchRepository dispatchRepository;
     private final DelegatedTaskApplicationService taskApplicationService;
     private final ObjectMapper objectMapper;
 
@@ -49,11 +51,13 @@ public class DelegatedWorkflowApplicationService {
     public DelegatedWorkflowApplicationService(
             JdbcDelegatedWorkflowRepository workflowRepository,
             JdbcDelegatedTaskRepository taskRepository,
+            JdbcDelegatedWorkflowStepDispatchRepository dispatchRepository,
             DelegatedTaskApplicationService taskApplicationService,
             ObjectMapper objectMapper
     ) {
         this.workflowRepository = workflowRepository;
         this.taskRepository = taskRepository;
+        this.dispatchRepository = dispatchRepository;
         this.taskApplicationService = taskApplicationService;
         this.objectMapper = objectMapper;
     }
@@ -99,7 +103,11 @@ public class DelegatedWorkflowApplicationService {
         workflowRepository.insert(workflow);
 
         for (DelegatedWorkflowStepCreateRequest step : steps) {
-            taskRepository.insert(buildTask(userId, workflow, step, now));
+            DelegatedTask task = buildTask(userId, workflow, step, now);
+            taskRepository.insert(task);
+            if ("ACTIVE".equalsIgnoreCase(task.status())) {
+                enqueueStepDispatch(task, now);
+            }
         }
         return toResponse(workflow);
     }
@@ -228,10 +236,25 @@ public class DelegatedWorkflowApplicationService {
                             && "COMPLETED".equalsIgnoreCase(dependency.status()));
             boolean factsReady = readStringList(task.requiredFactsJson()).stream().allMatch(facts::containsKey);
             if (dependenciesCompleted && factsReady) {
-                taskRepository.activateWorkflowStep(
+                int activated = taskRepository.activateWorkflowStep(
                         workflowId, task.stepKey(), userId, "前置步骤与事实已就绪。", now);
+                if (activated == 1) {
+                    dispatchRepository.enqueue(
+                            task.workflowId(), task.stepKey(), task.activationVersion() + 1,
+                            task.id(), task.userId(), now);
+                }
             }
         }
+    }
+
+    /**
+     * 将一个已激活步骤写入可靠投递表。
+     * 该方法必须由创建或激活步骤的事务调用，确保任务状态与待执行记录不会只成功一半。
+     */
+    private void enqueueStepDispatch(DelegatedTask task, Instant now) {
+        dispatchRepository.enqueue(
+                task.workflowId(), task.stepKey(), task.activationVersion(),
+                task.id(), task.userId(), now);
     }
 
     /** 复制 Runtime 事实，过滤空键并保持插入顺序，避免修改请求对象。 */
@@ -414,7 +437,8 @@ public class DelegatedWorkflowApplicationService {
                 .map(task -> new DelegatedWorkflowStepResponse(
                         task.id(), task.stepKey(), task.stepOrder(), task.stepRole(), task.stepInstruction(),
                         readStringList(task.dependsOnJson()), readStringList(task.requiredFactsJson()),
-                        readStringList(task.producesFactsJson()), task.status(), task.targetName(), task.platform(),
+                        readStringList(task.producesFactsJson()), task.status(), task.activationVersion(),
+                        task.targetName(), task.platform(),
                         task.chatType(), task.chatId(), task.objective(), task.progressSummary(),
                         task.startedAt(), task.completedAt()))
                 .toList();

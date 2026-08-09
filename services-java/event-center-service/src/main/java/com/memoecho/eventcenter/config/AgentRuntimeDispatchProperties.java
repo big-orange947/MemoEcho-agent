@@ -13,6 +13,7 @@ public class AgentRuntimeDispatchProperties {
     private String pendingGroupOperationPath = "/v1/group-operations/pending";
     private String approveGroupOperationPath = "/v1/group-operations/approve-event";
     private String delegatedTaskCompilePath = "/v1/delegated-tasks/compile";
+    private String delegatedWorkflowStepExecutePath = "/v1/delegated-workflows/steps/execute";
 
     public boolean isEnabled() {
         return enabled;
@@ -76,5 +77,13 @@ public class AgentRuntimeDispatchProperties {
 
     public void setDelegatedTaskCompilePath(String delegatedTaskCompilePath) {
         this.delegatedTaskCompilePath = delegatedTaskCompilePath;
+    }
+
+    public String getDelegatedWorkflowStepExecutePath() {
+        return delegatedWorkflowStepExecutePath;
+    }
+
+    public void setDelegatedWorkflowStepExecutePath(String delegatedWorkflowStepExecutePath) {
+        this.delegatedWorkflowStepExecutePath = delegatedWorkflowStepExecutePath;
     }
 }
