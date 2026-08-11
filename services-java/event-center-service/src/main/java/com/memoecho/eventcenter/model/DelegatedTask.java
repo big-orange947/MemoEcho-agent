@@ -46,6 +46,16 @@ public record DelegatedTask(
         Instant createdAt,
         Instant updatedAt
 ) {
+    /**
+     * 统一委托任务运行态的领域表示，避免可空输入泄漏到数据库的 NOT NULL 字段。
+     */
+    public DelegatedTask {
+        progressSummary = progressSummary == null ? "" : progressSummary;
+        stateJson = stateJson == null || stateJson.isBlank() ? "{}" : stateJson;
+        lastEventId = lastEventId == null ? "" : lastEventId;
+        completionReport = completionReport == null ? "" : completionReport;
+    }
+
     /** 兼容旧解析器和测试；新任务默认采用自动完成模式，但尚未写入运行进度。 */
     public DelegatedTask(
             String id, String userId, String taskType, String status, String originalCommand,

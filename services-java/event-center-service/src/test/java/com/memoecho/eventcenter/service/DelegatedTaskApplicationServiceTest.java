@@ -209,6 +209,29 @@ class DelegatedTaskApplicationServiceTest {
     }
 
     /** 构造具有确定时间和目标的委托任务。 */
+    /**
+     * 旧版本若提前把事件认领标记为完成，服务层应先验证任务归属，
+     * 再把规范化后的事件标识交给仓储层按持久化结果决定是否恢复。
+     */
+    @Test
+    void shouldRecoverDormantCompletedEventForOwnedTask() {
+        DelegatedTask active = task("task-recover", "ACTIVE", "3807050597");
+        when(repository.findByIdAndUserId("task-recover", "freeze")).thenReturn(Optional.of(active));
+        when(eventClaimRepository.recoverDormantCompleted(
+                "task-recover", "freeze", "event-001"
+        )).thenReturn(true);
+
+        boolean recovered = service.recoverDormantCompletedEvent(
+                "freeze", "task-recover", "  event-001  "
+        );
+
+        assertThat(recovered).isTrue();
+        verify(eventClaimRepository).recoverDormantCompleted(
+                "task-recover", "freeze", "event-001"
+        );
+    }
+
+    /** 构造具有固定用户、时间与目标会话的测试任务。 */
     private DelegatedTask task(String id, String status, String chatId) {
         Instant now = Instant.parse("2026-07-20T08:00:00Z");
         return new DelegatedTask(

@@ -27,10 +27,15 @@ from app.schemas.delegated_tasks import (
     DelegatedTaskRuntimeDecision,
     DelegatedTaskRuntimeInput,
 )
+from app.schemas.delegated_workflows import DelegatedWorkflowPlan, DelegatedWorkflowPlanStep
 from app.tools.langchain_delegated_task_tools import delegated_task_action_tools
 
 
 logger = logging.getLogger(__name__)
+
+
+class WorkflowPlanningError(ValueError):
+    """表示主控台命令无法被安全地编译成一个可执行父工作流。"""
 
 
 class CompileState(TypedDict, total=False):
@@ -374,6 +379,155 @@ class DelegatedTaskWorkflow:
         except Exception:
             pass
         return self._fallback_resolve_workspace_targets(command, candidates)
+
+    async def plan_workspace_command(
+        self,
+        command: str,
+        candidates: list[ConversationCandidate],
+        model_profile: Any = None,
+    ) -> DelegatedWorkflowPlan:
+        """把一条主控台命令规划成带依赖关系的父工作流。
+
+        联系人解析只回答“涉及谁”，本函数继续回答“先做什么、后做什么、步骤之间传递什么事实”。
+        多联系人命令绝不能再拆成互不知情的平级任务，否则“先询问 A，再转告 B”会错误地同时联系两人。
+        """
+        authorized = [candidate for candidate in candidates if candidate.chat_id]
+        if not authorized:
+            raise WorkflowPlanningError("没有已授权的目标会话")
+
+        if not self.llm_client.is_enabled(model_profile):
+            if len(authorized) == 1:
+                candidate = authorized[0]
+                return DelegatedWorkflowPlan(
+                    title=self._workflow_title(command),
+                    workflowType="PLAN_EXECUTE",
+                    steps=[
+                        DelegatedWorkflowPlanStep(
+                            stepKey="step_1",
+                            order=1,
+                            role="executor",
+                            instruction=command.strip(),
+                            targetChatType=self._normalize_chat_type(candidate.chat_type),
+                            targetChatId=candidate.chat_id,
+                        )
+                    ],
+                )
+            raise WorkflowPlanningError("多联系人委托需要可用模型来判断步骤依赖关系")
+
+        system_prompt = (
+            "你是 Memo Echo 的委托任务规划器，只输出 JSON。"
+            "你必须把用户命令规划成一个有向无环工作流，而不是为每个联系人复制整条命令。"
+            "authorizedTargets 是唯一允许联系的会话，targetChatId 和 targetChatType 必须原样取自其中。"
+            "如果命令是并行通知多人，每个目标创建一个无依赖根步骤。"
+            "如果命令包含先询问 A、取得答案、再转告 B，则先创建询问 A 的根步骤，"
+            "它通过 producesFacts 声明事实；转告 B 的步骤通过 dependsOn 和 requiredFacts 等待该事实。"
+            "instruction 只描述当前步骤应完成的事情，禁止把尚未取得的答案写成已知事实。"
+            "每个目标只创建完成命令所必需的步骤，禁止重复步骤。"
+            "输出格式为："
+            "{\"title\":\"简短标题\",\"workflowType\":\"PLAN_EXECUTE\",\"steps\":["
+            "{\"stepKey\":\"step_1\",\"order\":1,\"role\":\"executor\","
+            "\"instruction\":\"...\",\"targetChatType\":\"private|group\",\"targetChatId\":\"...\","
+            "\"dependsOn\":[],\"requiredFacts\":[],\"producesFacts\":[]}]}。"
+        )
+        user_message = json.dumps(
+            {
+                "command": command,
+                "authorizedTargets": [self._candidate_payload(candidate) for candidate in authorized],
+            },
+            ensure_ascii=False,
+        )
+        try:
+            raw = await self.llm_client.generate_reply(
+                system_prompt,
+                user_message,
+                temperature=0.05,
+                model_profile=model_profile,
+            )
+            plan = DelegatedWorkflowPlan.model_validate(self._parse_json_object(raw))
+            return self._validate_workspace_workflow_plan(plan, authorized)
+        except WorkflowPlanningError:
+            raise
+        except Exception as exception:
+            raise WorkflowPlanningError(f"工作流规划结果无效: {exception}") from exception
+
+    def _validate_workspace_workflow_plan(
+        self,
+        plan: DelegatedWorkflowPlan,
+        candidates: list[ConversationCandidate],
+    ) -> DelegatedWorkflowPlan:
+        """校验模型计划的白名单、DAG 和事实依赖，阻止越权或不可执行计划进入 Java。"""
+        if not plan.steps:
+            raise WorkflowPlanningError("工作流至少需要一个步骤")
+
+        authorized = {
+            (self._normalize_chat_type(candidate.chat_type), candidate.chat_id)
+            for candidate in candidates
+            if candidate.chat_id
+        }
+        step_keys = [step.step_key.strip() for step in plan.steps]
+        if any(not key for key in step_keys) or len(set(step_keys)) != len(step_keys):
+            raise WorkflowPlanningError("工作流步骤标识为空或重复")
+        step_map = {step.step_key.strip(): step for step in plan.steps}
+
+        for step in plan.steps:
+            target = (self._normalize_chat_type(step.target_chat_type), step.target_chat_id.strip())
+            if target not in authorized:
+                raise WorkflowPlanningError(f"步骤 {step.step_key} 使用了未授权会话")
+            dependencies = [item.strip() for item in step.depends_on if item.strip()]
+            if step.step_key in dependencies or any(item not in step_map for item in dependencies):
+                raise WorkflowPlanningError(f"步骤 {step.step_key} 的依赖不存在或指向自身")
+
+        visiting: set[str] = set()
+        visited: set[str] = set()
+
+        def visit(step_key: str) -> None:
+            if step_key in visiting:
+                raise WorkflowPlanningError("工作流包含循环依赖")
+            if step_key in visited:
+                return
+            visiting.add(step_key)
+            for dependency in step_map[step_key].depends_on:
+                visit(dependency.strip())
+            visiting.remove(step_key)
+            visited.add(step_key)
+
+        for step_key in step_map:
+            visit(step_key)
+        if not any(not step.depends_on for step in plan.steps):
+            raise WorkflowPlanningError("工作流没有可立即执行的根步骤")
+
+        def ancestor_facts(step_key: str, seen: set[str] | None = None) -> set[str]:
+            collected: set[str] = set()
+            chain = set(seen or set())
+            if step_key in chain:
+                return collected
+            chain.add(step_key)
+            for dependency in step_map[step_key].depends_on:
+                parent = step_map[dependency.strip()]
+                collected.update(item.strip() for item in parent.produces_facts if item.strip())
+                collected.update(ancestor_facts(parent.step_key, chain))
+            return collected
+
+        for step in plan.steps:
+            available = ancestor_facts(step.step_key)
+            missing = {item.strip() for item in step.required_facts if item.strip()} - available
+            if missing:
+                raise WorkflowPlanningError(
+                    f"步骤 {step.step_key} 所需事实没有由前置步骤产生: {sorted(missing)}"
+                )
+
+        normalized_steps = sorted(plan.steps, key=lambda item: (item.order, item.step_key))
+        return DelegatedWorkflowPlan(
+            title=(plan.title or self._workflow_title("委托任务")).strip(),
+            workflowType=(plan.workflow_type or "PLAN_EXECUTE").strip().upper(),
+            steps=normalized_steps,
+        )
+
+    @staticmethod
+    def _workflow_title(command: str) -> str:
+        """生成不会把动作残片拼进联系人名的简短工作流标题。"""
+        normalized = re.sub(r"\s+", " ", command or "").strip()
+        return normalized[:40] or "主控台委托任务"
 
     def _candidate_payload(self, candidate: ConversationCandidate) -> dict[str, Any]:
         """把授权会话压缩成模型路由可读的候选信息。

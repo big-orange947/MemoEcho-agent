@@ -1,5 +1,6 @@
 package com.memoecho.eventcenter.service;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.memoecho.eventcenter.config.DelegatedWorkflowDispatchProperties;
 import com.memoecho.eventcenter.dto.DelegatedWorkflowStepExecutionRequest;
 import com.memoecho.eventcenter.dto.DispatchResult;
@@ -18,6 +19,7 @@ import static org.mockito.Mockito.verify;
 
 class DelegatedWorkflowStepDispatchSchedulerTest {
 
+    private final ObjectMapper objectMapper = new ObjectMapper();
     private final DelegatedWorkflowStepDispatchLeaseService leaseService =
             mock(DelegatedWorkflowStepDispatchLeaseService.class);
     private final AgentRuntimeDispatchClient runtimeClient = mock(AgentRuntimeDispatchClient.class);
@@ -30,7 +32,7 @@ class DelegatedWorkflowStepDispatchSchedulerTest {
         given(leaseService.findDueIds()).willReturn(List.of(dispatch.id()));
         given(leaseService.claim(dispatch.id())).willReturn(Optional.of(dispatch));
         given(runtimeClient.executeDelegatedWorkflowStep(any(DelegatedWorkflowStepExecutionRequest.class)))
-                .willReturn(new DispatchResult(true, 200, null, null));
+                .willReturn(new DispatchResult(true, 200, runtimeBody("executed", ""), null));
 
         scheduler.dispatchDueSteps();
 
@@ -67,6 +69,42 @@ class DelegatedWorkflowStepDispatchSchedulerTest {
         scheduler.dispatchDueSteps();
 
         verify(leaseService).scheduleRetry(dispatch, "HTTP 503: Runtime unavailable");
+        verify(leaseService, never()).markSucceeded(any());
+    }
+
+    @Test
+    void shouldRetryWhenRuntimeDeferredAnOtherwiseSuccessfulRequest() {
+        // HTTP 200 只代表接口可达；步骤没有产生持久化效果时仍需重试。
+        DelegatedWorkflowStepDispatch dispatch = dispatch();
+        DelegatedWorkflowStepDispatchScheduler scheduler = scheduler(true);
+        given(leaseService.findDueIds()).willReturn(List.of(dispatch.id()));
+        given(leaseService.claim(dispatch.id())).willReturn(Optional.of(dispatch));
+        given(runtimeClient.executeDelegatedWorkflowStep(any(DelegatedWorkflowStepExecutionRequest.class)))
+                .willReturn(new DispatchResult(true, 200,
+                        runtimeBody("deferred", "no_persistent_effect"), null));
+
+        scheduler.dispatchDueSteps();
+
+        verify(leaseService).scheduleRetry(
+                dispatch,
+                "HTTP 200: Runtime status=deferred, reason=no_persistent_effect"
+        );
+        verify(leaseService, never()).markSucceeded(any());
+    }
+
+    @Test
+    void shouldRetryWhenRuntimeResponseHasNoBusinessStatus() {
+        // 防止旧版或异常 Runtime 返回空 JSON 后被错误确认，导致任务永久停滞。
+        DelegatedWorkflowStepDispatch dispatch = dispatch();
+        DelegatedWorkflowStepDispatchScheduler scheduler = scheduler(true);
+        given(leaseService.findDueIds()).willReturn(List.of(dispatch.id()));
+        given(leaseService.claim(dispatch.id())).willReturn(Optional.of(dispatch));
+        given(runtimeClient.executeDelegatedWorkflowStep(any(DelegatedWorkflowStepExecutionRequest.class)))
+                .willReturn(new DispatchResult(true, 200, objectMapper.createObjectNode(), null));
+
+        scheduler.dispatchDueSteps();
+
+        verify(leaseService).scheduleRetry(dispatch, "HTTP 200: Runtime status=missing");
         verify(leaseService, never()).markSucceeded(any());
     }
 
@@ -118,5 +156,12 @@ class DelegatedWorkflowStepDispatchSchedulerTest {
                 Instant.parse("2026-08-09T08:01:00Z"),
                 null
         );
+    }
+
+    /** 构造 Runtime 的业务响应，避免测试把 HTTP 成功误当成步骤执行成功。 */
+    private com.fasterxml.jackson.databind.node.ObjectNode runtimeBody(String status, String reason) {
+        return objectMapper.createObjectNode()
+                .put("status", status)
+                .put("reason", reason);
     }
 }

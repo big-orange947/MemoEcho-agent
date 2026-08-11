@@ -132,6 +132,57 @@ class EventCenterServiceClient:
             )
         response.raise_for_status()
 
+    async def recover_dormant_delegated_task_event(
+        self,
+        event: UnifiedEvent,
+        task_id: str,
+        event_id: str,
+    ) -> bool:
+        """恢复旧版本提前完成、但尚未产生任何持久化执行结果的事件认领。"""
+        normalized_task_id = task_id.strip()
+        normalized_event_id = event_id.strip()
+        if not normalized_task_id or not normalized_event_id:
+            raise ValueError("task_id and event_id are required")
+        async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+            response = await client.post(
+                (
+                    f"{self.base_url}/internal/workspace/commands/delegated/"
+                    f"{quote(normalized_task_id, safe='')}/events/recover"
+                ),
+                json={"eventId": normalized_event_id, "leaseSeconds": 120},
+                headers=self._runtime_headers(self.resolve_event_user_id(event)),
+            )
+        response.raise_for_status()
+        result = response.json()
+        return isinstance(result, dict) and bool(result.get("recovered"))
+
+    async def release_delegated_task_event(
+        self,
+        event: UnifiedEvent,
+        task_id: str,
+        event_id: str,
+        claim_token: str,
+    ) -> None:
+        """释放未产生副作用的委托事件租约，让同一工作流步骤可以立即重试。"""
+        normalized_task_id = task_id.strip()
+        normalized_event_id = event_id.strip()
+        normalized_claim_token = claim_token.strip()
+        if not normalized_task_id or not normalized_event_id or not normalized_claim_token:
+            raise ValueError("task_id, event_id and claim_token are required")
+        async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+            response = await client.post(
+                (
+                    f"{self.base_url}/internal/workspace/commands/delegated/"
+                    f"{quote(normalized_task_id, safe='')}/events/release"
+                ),
+                json={
+                    "eventId": normalized_event_id,
+                    "claimToken": normalized_claim_token,
+                },
+                headers=self._runtime_headers(self.resolve_event_user_id(event)),
+            )
+        response.raise_for_status()
+
     async def update_delegated_task_runtime(
         self,
         event: UnifiedEvent,
@@ -258,6 +309,35 @@ class EventCenterServiceClient:
         result = response.json()
         if not isinstance(result, dict):
             raise ValueError("delegated task create response must be an object")
+        return result
+
+    async def create_delegated_workflow(
+        self,
+        user_id: str,
+        command: str,
+        title: str,
+        workflow_type: str,
+        steps: list[dict[str, Any]],
+        execution_id: str | None = None,
+    ) -> dict[str, Any]:
+        """一次性创建父工作流及全部子步骤，让 Java 只激活无依赖的根步骤。"""
+        payload = {
+            "command": command,
+            "executionId": execution_id,
+            "title": title,
+            "workflowType": workflow_type,
+            "steps": steps,
+        }
+        async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+            response = await client.post(
+                f"{self.base_url}/internal/workspace/commands/delegated-workflows/runtime",
+                json=payload,
+                headers=self._runtime_headers(user_id),
+            )
+        response.raise_for_status()
+        result = response.json()
+        if not isinstance(result, dict):
+            raise ValueError("delegated workflow create response must be an object")
         return result
 
     async def list_verified_memories(self, event: UnifiedEvent) -> list[VerifiedMemory]:

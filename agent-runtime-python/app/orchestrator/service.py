@@ -51,7 +51,7 @@ from app.tools.registry import ToolRegistry
 from app.tools.send_secure_asset_tool import SendSecureAssetTool
 from app.tools.base import ToolExecutionContext
 from app.tools.qq_group_operations_tool import ManageQqGroupTool, QueryQqGroupTool
-from app.workflows.delegated_task_graph import DelegatedTaskWorkflow
+from app.workflows.delegated_task_graph import DelegatedTaskWorkflow, WorkflowPlanningError
 
 
 logger = logging.getLogger(__name__)
@@ -368,16 +368,36 @@ class OrchestratorService:
                 results=[],
                 final_reply="暂时无法确认需要联系的对象，请稍后重试或补充联系人信息",
             )
-        candidate_batches = [[candidate] for candidate in target_candidates] if target_candidates else [candidates]
-        target_resolved_by_router = bool(target_candidates)
+        if not target_candidates:
+            self._log_delegated_trace(
+                "targets_unresolved",
+                execution_id=execution_id,
+                event=event,
+                candidateCount=len(candidates),
+            )
+            return OrchestratorResult(
+                execution_id=execution_id,
+                status="failed",
+                route="delegated_task",
+                summary="未能确认委托目标",
+                results=[
+                    AgentResult(
+                        task_id=f"{execution_id}:targets",
+                        agent="delegated_task_router",
+                        status="needs_clarification",
+                        reply_draft="请补充需要联系的好友或群聊",
+                        need_confirmation=True,
+                    )
+                ],
+                final_reply="请补充需要联系的好友或群聊",
+            )
+
         self._log_delegated_trace(
             "targets_resolved",
             execution_id=execution_id,
             event=event,
             candidateCount=len(candidates),
             targetCount=len(target_candidates),
-            batchCount=len(candidate_batches),
-            targetResolvedByRouter=target_resolved_by_router,
             targets=[
                 {
                     "platform": candidate.platform,
@@ -388,127 +408,140 @@ class OrchestratorService:
                 for candidate in target_candidates
             ],
         )
-        created_tasks: list[dict[str, Any]] = []
-        results: list[AgentResult] = []
+        try:
+            # RouterAgent 先生成父工作流。依赖关系在这里一次性确定，后续不得再按联系人拆成独立任务。
+            plan = await self.delegated_task_workflow.plan_workspace_command(
+                command=command,
+                candidates=target_candidates,
+                model_profile=model_profile,
+            )
+            candidate_map = {
+                (self._normalize_workspace_chat_type(candidate.chat_type), candidate.chat_id): candidate
+                for candidate in target_candidates
+            }
+            compiled_steps: list[dict[str, Any]] = []
+            for step in sorted(plan.steps, key=lambda item: item.order):
+                candidate = candidate_map.get((step.target_chat_type, step.target_chat_id))
+                if candidate is None:
+                    raise WorkflowPlanningError(f"步骤 {step.step_key} 引用了未授权会话")
 
-        for index, batch in enumerate(candidate_batches):
-            try:
-                compile_request = DelegatedTaskCompileRequest(
-                    userId=user_id,
-                    command=command,
-                    conversations=batch,
-                    targetResolvedByRouter=target_resolved_by_router,
+                compilation = await self.delegated_task_workflow.compile_task(
+                    DelegatedTaskCompileRequest(
+                        userId=user_id,
+                        command=step.instruction,
+                        conversations=[candidate],
+                        targetResolvedByRouter=True,
+                    ),
+                    model_profile,
                 )
-                compilation = await self.delegated_task_workflow.compile_task(compile_request, model_profile)
+                if not compilation.recognized or bool(getattr(compilation, "needs_clarification", False)):
+                    question = compilation.clarification_question or f"步骤 {step.step_key} 缺少执行信息"
+                    raise WorkflowPlanningError(question)
+
+                compiled_steps.append(
+                    {
+                        "stepKey": step.step_key,
+                        "order": step.order,
+                        "role": step.role,
+                        "instruction": step.instruction,
+                        "dependsOn": step.depends_on,
+                        "requiredFacts": step.required_facts,
+                        "producesFacts": step.produces_facts,
+                        "compilation": compilation.model_dump(by_alias=True),
+                    }
+                )
                 self._log_delegated_trace(
-                    "task_compiled",
+                    "workflow_step_compiled",
                     execution_id=execution_id,
                     event=event,
-                    batchIndex=index,
-                    batchSize=len(batch),
-                    recognized=compilation.recognized,
-                    # 兼容尚未返回 needs_clarification 字段的旧版 Runtime 响应。
-                    needsClarification=bool(getattr(compilation, "needs_clarification", False)),
+                    stepKey=step.step_key,
+                    dependsOn=step.depends_on,
+                    targetChatId=step.target_chat_id,
                 )
-                if not compilation.recognized:
-                    results.append(
-                        AgentResult(
-                            task_id=f"{execution_id}:compile:{index}",
-                            agent="delegated_task_router",
-                            status="needs_clarification",
-                            structured_result=compilation.model_dump(by_alias=True),
-                            reply_draft=compilation.clarification_question or "没有识别到明确的委托任务",
-                            need_confirmation=True,
-                        )
-                    )
-                    continue
 
-                task = await self.event_center_client.create_delegated_task(
-                    user_id,
-                    command,
-                    compilation,
-                    execution_id=execution_id,
-                )
-                created_tasks.append(task)
-                task_id = str(task.get("id") or f"{execution_id}:task:{index}")
-                task_status = str(task.get("status") or "CREATED")
-                self._log_delegated_trace(
-                    "task_created",
-                    execution_id=execution_id,
-                    event=event,
-                    task_id=task_id,
-                    taskStatus=task_status,
-                    chatId=task.get("chatId"),
-                    chatType=task.get("chatType"),
-                    targetName=task.get("targetName"),
-                    batchIndex=index,
-                    batchCount=len(candidate_batches),
-                )
-                results.append(
+            workflow = await self.event_center_client.create_delegated_workflow(
+                user_id=user_id,
+                command=command,
+                title=plan.title,
+                workflow_type=plan.workflow_type,
+                steps=compiled_steps,
+                execution_id=execution_id,
+            )
+            workflow_id = str(workflow.get("id") or workflow.get("workflowId") or execution_id)
+            workflow_status = str(workflow.get("status") or "RUNNING")
+            self._log_delegated_trace(
+                "workflow_created",
+                execution_id=execution_id,
+                event=event,
+                workflowId=workflow_id,
+                workflowStatus=workflow_status,
+                stepCount=len(compiled_steps),
+            )
+            return OrchestratorResult(
+                execution_id=execution_id,
+                status="success",
+                route="delegated_task",
+                summary=f"已创建包含 {len(compiled_steps)} 个步骤的委托工作流",
+                results=[
                     AgentResult(
-                        task_id=task_id,
+                        task_id=workflow_id,
                         agent="delegated_task_router",
-                        status=task_status.lower(),
-                        structured_result={
-                            "task": task,
-                            "compilation": compilation.model_dump(by_alias=True),
-                        },
-                        reply_draft=str(task.get("initialProgress") or "委托任务已创建"),
+                        status=workflow_status.lower(),
+                        structured_result={"workflow": workflow, "plan": plan.model_dump(by_alias=True)},
+                        reply_draft=str(workflow.get("initialProgress") or "委托工作流已创建，正在执行首个步骤"),
                         tool_calls=[
                             ToolCallRecord(
-                                tool="create_delegated_task",
-                                arguments={
-                                    "chatId": task.get("chatId"),
-                                    "chatType": task.get("chatType"),
-                                    "targetName": task.get("targetName"),
-                                },
+                                tool="create_delegated_workflow",
+                                arguments={"workflowId": workflow_id, "stepCount": len(compiled_steps)},
                             )
                         ],
-                        next_actions=["目标明确时 Runtime 会主动发起第一轮对话"],
-                        need_confirmation=task_status.upper() == "WAITING_TARGET",
+                        next_actions=["系统只激活无依赖的根步骤，后继步骤将在所需事实就绪后自动执行"],
                     )
-                )
-            except Exception as exception:
-                self._log_delegated_trace(
-                    "task_create_failed",
-                    execution_id=execution_id,
-                    event=event,
-                    batchIndex=index,
-                    errorType=type(exception).__name__,
-                )
-                logger.exception("主控台委托任务创建失败：executionId=%s, batchIndex=%s", execution_id, index)
-                results.append(
+                ],
+                final_reply="委托任务已创建，正在按步骤执行",
+                write_back_actions=[f"delegated_workflow_created:{workflow_id}"],
+            )
+        except WorkflowPlanningError as exception:
+            self._log_delegated_trace(
+                "workflow_planning_failed",
+                execution_id=execution_id,
+                event=event,
+                error=str(exception),
+            )
+            return OrchestratorResult(
+                execution_id=execution_id,
+                status="failed",
+                route="delegated_task",
+                summary="委托工作流缺少可执行信息",
+                results=[
                     AgentResult(
-                        task_id=f"{execution_id}:failed:{index}",
+                        task_id=f"{execution_id}:plan",
+                        agent="delegated_task_router",
+                        status="needs_clarification",
+                        reply_draft=str(exception),
+                        need_confirmation=True,
+                    )
+                ],
+                final_reply=str(exception),
+            )
+        except Exception as exception:
+            logger.exception("主控台委托工作流创建失败：executionId=%s", execution_id)
+            return OrchestratorResult(
+                execution_id=execution_id,
+                status="failed",
+                route="delegated_task",
+                summary="委托工作流创建失败",
+                results=[
+                    AgentResult(
+                        task_id=f"{execution_id}:failed",
                         agent="delegated_task_router",
                         status="failed",
                         reply_draft=str(exception),
                         need_confirmation=True,
                     )
-                )
-
-        status = "success" if created_tasks else "failed"
-        self._log_delegated_trace(
-            "command_finished",
-            execution_id=execution_id,
-            event=event,
-            status=status,
-            taskCount=len(created_tasks),
-            resultCount=len(results),
-        )
-        return OrchestratorResult(
-            execution_id=execution_id,
-            status=status,
-            route="delegated_task",
-            summary=f"已创建 {len(created_tasks)} 个委托任务" if created_tasks else "未能创建委托任务",
-            results=results,
-            final_reply=(
-                f"已创建 {len(created_tasks)} 个委托任务，正在开始执行"
-                if created_tasks
-                else "未能创建委托任务，请检查联系人或补充更具体的要求"
-            ),
-            write_back_actions=[f"delegated_task_created:{len(created_tasks)}"] if created_tasks else [],
-        )
+                ],
+                final_reply="委托工作流创建失败，请稍后重试",
+            )
 
     async def _safe_resolve_workspace_command_model(
         self,
@@ -523,65 +556,11 @@ class OrchestratorService:
             logger.info("主控台命令模型配置读取失败，使用 Runtime 默认模型：userId=%s, error=%s", user_id, exception)
             return None
 
-    def _build_workspace_command_candidate_batches(
-        self,
-        command: str,
-        candidates: list[ConversationCandidate],
-    ) -> list[list[ConversationCandidate]]:
-        """按命令里显式提到的联系人拆分候选；命中私聊时优先私聊，避免误选同名群聊。"""
-        matched_candidates = self._find_workspace_command_targets(command, candidates)
-        if not matched_candidates:
-            return [candidates]
-        return [[candidate] for candidate in matched_candidates]
-
-    def _find_workspace_command_targets(
-        self,
-        command: str,
-        candidates: list[ConversationCandidate],
-    ) -> list[ConversationCandidate]:
-        """从联系人白名单里找出命令显式提到的目标，支持昵称、备注、QQ 号等直接命中。"""
-        normalized_command = self._normalize_contact_token(command)
-        scored: list[tuple[int, ConversationCandidate]] = []
-        for candidate in candidates:
-            score = 0
-            for alias in self._candidate_aliases(candidate):
-                if alias in normalized_command:
-                    score = max(score, len(alias))
-            if score <= 0:
-                continue
-            if candidate.chat_type == "private":
-                score += 1000
-            scored.append((score, candidate))
-
-        private_scored = [(score, candidate) for score, candidate in scored if candidate.chat_type == "private"]
-        selected = private_scored or scored
-        selected.sort(key=lambda item: (-item[0], item[1].chat_name or item[1].chat_id))
-        result: list[ConversationCandidate] = []
-        seen: set[tuple[str, str, str]] = set()
-        for _, candidate in selected:
-            key = (candidate.platform, candidate.chat_type, candidate.chat_id)
-            if key in seen:
-                continue
-            seen.add(key)
-            result.append(candidate)
-        return result
-
-    def _candidate_aliases(self, candidate: ConversationCandidate) -> set[str]:
-        """整理一个候选会话可被自然语言命中的别名，保持保守匹配以降低误选群聊概率。"""
-        aliases: set[str] = set()
-        for raw_value in (candidate.chat_name, candidate.last_sender_name, candidate.chat_id):
-            alias = self._normalize_contact_token(raw_value)
-            if alias and (len(alias) >= 2 or alias.isdigit()):
-                aliases.add(alias)
-        return aliases
-
     @staticmethod
-    def _normalize_contact_token(value: str | None) -> str:
-        """把昵称、备注和命令文本归一化，便于做轻量级显式提及匹配。"""
-        if not value:
-            return ""
-        ignored_chars = set(" \t\r\n，,。.!！?？、:：;；@")
-        return "".join(char.lower() for char in str(value).strip() if char not in ignored_chars)
+    def _normalize_workspace_chat_type(chat_type: str | None) -> str:
+        """统一 Planner 与联系人白名单中的会话类型，避免 channel/room 导致目标校验误判。"""
+        normalized = str(chat_type or "").strip().lower()
+        return "group" if normalized in {"group", "channel", "room"} else "private"
 
     async def execute_delegated_workflow_step(
         self,
@@ -670,7 +649,40 @@ class OrchestratorService:
             stepKey=request.step_key,
             activationVersion=request.activation_version,
         )
-        await self.handle_event(start_event)
+        # outbox 步骤必须由最外层持有事件租约。handle_event 内部可能因为暂时缺少模型、
+        # 联系人或工具而正常返回“无动作”，此时不能提前把事件标记为已完成。
+        delegated_task_ref = {"id": request.task_id}
+        claim_token = await self._claim_delegated_event(start_event, delegated_task_ref)
+        if claim_token == "":
+            return DelegatedWorkflowStepExecutionResponse(
+                status="deferred",
+                reason="event_claim_unavailable",
+                workflowId=request.workflow_id,
+                stepKey=request.step_key,
+                retryable=True,
+                writeBackActions=[],
+            )
+        if claim_token:
+            start_event.raw_payload["_delegatedEventClaimToken"] = claim_token
+            start_event.raw_payload["_deferDelegatedClaimCompletion"] = True
+        try:
+            result = await self.handle_event(start_event)
+        except Exception:
+            await self._release_delegated_event(
+                start_event,
+                delegated_task_ref,
+                claim_token,
+            )
+            raise
+        write_back_actions = list(getattr(result, "write_back_actions", None) or [])
+        has_persistent_effect = any(
+            action
+            and action not in {
+                "delegated_task_event:skipped",
+                "delegated_task_action:superseded",
+            }
+            for action in write_back_actions
+        )
         self._log_delegated_trace(
             "workflow_step_finished",
             execution_id=request.idempotency_key,
@@ -678,13 +690,81 @@ class OrchestratorService:
             workflowId=request.workflow_id,
             stepKey=request.step_key,
             activationVersion=request.activation_version,
+            persistentEffect=has_persistent_effect,
+            writeBackActions=write_back_actions,
+        )
+        if not has_persistent_effect:
+            # handle_event 会把认领冲突、暂时无动作等情况作为正常结果返回。
+            # 再读一次服务端状态，只有同一激活版本仍未推进时才要求 outbox 重试。
+            refreshed_workflow = await self.event_center_client.get_delegated_workflow_runtime(
+                request.user_id,
+                request.workflow_id,
+            )
+            if self._is_same_active_workflow_step(refreshed_workflow, request):
+                await self._release_delegated_event(
+                    start_event,
+                    delegated_task_ref,
+                    claim_token,
+                )
+                return DelegatedWorkflowStepExecutionResponse(
+                    status="deferred",
+                    reason="no_persistent_effect",
+                    workflowId=request.workflow_id,
+                    stepKey=request.step_key,
+                    retryable=True,
+                    writeBackActions=write_back_actions,
+                )
+            await self._complete_delegated_event(
+                start_event,
+                delegated_task_ref,
+                claim_token,
+                force=True,
+            )
+            return DelegatedWorkflowStepExecutionResponse(
+                status="ignored",
+                reason="state_advanced_after_dispatch",
+                workflowId=request.workflow_id,
+                stepKey=request.step_key,
+                writeBackActions=write_back_actions,
+            )
+        await self._complete_delegated_event(
+            start_event,
+            delegated_task_ref,
+            claim_token,
+            force=True,
         )
         return DelegatedWorkflowStepExecutionResponse(
             status="executed",
             reason="",
             workflowId=request.workflow_id,
             stepKey=request.step_key,
+            writeBackActions=write_back_actions,
         )
+
+    @staticmethod
+    def _is_same_active_workflow_step(
+        workflow: dict,
+        request: DelegatedWorkflowStepExecutionRequest,
+    ) -> bool:
+        """判断执行后服务端是否仍停留在同一激活版本，用于区分已推进与暂时无效果。"""
+        if str(workflow.get("status") or "").upper() != "RUNNING":
+            return False
+        steps = workflow.get("steps")
+        for step in steps if isinstance(steps, list) else []:
+            if not isinstance(step, dict):
+                continue
+            if str(step.get("stepKey") or "").strip() != request.step_key:
+                continue
+            try:
+                activation_version = int(step.get("activationVersion") or 0)
+            except (TypeError, ValueError):
+                activation_version = 0
+            return (
+                str(step.get("taskId") or "").strip() == request.task_id
+                and str(step.get("status") or "").upper() == "ACTIVE"
+                and activation_version == request.activation_version
+            )
+        return False
 
     @staticmethod
     def _ignored_workflow_step_execution(
@@ -725,7 +805,11 @@ class OrchestratorService:
             )
         delegated_claim_token: str | None = None
         if delegated_task:
-            delegated_claim_token = await self._claim_delegated_event(event, delegated_task)
+            # 显式工作流步骤会在进入主编排前认领事件。复用外层 token 可以避免这里
+            # 再次认领同一个 eventId，并把租约的最终提交权保留给 outbox 执行入口。
+            delegated_claim_token = str(
+                (event.raw_payload or {}).get("_delegatedEventClaimToken") or ""
+            ).strip() or await self._claim_delegated_event(event, delegated_task)
             if delegated_claim_token == "":
                 self._log_delegated_trace(
                     "task_event_claim_skipped",
@@ -1129,6 +1213,29 @@ class OrchestratorService:
                 type(exception).__name__,
             )
             return ""
+        if not bool(result.get("claimed")) and str(result.get("status") or "").upper() == "COMPLETED":
+            recover = getattr(
+                self.event_center_client,
+                "recover_dormant_delegated_task_event",
+                None,
+            )
+            if callable(recover):
+                try:
+                    recovered = await recover(event, task_id, event_id)
+                    if recovered:
+                        logger.warning(
+                            "已恢复旧版本遗留的空完成事件，重新认领一次：taskId=%s, eventId=%s",
+                            task_id,
+                            event_id,
+                        )
+                        result = await claim(event, task_id, event_id, 120)
+                except Exception as exception:
+                    logger.warning(
+                        "恢复旧版本空完成事件失败：taskId=%s, eventId=%s, error=%s",
+                        task_id,
+                        event_id,
+                        type(exception).__name__,
+                    )
         if not bool(result.get("claimed")):
             logger.info(
                 "委托事件已由其他执行占用：taskId=%s, eventId=%s, status=%s",
@@ -1152,8 +1259,12 @@ class OrchestratorService:
         event: UnifiedEvent,
         task: dict,
         claim_token: str | None,
+        *,
+        force: bool = False,
     ) -> None:
         """在本轮委托的状态写入和消息副作用全部完成后提交事件租约。"""
+        if bool((event.raw_payload or {}).get("_deferDelegatedClaimCompletion")) and not force:
+            return
         if not claim_token or self.event_center_client is None:
             return
         complete = getattr(self.event_center_client, "complete_delegated_task_event", None)
@@ -1169,6 +1280,32 @@ class OrchestratorService:
             # 平台副作用已经完成，提交失败只能保留租约等待超时，不能再次执行发送。
             logger.error(
                 "提交委托事件租约失败：taskId=%s, eventId=%s, error=%s",
+                task_id,
+                event_id,
+                type(exception).__name__,
+            )
+
+    async def _release_delegated_event(
+        self,
+        event: UnifiedEvent,
+        task: dict,
+        claim_token: str | None,
+    ) -> None:
+        """释放尚未产生持久化效果的委托事件，让 outbox 可以在稍后安全重试。"""
+        if not claim_token or self.event_center_client is None:
+            return
+        release = getattr(self.event_center_client, "release_delegated_task_event", None)
+        if not callable(release):
+            return
+        task_id = str(task.get("id") or "").strip()
+        event_id = self._stable_event_identity(event)
+        if not task_id or not event_id:
+            return
+        try:
+            await release(event, task_id, event_id, claim_token)
+        except Exception as exception:
+            logger.error(
+                "释放委托事件租约失败：taskId=%s, eventId=%s, error=%s",
                 task_id,
                 event_id,
                 type(exception).__name__,

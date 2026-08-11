@@ -323,7 +323,28 @@ public class DelegatedTaskApplicationService {
         }
     }
 
+    /** Runtime 本轮没有产生持久副作用时释放租约，允许调度器立即重试同一事件。 */
+    public void releaseEvent(String userId, String taskId, String eventId, String claimToken) {
+        requireTask(userId, taskId);
+        if (!eventClaimRepository.release(taskId, userId, clean(eventId), clean(claimToken))) {
+            throw new ResponseStatusException(HttpStatus.CONFLICT, "事件租约不存在、已过期或已被接管。");
+        }
+    }
+
     /** 兼容旧客户端的确认按钮；新工作台任务在目标明确时会直接进入 ACTIVE。 */
+    /**
+     * 恢复旧版本提前标记为完成、但任务从未产生持久化执行结果的事件认领。
+     * 仓储层会再次核验任务状态和工作流结果，避免重复执行真实副作用。
+     */
+    public boolean recoverDormantCompletedEvent(String userId, String taskId, String eventId) {
+        requireTask(userId, taskId);
+        String normalizedEventId = clean(eventId);
+        if (normalizedEventId.isBlank()) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "事件标识不能为空。");
+        }
+        return eventClaimRepository.recoverDormantCompleted(taskId, userId, normalizedEventId);
+    }
+
     public DelegatedTaskResponse confirm(String userId, String taskId) {
         DelegatedTask task = requireTask(userId, taskId);
         if (task.chatId().isBlank()) {

@@ -43,8 +43,9 @@ public class JdbcDelegatedTaskRepository {
                 task.sourceExecutionId(), task.targetQuery(), task.platform(), task.chatType(), task.chatId(), task.targetName(),
                 task.objective(), task.successCriteria(), task.deadlineText(), task.confidence(),
                 task.clarificationQuestion(), task.requiresConfirmation(), task.executionMode(),
-                task.progressSummary(), task.stateJson(), task.lastEventId(), timestamp(task.startedAt()),
-                timestamp(task.completedAt()), task.completionReport(), Timestamp.from(task.createdAt()),
+                nonNullText(task.progressSummary()), nonNullJson(task.stateJson()),
+                nonNullText(task.lastEventId()), timestamp(task.startedAt()),
+                timestamp(task.completedAt()), nonNullText(task.completionReport()), Timestamp.from(task.createdAt()),
                 Timestamp.from(task.updatedAt()));
         return task;
     }
@@ -209,7 +210,8 @@ public class JdbcDelegatedTaskRepository {
                     completed_at = CASE WHEN ? THEN COALESCE(completed_at, ?) ELSE completed_at END,
                     requires_confirmation = FALSE, updated_at = ?
                 WHERE id = ? AND user_id = ?
-                """, status, progressSummary, stateJson, lastEventId, completionReport,
+                """, status, nonNullText(progressSummary), nonNullJson(stateJson),
+                nonNullText(lastEventId), nonNullText(completionReport),
                 Timestamp.from(now), terminal, Timestamp.from(now), Timestamp.from(now), id, userId);
         return findByIdAndUserId(id, userId);
     }
@@ -286,6 +288,16 @@ public class JdbcDelegatedTaskRepository {
 
     private static Timestamp timestamp(java.time.Instant value) {
         return value == null ? null : Timestamp.from(value);
+    }
+
+    /** 将可空文本转换为数据库可安全写入的空字符串。 */
+    private static String nonNullText(String value) {
+        return value == null ? "" : value;
+    }
+
+    /** 将可空或空白 JSON 转换为合法空对象，保证运行态始终可反序列化。 */
+    private static String nonNullJson(String value) {
+        return value == null || value.isBlank() ? "{}" : value;
     }
 
     private static java.time.Instant instant(Timestamp value) {

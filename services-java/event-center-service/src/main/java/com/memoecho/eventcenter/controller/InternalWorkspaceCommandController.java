@@ -28,6 +28,7 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.util.List;
+import java.util.Map;
 
 @RestController
 @RequestMapping("/internal/workspace/commands")
@@ -141,7 +142,37 @@ public class InternalWorkspaceCommandController {
         return ResponseEntity.noContent().build();
     }
 
+    /** Runtime 未产生消息或状态副作用时释放租约，使工作流步骤能够安全重试。 */
+    @PostMapping("/delegated/{taskId}/events/release")
+    public ResponseEntity<Void> releaseDelegatedTaskEvent(
+            @RequestHeader("X-Memo-Echo-Runtime-Token") String runtimeToken,
+            @RequestHeader("X-Memo-Echo-User-Id") String userId,
+            @PathVariable String taskId,
+            @RequestBody DelegatedTaskEventCompleteRequest request
+    ) {
+        String resolvedUserId = userContextResolver.resolveRuntimeUser(runtimeToken, userId);
+        delegatedTaskApplicationService.releaseEvent(resolvedUserId, taskId, request.eventId(), request.claimToken());
+        return ResponseEntity.noContent().build();
+    }
+
     /** Runtime 编译主控台命令前读取联系人白名单，客户端不能绕过该接口直接给模型任意联系人。 */
+    /**
+     * 恢复旧版本遗留的空完成事件，使 Runtime 可以重新认领并真正执行一次。
+     * 仓储层会严格检查任务尚未完成且没有任何步骤结果。
+     */
+    @PostMapping("/delegated/{taskId}/events/recover")
+    public ResponseEntity<Map<String, Boolean>> recoverDormantDelegatedTaskEvent(
+            @RequestHeader("X-Memo-Echo-Runtime-Token") String runtimeToken,
+            @RequestHeader("X-Memo-Echo-User-Id") String userId,
+            @PathVariable String taskId,
+            @RequestBody DelegatedTaskEventClaimRequest request
+    ) {
+        String resolvedUserId = userContextResolver.resolveRuntimeUser(runtimeToken, userId);
+        boolean recovered = delegatedTaskApplicationService.recoverDormantCompletedEvent(
+                resolvedUserId, taskId, request.eventId());
+        return ResponseEntity.ok(Map.of("recovered", recovered));
+    }
+
     @GetMapping("/delegated/candidates")
     public ResponseEntity<List<ConversationSummaryResponse>> listDelegatedTaskCandidates(
             @RequestHeader("X-Memo-Echo-Runtime-Token") String runtimeToken,

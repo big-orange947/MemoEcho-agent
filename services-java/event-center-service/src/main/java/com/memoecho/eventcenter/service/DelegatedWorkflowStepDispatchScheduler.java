@@ -64,7 +64,7 @@ public class DelegatedWorkflowStepDispatchScheduler {
         }
     }
 
-    /** 调用 Runtime，并依据明确的 2xx 结果确认成功，否则安排下一次重试。 */
+    /** 调用 Runtime，并依据明确的业务状态确认成功，否则安排下一次重试。 */
     private void dispatchClaimedStep(DelegatedWorkflowStepDispatch dispatch) {
         DelegatedWorkflowStepExecutionRequest request = new DelegatedWorkflowStepExecutionRequest(
                 dispatch.workflowId(), dispatch.stepKey(), dispatch.activationVersion(),
@@ -90,10 +90,14 @@ public class DelegatedWorkflowStepDispatchScheduler {
                 dispatch.idempotencyKey(), dispatch.attemptCount(), error);
     }
 
-    /** 只有 Runtime 确实收到请求且返回 2xx 才视为成功。 */
+    /** 只有 Runtime 返回 2xx 且明确声明 executed/ignored，outbox 才能确认完成。 */
     private boolean isSuccessful(DispatchResult result) {
-        return result != null && result.attempted() && result.httpStatus() != null
-                && result.httpStatus() >= 200 && result.httpStatus() < 300;
+        if (result == null || !result.attempted() || result.httpStatus() == null
+                || result.httpStatus() < 200 || result.httpStatus() >= 300 || result.body() == null) {
+            return false;
+        }
+        String runtimeStatus = result.body().path("status").asText("");
+        return "executed".equalsIgnoreCase(runtimeStatus) || "ignored".equalsIgnoreCase(runtimeStatus);
     }
 
     /** 汇总 HTTP 状态与错误内容，给运维日志和下一次重试保留足够上下文。 */
@@ -102,6 +106,13 @@ public class DelegatedWorkflowStepDispatchScheduler {
             return "Runtime 未返回调用结果";
         }
         String status = result.httpStatus() == null ? "无 HTTP 状态" : "HTTP " + result.httpStatus();
+        if (result.body() != null && result.httpStatus() != null
+                && result.httpStatus() >= 200 && result.httpStatus() < 300) {
+            String runtimeStatus = result.body().path("status").asText("missing");
+            String reason = result.body().path("reason").asText("");
+            return status + ": Runtime status=" + runtimeStatus
+                    + (reason.isBlank() ? "" : ", reason=" + reason);
+        }
         String error = result.error() == null || result.error().isBlank() ? "未提供错误详情" : result.error();
         return status + ": " + error;
     }

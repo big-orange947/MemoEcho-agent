@@ -426,8 +426,8 @@ public class DelegatedWorkflowApplicationService {
                 compilation.deadlineText(), compilation.confidence(), compilation.clarificationQuestion(),
                 compilation.requiresConfirmation(), defaultText(compilation.executionMode(), "AUTO_COMPLETE"),
                 root ? defaultText(compilation.initialProgress(), "步骤已激活。") : "等待前置步骤完成。",
-                defaultText(compilation.stateJson(), "{}"), null, root ? now : null,
-                null, null, now, now
+                defaultText(compilation.stateJson(), "{}"), "", root ? now : null,
+                null, "", now, now
         );
     }
 
