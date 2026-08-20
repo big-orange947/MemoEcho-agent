@@ -6,7 +6,7 @@ import unittest
 from types import SimpleNamespace
 
 from app.memory.manager import MemoryManager
-from app.orchestrator.service import DelegatedWorkflowCompletionError, OrchestratorService
+from app.orchestrator.service import OrchestratorService
 from app.planner.service import PlannerService
 from app.router.service import RouterService
 from app.schemas.events import Sender, UnifiedEvent
@@ -106,6 +106,7 @@ class DummyEventCenterServiceClient:
         self.delegated_event_claim_allowed = True
         self.delegated_event_claims: list[dict] = []
         self.delegated_event_completions: list[dict] = []
+        self.delegated_event_releases: list[dict] = []
         self.delegated_workflow_completions: list[dict] = []
         self.delegated_workflow_completion_error: Exception | None = None
         self.current_events: dict[str, dict] = {}
@@ -180,6 +181,22 @@ class DummyEventCenterServiceClient:
     ) -> None:
         """记录租约提交，确保外部副作用完成后事件不会被再次消费。"""
         self.delegated_event_completions.append(
+            {
+                "taskId": task_id,
+                "eventId": event_id,
+                "claimToken": claim_token,
+            }
+        )
+
+    async def release_delegated_task_event(
+        self,
+        event: UnifiedEvent,
+        task_id: str,
+        event_id: str,
+        claim_token: str,
+    ) -> None:
+        """记录租约释放，供持久化失败重试场景断言。"""
+        self.delegated_event_releases.append(
             {
                 "taskId": task_id,
                 "eventId": event_id,
@@ -1688,13 +1705,15 @@ class OrchestratorWriteBackTest(unittest.IsolatedAsyncioTestCase):
             "producesFacts": ["scheduled_time", "contact_name"],
         }
 
-        response = await service._persist_delegated_task_decision(
+        response = await service._finalize_send(
             event=event,
             task=task,
-            decision=decision,
+            delegated_action=decision,
+            claim_token="claim:child-task-001:complete",
         )
 
-        self.assertEqual("workflow-001", response["id"])
+        self.assertEqual("done", response.get("route"))
+        self.assertTrue(response.get("persisted"))
         self.assertEqual(1, len(event_center_client.delegated_workflow_completions))
         completion = event_center_client.delegated_workflow_completions[0]
         self.assertEqual(
@@ -1748,13 +1767,14 @@ class OrchestratorWriteBackTest(unittest.IsolatedAsyncioTestCase):
             "producesFacts": ["今晚的上课时间"],
         }
 
-        response = await service._persist_delegated_task_decision(
+        response = await service._finalize_send(
             event=event,
             task=task,
-            decision=decision,
+            delegated_action=decision,
+            claim_token="claim:child-task-single-fact:complete",
         )
 
-        self.assertEqual("workflow-single-fact", response["id"])
+        self.assertEqual("done", response.get("route"))
         self.assertEqual(1, len(event_center_client.delegated_workflow_completions))
         self.assertEqual(
             {"今晚的上课时间": "七点半吧"},
@@ -1941,19 +1961,20 @@ class OrchestratorWriteBackTest(unittest.IsolatedAsyncioTestCase):
             "producesFacts": ["scheduled_time", "contact_name"],
         }
 
-        response = await service._persist_delegated_task_decision(
+        response = await service._finalize_send(
             event=event,
             task=task,
-            decision=decision,
+            delegated_action=decision,
+            claim_token="claim:child-task-002:wait",
         )
 
+        self.assertEqual("wait", response.get("route"))
         self.assertEqual([], event_center_client.delegated_workflow_completions)
-        self.assertEqual("ACTIVE", response["status"])
         pending_state = json.loads(event_center_client.delegated_runtime_updates[-1]["stateJson"])
         self.assertEqual(["scheduled_time"], pending_state["workflowCompletionPending"]["missingFacts"])
 
     async def test_should_surface_parent_workflow_callback_failure_for_message_retry(self) -> None:
-        """父工作流回调失败必须向上抛出，让消息基础设施重试而不是静默丢失完成事件。"""
+        """父工作流回调失败时主链路图释放租约返回重试，不静默丢失完成事件。"""
         event_center_client = DummyEventCenterServiceClient()
         event_center_client.delegated_workflow_completion_error = RuntimeError("event center unavailable")
         service = OrchestratorService(
@@ -1993,15 +2014,18 @@ class OrchestratorWriteBackTest(unittest.IsolatedAsyncioTestCase):
             "producesFacts": ["scheduled_time"],
         }
 
-        with self.assertRaisesRegex(
-            DelegatedWorkflowCompletionError,
-            "父工作流步骤完成回调失败",
-        ):
-            await service._persist_delegated_task_decision(
-                event=event,
-                task=task,
-                decision=decision,
-            )
+        response = await service._finalize_send(
+            event=event,
+            task=task,
+            delegated_action=decision,
+            claim_token="claim:child-task-003:retry",
+        )
+
+        # 回调失败：图返回可重试状态并释放租约，投递方据此重新投递。
+        self.assertEqual("retry", response.get("route"))
+        self.assertFalse(response.get("persisted"))
+        self.assertEqual(0, len(event_center_client.delegated_workflow_completions))
+        self.assertEqual(1, len(event_center_client.delegated_event_releases))
 
 
 if __name__ == "__main__":

@@ -60,6 +60,9 @@ class DelegatedExecutionState(TypedDict, total=False):
     transition: dict[str, Any]
     persisted: bool
     write_back_actions: list[str]
+    # finalize：SEND 后状态写回模式。编排层已执行真实发送，图只按给定决策落库，
+    # 跳过 react/review，并把 SEND_AND_COMPLETE 当作完成转换持久化。
+    finalize: bool
     error: str
 
 
@@ -91,8 +94,8 @@ class DelegatedExecutionGraph:
         graph.add_node("react", self._react)
         graph.add_node("review", self._review)
         graph.add_node("persist_transition", self._persist_transition)
-        graph.add_node("wait", lambda state: {"transition": {"kind": "wait"}})
-        graph.add_node("end", lambda state: {"transition": {"kind": "end"}})
+        graph.add_node("wait", lambda state: {})
+        graph.add_node("end", lambda state: {})
         graph.add_node("skip", lambda state: {"route": "skip"})
 
         graph.add_edge(START, "ingest_event")
@@ -102,7 +105,7 @@ class DelegatedExecutionGraph:
         graph.add_conditional_edges(
             "select_ready_step",
             self._route_after_select,
-            {"react": "react", "skip": "skip"},
+            {"react": "react", "skip": "skip", "persist_transition": "persist_transition"},
         )
         graph.add_edge("skip", END)
         graph.add_edge("react", "review")
@@ -127,11 +130,16 @@ class DelegatedExecutionGraph:
         task: dict[str, Any],
         model_profile: Any = None,
         claim_token: str = "",
+        finalize: bool = False,
+        decision: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """执行一次委托事件主链路，返回最终状态与决策。
 
         编排层已提前认领事件时传入 claim_token，reconcile 节点不再重复认领；
         独立使用时由 reconcile 节点完成租约抢占。
+
+        finalize 为 SEND 后状态写回模式：编排层已执行真实发送，图只按给定决策
+        落库（跳过 react/review），并把 SEND_AND_COMPLETE 当作完成转换持久化。
         """
         workflow_id = str(task.get("workflowId") or task.get("workflow_id") or "").strip()
         task_id = str(task.get("id") or task.get("taskId") or "").strip()
@@ -145,6 +153,8 @@ class DelegatedExecutionGraph:
                 "claim_token": str(claim_token or "").strip(),
                 "write_back_actions": [],
                 "persisted": False,
+                "finalize": bool(finalize),
+                "decision": dict(decision or {}),
             },
             config={"configurable": {"thread_id": thread_id}},
         )
@@ -308,8 +318,13 @@ class DelegatedExecutionGraph:
         claim_token = str(state.get("claim_token") or "").strip()
         stable_event_id = canonical_message_identity(state["event"], str(event.text or ""))
         write_back_actions = list(state.get("write_back_actions") or [])
+        finalize = bool(state.get("finalize"))
 
-        if action in {"SEND_MESSAGE", "SEND_AND_COMPLETE"}:
+        # finalize 模式（SEND 后写回）：SEND_AND_COMPLETE 的发送已成功，按完成转换落库。
+        if finalize and action == "SEND_AND_COMPLETE":
+            action = "COMPLETE_TASK"
+
+        if action in {"SEND_MESSAGE", "SEND_AND_COMPLETE"} and not finalize:
             # 真实发送需要 SocialAgent 与写回层，由编排层在图外执行；租约保持占用。
             write_back_actions.append("delegated_task_action:" + action.lower())
             return {"route": "send", "transition": {"kind": "send"}, "write_back_actions": write_back_actions}
@@ -362,7 +377,13 @@ class DelegatedExecutionGraph:
                 complete_claim = getattr(self.event_center_client, "complete_delegated_task_event", None)
                 if callable(complete_claim):
                     await complete_claim(event, task_id, stable_event_id, claim_token)
-            return {"route": "done", "persisted": True, "transition": {"kind": "done"}, "write_back_actions": write_back_actions}
+            persisted_status = "COMPLETED" if action == "COMPLETE_TASK" else "ACTIVE"
+            return {
+                "route": "done",
+                "persisted": True,
+                "transition": {"kind": "done", "status": persisted_status},
+                "write_back_actions": write_back_actions,
+            }
         except DelegatedWorkflowFactsMissingError as exception:
             # 模型判断完成但没有给齐父工作流声明事实：保留任务并记录缺口，等待后续消息。
             logger.warning(
@@ -392,7 +413,7 @@ class DelegatedExecutionGraph:
             return {
                 "route": "wait",
                 "persisted": True,
-                "transition": {"kind": "facts_wait", "missingFacts": list(exception.missing_facts)},
+                "transition": {"kind": "facts_wait", "status": "ACTIVE", "missingFacts": list(exception.missing_facts)},
                 "write_back_actions": write_back_actions,
             }
         except Exception as exception:
@@ -415,6 +436,9 @@ class DelegatedExecutionGraph:
 
     @staticmethod
     def _route_after_select(state: DelegatedExecutionState) -> str:
+        # finalize 模式跳过 react/review，直接用给定决策落库。
+        if state.get("finalize"):
+            return "persist_transition"
         return "skip" if state.get("route") == "skip" else "react"
 
     @staticmethod
@@ -693,8 +717,12 @@ class DelegatedExecutionGraph:
         facts: dict[str, Any] = {}
         missing: list[str] = []
         state = self._parse_json_object(decision.get("stateJson"))
+        # 依次从 producedFacts 映射、knownFacts 列表与状态顶层恢复声明事实。
+        produced_map = state.get("producedFacts") if isinstance(state.get("producedFacts"), dict) else {}
         for key in fact_keys:
             value = state.get(key)
+            if value is None and key in produced_map:
+                value = produced_map[key]
             if value is not None and str(value).strip():
                 facts[key] = value
                 continue
