@@ -40,6 +40,8 @@ public record DelegatedTask(
         String progressSummary,
         String stateJson,
         String lastEventId,
+        String startEventId,
+        String conversationScopeJson,
         Instant startedAt,
         Instant completedAt,
         String completionReport,
@@ -53,6 +55,8 @@ public record DelegatedTask(
         progressSummary = progressSummary == null ? "" : progressSummary;
         stateJson = stateJson == null || stateJson.isBlank() ? "{}" : stateJson;
         lastEventId = lastEventId == null ? "" : lastEventId;
+        startEventId = startEventId == null ? "" : startEventId;
+        conversationScopeJson = conversationScopeJson == null ? "" : conversationScopeJson;
         completionReport = completionReport == null ? "" : completionReport;
     }
 
@@ -66,7 +70,7 @@ public record DelegatedTask(
         this(id, null, "", 0, "ACTION", "", "[]", "[]", "[]", "{}", 0,
                 userId, taskType, status, originalCommand, null, targetQuery, platform, chatType, chatId,
                 targetName, objective, successCriteria, deadlineText, confidence, clarificationQuestion,
-                requiresConfirmation, "AUTO_COMPLETE", "", "{}", "", null, null, "", createdAt, updatedAt);
+                requiresConfirmation, "AUTO_COMPLETE", "", "{}", "", "", "", null, null, "", createdAt, updatedAt);
     }
 
     /**
@@ -85,6 +89,6 @@ public record DelegatedTask(
                 userId, taskType, status, originalCommand, sourceExecutionId, targetQuery, platform,
                 chatType, chatId, targetName, objective, successCriteria, deadlineText, confidence,
                 clarificationQuestion, requiresConfirmation, executionMode, progressSummary, stateJson,
-                lastEventId, startedAt, completedAt, completionReport, createdAt, updatedAt);
+                lastEventId, "", "", startedAt, completedAt, completionReport, createdAt, updatedAt);
     }
 }

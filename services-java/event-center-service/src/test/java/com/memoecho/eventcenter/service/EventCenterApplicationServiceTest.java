@@ -11,9 +11,11 @@ import com.memoecho.eventcenter.dto.SnoozeEventRequest;
 import com.memoecho.eventcenter.dto.SenderPayload;
 import com.memoecho.eventcenter.dto.UnifiedEventPayload;
 import com.memoecho.eventcenter.model.StoredEvent;
+import com.memoecho.eventcenter.repository.EventRecordRepository;
 import com.memoecho.eventcenter.repository.InMemoryEventRecordRepository;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
+import org.springframework.http.HttpStatus;
 
 import java.util.List;
 import java.time.Instant;
@@ -26,6 +28,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.BDDMockito.given;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 import static org.mockito.ArgumentMatchers.any;
 
 class EventCenterApplicationServiceTest {
@@ -579,6 +582,28 @@ class EventCenterApplicationServiceTest {
                 messages.stream().map(ConversationMessageResponse::eventId).toList());
         assertEquals(source.eventId(), service.findOwnedSourceMessage("local-user", source.eventId())
                 .orElseThrow().eventId());
+    }
+
+    /**
+     * 历史查询失败时必须显式暴露 502 并携带完整诊断，
+     * 而不是静默返回空列表掩盖事件表问题。
+     */
+    @Test
+    void shouldExposeHistoryQueryFailureInsteadOfSilentlyEmptyList() {
+        EventRecordRepository repository = mock(EventRecordRepository.class);
+        AgentRuntimeDispatchClient dispatchClient = mock(AgentRuntimeDispatchClient.class);
+        QqConnectorMessageClient qqConnectorMessageClient = mock(QqConnectorMessageClient.class);
+        when(repository.findAll()).thenThrow(new IllegalStateException("json damaged"));
+        EventCenterApplicationService service = new EventCenterApplicationService(
+                repository, dispatchClient, qqConnectorMessageClient);
+
+        org.springframework.web.server.ResponseStatusException exception = org.junit.jupiter.api.Assertions.assertThrows(
+                org.springframework.web.server.ResponseStatusException.class,
+                () -> service.findConversationMessages("user-1", "10001", "qq", "private", 50, null, null));
+
+        assertEquals(HttpStatus.BAD_GATEWAY, exception.getStatusCode());
+        assertTrue(exception.getReason().contains("10001"));
+        verify(repository).findAll();
     }
 
     private UnifiedEventPayload createEvent(String eventId) {

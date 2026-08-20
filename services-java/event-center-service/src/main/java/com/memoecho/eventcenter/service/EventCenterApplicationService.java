@@ -697,6 +697,8 @@ public class EventCenterApplicationService {
 
     /**
      * 按会话时间窗读取消息。after 为包含边界，before 为排除边界，避免把任务创建前历史误作任务完成证据。
+     * 历史读取失败时记录完整诊断（请求范围、HTTP 状态、响应正文、数据库命中数、过滤前后数量），
+     * 并以 502 明确暴露给调用方，而不是静默返回空列表掩盖事实源问题。
      */
     public List<ConversationMessageResponse> findConversationMessages(
             String ownerUserId,
@@ -712,12 +714,81 @@ public class EventCenterApplicationService {
         Instant beforeInstant = parseTimestamp(before);
         Instant afterInstant = parseTimestamp(after);
 
-        List<StoredEvent> conversationEvents = repository.findAll().stream()
-                .filter(event -> isOwnedConversationEvent(ownerUserId, event))
-                .filter(event -> matchesFilters(event.payload(), platform, chatType, chatId))
-                .filter(event -> isWithinConversationWindow(event, beforeInstant, afterInstant))
-                .toList();
-        return buildConversationTimeline(conversationEvents, safeLimit, true);
+        List<StoredEvent> allEvents;
+        try {
+            allEvents = repository.findAll();
+        } catch (Exception exception) {
+            logHistoryFailure(ownerUserId, chatId, platform, chatType, safeLimit, before, after,
+                    0, -1, -1, exception);
+            throw historyQueryFailure("事件表查询失败。", chatId);
+        }
+        int dbHitCount = allEvents.size();
+
+        List<StoredEvent> filtered;
+        try {
+            filtered = allEvents.stream()
+                    .filter(event -> isOwnedConversationEvent(ownerUserId, event))
+                    .filter(event -> matchesFilters(event.payload(), platform, chatType, chatId))
+                    .filter(event -> isWithinConversationWindow(event, beforeInstant, afterInstant))
+                    .toList();
+        } catch (Exception exception) {
+            logHistoryFailure(ownerUserId, chatId, platform, chatType, safeLimit, before, after,
+                    dbHitCount, -1, -1, exception);
+            throw historyQueryFailure("事件过滤失败。", chatId);
+        }
+        int filteredCount = filtered.size();
+
+        try {
+            return buildConversationTimeline(filtered, safeLimit, true);
+        } catch (Exception exception) {
+            logHistoryFailure(ownerUserId, chatId, platform, chatType, safeLimit, before, after,
+                    dbHitCount, filteredCount, -1, exception);
+            throw historyQueryFailure("事件时间线解析失败。", chatId);
+        }
+    }
+
+    /**
+     * 记录历史查询失败的完整诊断信息。
+     * 覆盖请求范围、数据库命中数、过滤前后数量、拟返回的 HTTP 状态与响应正文。
+     */
+    private void logHistoryFailure(
+            String ownerUserId,
+            String chatId,
+            String platform,
+            String chatType,
+            int limit,
+            String before,
+            String after,
+            int dbHitCount,
+            int filteredCount,
+            int timelineCount,
+            Exception exception
+    ) {
+        String requestScope = "userId=" + ownerUserId + ", chatId=" + chatId
+                + ", platform=" + safeText(platform, "-") + ", chatType=" + safeText(chatType, "-")
+                + ", limit=" + limit + ", before=" + safeText(before, "-")
+                + ", after=" + safeText(after, "-");
+        log.error(
+                "历史查询失败 | 请求范围={} | dbHitCount={} | filteredBefore={} | filteredAfter={} | "
+                        + "httpStatus=502 | responseBody={\"error\":\"history_query_failed\"} | errorType={} | message={}",
+                requestScope,
+                dbHitCount,
+                filteredCount >= 0 ? filteredCount : -1,
+                timelineCount >= 0 ? timelineCount : -1,
+                exception.getClass().getSimpleName(),
+                safeText(exception.getMessage(), exception.toString())
+        );
+    }
+
+    /** 空值安全地回退到占位文本，避免诊断日志出现 null 字面量。 */
+    private static String safeText(String value, String fallback) {
+        return value == null || value.isBlank() ? fallback : value;
+    }
+
+    /** 构造历史查询失败的 502 响应，明确告知调用方不可静默使用空历史继续。 */
+    private ResponseStatusException historyQueryFailure(String detail, String chatId) {
+        return new ResponseStatusException(
+                HttpStatus.BAD_GATEWAY, detail + " chatId=" + chatId);
     }
 
     /**

@@ -22,6 +22,7 @@ public record DelegatedWorkflowStepResponse(
         String objective,
         String progressSummary,
         Instant startedAt,
-        Instant completedAt
+        Instant completedAt,
+        String startEventId
 ) {
 }

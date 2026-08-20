@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.memoecho.eventcenter.dto.ConversationSummaryResponse;
 import com.memoecho.eventcenter.dto.DelegatedTaskCompilationResponse;
 import com.memoecho.eventcenter.dto.DelegatedWorkflowCreateRequest;
+import com.memoecho.eventcenter.dto.DelegatedWorkflowArtifactRequest;
 import com.memoecho.eventcenter.dto.DelegatedWorkflowResponse;
 import com.memoecho.eventcenter.dto.DelegatedWorkflowStepCreateRequest;
 import com.memoecho.eventcenter.dto.DelegatedWorkflowStepCompleteRequest;
@@ -127,7 +128,7 @@ public class DelegatedWorkflowApplicationService {
     }
 
     /**
-     * 完成一个已激活步骤，并在同一事务中合并事实、解锁后继步骤和收口父工作流。
+     * 完成一个已激活步骤，并在同一事务中原子保存类型化产物、合并事实、解锁后继步骤和收口父工作流。
      * 父工作流行锁会串行化并发回调；重复提交已完成步骤时直接返回当前状态，不重复产生副作用。
      */
     @Transactional
@@ -151,7 +152,8 @@ public class DelegatedWorkflowApplicationService {
             throw conflict("步骤尚未激活，不能提前完成：" + stepKey);
         }
 
-        Map<String, Object> producedFacts = normalizeFacts(request.producedFacts());
+        List<DelegatedWorkflowArtifactRequest> artifacts = safeArtifacts(request.artifacts());
+        Map<String, Object> producedFacts = producedFactsFromArtifacts(current, artifacts, request.producedFacts());
         validateProducedFacts(current, producedFacts);
         Map<String, Object> mergedFacts = new LinkedHashMap<>(readObjectMap(workflow.factsJson()));
         mergedFacts.putAll(producedFacts);
@@ -160,6 +162,7 @@ public class DelegatedWorkflowApplicationService {
         String summary = defaultText(request.resultSummary(), "步骤已完成。");
         Map<String, Object> persistedResult = new LinkedHashMap<>();
         persistedResult.put("summary", summary);
+        persistedResult.put("artifacts", artifacts);
         persistedResult.put("producedFacts", producedFacts);
         persistedResult.put("result", request.result());
         int completed = taskRepository.completeWorkflowStep(
@@ -173,7 +176,8 @@ public class DelegatedWorkflowApplicationService {
         }
 
         List<DelegatedTask> afterCompletion = taskRepository.findByWorkflowId(workflowId);
-        activateReadySteps(userId, workflowId, afterCompletion, mergedFacts, now);
+        // 触发本次完成的事件成为后继步骤的起点水位，让后继步骤只把起点之后的证据纳入 L1。
+        activateReadySteps(userId, workflowId, afterCompletion, mergedFacts, now, request.sourceEventId());
         List<DelegatedTask> latestTasks = taskRepository.findByWorkflowId(workflowId);
         boolean allCompleted = !latestTasks.isEmpty()
                 && latestTasks.stream().allMatch(task -> "COMPLETED".equalsIgnoreCase(task.status()));
@@ -216,13 +220,61 @@ public class DelegatedWorkflowApplicationService {
         }
     }
 
+    /** 复制并校验类型化产物，保证 name 非空、不重复，且不能与声明事实冲突。 */
+    private List<DelegatedWorkflowArtifactRequest> safeArtifacts(List<DelegatedWorkflowArtifactRequest> artifacts) {
+        if (artifacts == null || artifacts.isEmpty()) {
+            return List.of();
+        }
+        List<DelegatedWorkflowArtifactRequest> normalized = new ArrayList<>();
+        Set<String> names = new HashSet<>();
+        for (DelegatedWorkflowArtifactRequest artifact : artifacts) {
+            String name = trimToNull(artifact.name());
+            if (name == null) {
+                throw badRequest("类型化产物缺少事实名称。");
+            }
+            String type = trimToNull(artifact.type());
+            if (type == null) {
+                throw badRequest("类型化产物 " + name + " 缺少类型。");
+            }
+            if (!names.add(name)) {
+                throw badRequest("类型化产物事实名称重复：" + name);
+            }
+            normalized.add(new DelegatedWorkflowArtifactRequest(
+                    type, name, artifact.value(), trimToNull(artifact.sourceEventId())));
+        }
+        return normalized;
+    }
+
+    /**
+     * 优先从类型化产物派生事实映射；未提供产物时回退到旧的 producedFacts 契约。
+     * 产物存在时以其 name→value 为准，避免同一事实出现两套值。
+     */
+    private Map<String, Object> producedFactsFromArtifacts(
+            DelegatedTask task,
+            List<DelegatedWorkflowArtifactRequest> artifacts,
+            Map<String, Object> producedFacts
+    ) {
+        if (artifacts.isEmpty()) {
+            return normalizeFacts(producedFacts);
+        }
+        Map<String, Object> derived = new LinkedHashMap<>();
+        for (DelegatedWorkflowArtifactRequest artifact : artifacts) {
+            if (!readStringList(task.producesFactsJson()).contains(artifact.name())) {
+                throw badRequest("步骤 " + task.stepKey() + " 的产物未在声明事实中：" + artifact.name());
+            }
+            derived.put(artifact.name(), artifact.value());
+        }
+        return derived;
+    }
+
     /** 仅激活依赖全部完成且所需事实全部存在的阻塞步骤。 */
     private void activateReadySteps(
             String userId,
             String workflowId,
             List<DelegatedTask> tasks,
             Map<String, Object> facts,
-            Instant now
+            Instant now,
+            String sourceEventId
     ) {
         Map<String, DelegatedTask> taskByKey = new HashMap<>();
         tasks.forEach(task -> taskByKey.put(task.stepKey(), task));
@@ -237,7 +289,7 @@ public class DelegatedWorkflowApplicationService {
             boolean factsReady = readStringList(task.requiredFactsJson()).stream().allMatch(facts::containsKey);
             if (dependenciesCompleted && factsReady) {
                 int activated = taskRepository.activateWorkflowStep(
-                        workflowId, task.stepKey(), userId, "前置步骤与事实已就绪。", now);
+                        workflowId, task.stepKey(), userId, "前置步骤与事实已就绪。", now, sourceEventId);
                 if (activated == 1) {
                     dispatchRepository.enqueue(
                             task.workflowId(), task.stepKey(), task.activationVersion() + 1,
@@ -426,9 +478,22 @@ public class DelegatedWorkflowApplicationService {
                 compilation.deadlineText(), compilation.confidence(), compilation.clarificationQuestion(),
                 compilation.requiresConfirmation(), defaultText(compilation.executionMode(), "AUTO_COMPLETE"),
                 root ? defaultText(compilation.initialProgress(), "步骤已激活。") : "等待前置步骤完成。",
-                defaultText(compilation.stateJson(), "{}"), "", root ? now : null,
+                defaultText(compilation.stateJson(), "{}"), "", root ? trimToNull(step.startEventId()) : null,
+                buildConversationScopeJson(compilation), root ? now : null,
                 null, "", now, now
         );
+    }
+
+    /**
+     * 把步骤的目标会话固化为历史查询使用的会话范围。
+     * 私聊会话的 chatId 固定为对方平台账号，绝不使用 Agent 自身账号或临时推导值。
+     */
+    private String buildConversationScopeJson(DelegatedTaskCompilationResponse compilation) {
+        Map<String, String> scope = new LinkedHashMap<>();
+        scope.put("platform", defaultText(compilation.platform(), ""));
+        scope.put("chatType", defaultText(compilation.chatType(), ""));
+        scope.put("chatId", defaultText(compilation.chatId(), ""));
+        return writeJson(scope);
     }
 
     /** 将父工作流与排序后的步骤聚合为 API 响应。 */
@@ -440,7 +505,7 @@ public class DelegatedWorkflowApplicationService {
                         readStringList(task.producesFactsJson()), task.status(), task.activationVersion(),
                         task.targetName(), task.platform(),
                         task.chatType(), task.chatId(), task.objective(), task.progressSummary(),
-                        task.startedAt(), task.completedAt()))
+                        task.startedAt(), task.completedAt(), task.startEventId()))
                 .toList();
         return DelegatedWorkflowResponse.from(workflow, steps);
     }

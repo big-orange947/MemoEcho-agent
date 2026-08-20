@@ -15,6 +15,7 @@ public record DelegatedWorkflowStepCreateRequest(
         List<String> dependsOn,
         List<String> requiredFacts,
         List<String> producesFacts,
-        @NotNull @Valid DelegatedTaskCompilationResponse compilation
+        @NotNull @Valid DelegatedTaskCompilationResponse compilation,
+        String startEventId
 ) {
 }

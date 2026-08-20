@@ -4,6 +4,8 @@ import com.memoecho.eventcenter.dto.WorkspaceCommandRequest;
 import com.memoecho.eventcenter.dto.WorkspaceCommandResponse;
 import com.memoecho.eventcenter.dto.ConversationSummaryResponse;
 import com.memoecho.eventcenter.dto.DelegatedTaskResponse;
+import com.memoecho.eventcenter.dto.DelegatedTaskCurrentEventResponse;
+import com.memoecho.eventcenter.dto.DelegatedTaskCurrentEventUpsertRequest;
 import com.memoecho.eventcenter.dto.DelegatedTaskEventClaimRequest;
 import com.memoecho.eventcenter.dto.DelegatedTaskEventClaimResponse;
 import com.memoecho.eventcenter.dto.DelegatedTaskEventCompleteRequest;
@@ -171,6 +173,35 @@ public class InternalWorkspaceCommandController {
         boolean recovered = delegatedTaskApplicationService.recoverDormantCompletedEvent(
                 resolvedUserId, taskId, request.eventId());
         return ResponseEntity.ok(Map.of("recovered", recovered));
+    }
+
+    /**
+     * Runtime 在每次 LangGraph 执行前写入 L0 当前事件，保证当前事件不丢失。
+     * 会话范围由 Java 从步骤固化值生成，不从请求事件推导。
+     */
+    @PostMapping("/delegated/{taskId}/current-event")
+    public ResponseEntity<DelegatedTaskCurrentEventResponse> upsertDelegatedTaskCurrentEvent(
+            @RequestHeader("X-Memo-Echo-Runtime-Token") String runtimeToken,
+            @RequestHeader("X-Memo-Echo-User-Id") String userId,
+            @PathVariable String taskId,
+            @Valid @RequestBody DelegatedTaskCurrentEventUpsertRequest request
+    ) {
+        String resolvedUserId = userContextResolver.resolveRuntimeUser(runtimeToken, userId);
+        return ResponseEntity.ok(delegatedTaskApplicationService.upsertCurrentEvent(
+                resolvedUserId, taskId, request));
+    }
+
+    /** Runtime 读取步骤最近一次入站事件，历史接口失败时据此继续推理。 */
+    @GetMapping("/delegated/{taskId}/current-event")
+    public ResponseEntity<DelegatedTaskCurrentEventResponse> getDelegatedTaskCurrentEvent(
+            @RequestHeader("X-Memo-Echo-Runtime-Token") String runtimeToken,
+            @RequestHeader("X-Memo-Echo-User-Id") String userId,
+            @PathVariable String taskId
+    ) {
+        String resolvedUserId = userContextResolver.resolveRuntimeUser(runtimeToken, userId);
+        return delegatedTaskApplicationService.getCurrentEvent(resolvedUserId, taskId)
+                .map(ResponseEntity::ok)
+                .orElseGet(() -> ResponseEntity.notFound().build());
     }
 
     @GetMapping("/delegated/candidates")

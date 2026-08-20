@@ -33,9 +33,10 @@ public class JdbcDelegatedTaskRepository {
                             user_id, task_type, status, original_command, source_execution_id, target_query,
                             platform, chat_type, chat_id, target_name, objective, success_criteria,
                             deadline_text, confidence, clarification_question, requires_confirmation,
-                            execution_mode, progress_summary, state_json, last_event_id, started_at,
+                            execution_mode, progress_summary, state_json, last_event_id, start_event_id,
+                            conversation_scope_json, started_at,
                             completed_at, completion_report, created_at, updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                 task.id(), task.workflowId(), task.stepKey(), task.stepOrder(), task.stepRole(), task.stepInstruction(),
                 task.dependsOnJson(), task.requiredFactsJson(), task.producesFactsJson(), task.resultJson(),
@@ -44,7 +45,8 @@ public class JdbcDelegatedTaskRepository {
                 task.objective(), task.successCriteria(), task.deadlineText(), task.confidence(),
                 task.clarificationQuestion(), task.requiresConfirmation(), task.executionMode(),
                 nonNullText(task.progressSummary()), nonNullJson(task.stateJson()),
-                nonNullText(task.lastEventId()), timestamp(task.startedAt()),
+                nonNullText(task.lastEventId()), nonNullText(task.startEventId()),
+                nonNullText(task.conversationScopeJson()), timestamp(task.startedAt()),
                 timestamp(task.completedAt()), nonNullText(task.completionReport()), Timestamp.from(task.createdAt()),
                 Timestamp.from(task.updatedAt()));
         return task;
@@ -237,20 +239,23 @@ public class JdbcDelegatedTaskRepository {
                 Timestamp.from(completedAt), workflowId, stepKey, userId);
     }
 
-    /** 依赖和事实均满足时，将 BLOCKED 步骤幂等激活。 */
+    /** 依赖和事实均满足时，将 BLOCKED 步骤幂等激活，并记录起点水位。 */
     public int activateWorkflowStep(
             String workflowId,
             String stepKey,
             String userId,
             String progressSummary,
-            Instant startedAt
+            Instant startedAt,
+            String startEventId
     ) {
         return jdbcTemplate.update("""
                 UPDATE delegated_task
                 SET status = 'ACTIVE', progress_summary = ?, started_at = COALESCE(started_at, ?),
+                    start_event_id = CASE WHEN start_event_id = '' THEN ? ELSE start_event_id END,
                     activation_version = activation_version + 1, updated_at = ?
                 WHERE workflow_id = ? AND step_key = ? AND user_id = ? AND status = 'BLOCKED'
-                """, progressSummary, Timestamp.from(startedAt), Timestamp.from(startedAt),
+                """, progressSummary, Timestamp.from(startedAt), nonNullText(startEventId),
+                Timestamp.from(startedAt),
                 workflowId, stepKey, userId);
     }
 
@@ -273,6 +278,7 @@ public class JdbcDelegatedTaskRepository {
                     rs.getString("clarification_question"), rs.getBoolean("requires_confirmation"),
                     rs.getString("execution_mode"), rs.getString("progress_summary"),
                     rs.getString("state_json"), rs.getString("last_event_id"),
+                    text(rs, "start_event_id", ""), text(rs, "conversation_scope_json", ""),
                     instant(rs.getTimestamp("started_at")), instant(rs.getTimestamp("completed_at")),
                     rs.getString("completion_report"),
                     rs.getTimestamp("created_at").toInstant(), rs.getTimestamp("updated_at").toInstant()

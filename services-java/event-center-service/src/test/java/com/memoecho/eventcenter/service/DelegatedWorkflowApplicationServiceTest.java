@@ -2,6 +2,7 @@ package com.memoecho.eventcenter.service;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.memoecho.eventcenter.dto.DelegatedWorkflowResponse;
+import com.memoecho.eventcenter.dto.DelegatedWorkflowArtifactRequest;
 import com.memoecho.eventcenter.dto.DelegatedWorkflowStepCompleteRequest;
 import com.memoecho.eventcenter.model.DelegatedTask;
 import com.memoecho.eventcenter.model.DelegatedWorkflow;
@@ -70,7 +71,7 @@ class DelegatedWorkflowApplicationServiceTest {
                 eq(WORKFLOW_ID), eq("ask_contact"), eq(USER_ID), any(), any(), any()))
                 .thenReturn(1);
         when(taskRepository.activateWorkflowStep(
-                eq(WORKFLOW_ID), eq("notify_contact"), eq(USER_ID), any(), any()))
+                eq(WORKFLOW_ID), eq("notify_contact"), eq(USER_ID), any(), any(), any()))
                 .thenReturn(1);
         when(workflowRepository.findByIdAndUserId(WORKFLOW_ID, USER_ID))
                 .thenReturn(Optional.of(updatedWorkflow));
@@ -80,14 +81,14 @@ class DelegatedWorkflowApplicationServiceTest {
                 WORKFLOW_ID,
                 "ask_contact",
                 new DelegatedWorkflowStepCompleteRequest(
-                        Map.of("availability", "晚上七点"), "已确认时间", Map.of("accepted", true)));
+                        null, Map.of("availability", "晚上七点"), "已确认时间", Map.of("accepted", true), null));
 
         ArgumentCaptor<String> factsCaptor = ArgumentCaptor.forClass(String.class);
         verify(workflowRepository).updateRuntimeState(
                 eq(WORKFLOW_ID), eq(USER_ID), eq("RUNNING"), factsCaptor.capture(),
                 contains("1/2"), eq(""), any(Instant.class), isNull());
         verify(taskRepository).activateWorkflowStep(
-                eq(WORKFLOW_ID), eq("notify_contact"), eq(USER_ID), any(), any(Instant.class));
+                eq(WORKFLOW_ID), eq("notify_contact"), eq(USER_ID), any(), any(Instant.class), any());
         verify(dispatchRepository).enqueue(
                 eq(WORKFLOW_ID), eq("notify_contact"), eq(1L),
                 eq("task-notify_contact"), eq(USER_ID), any(Instant.class));
@@ -124,7 +125,7 @@ class DelegatedWorkflowApplicationServiceTest {
                 USER_ID,
                 WORKFLOW_ID,
                 "finish",
-                new DelegatedWorkflowStepCompleteRequest(Map.of("result", "done"), "完成", "done"));
+                new DelegatedWorkflowStepCompleteRequest(null, Map.of("result", "done"), "完成", "done", null));
 
         verify(workflowRepository).updateRuntimeState(
                 eq(WORKFLOW_ID), eq(USER_ID), eq("COMPLETED"), any(),
@@ -154,13 +155,108 @@ class DelegatedWorkflowApplicationServiceTest {
                 WORKFLOW_ID,
                 "ask_contact",
                 new DelegatedWorkflowStepCompleteRequest(
-                        Map.of("availability", "重复值"), "重复回调", Map.of()));
+                        null, Map.of("availability", "重复值"), "重复回调", Map.of(), null));
 
         verify(taskRepository, never()).completeWorkflowStep(any(), any(), any(), any(), any(), any());
-        verify(taskRepository, never()).activateWorkflowStep(any(), any(), any(), any(), any());
+        verify(taskRepository, never()).activateWorkflowStep(any(), any(), any(), any(), any(), any());
         verify(workflowRepository, never()).updateRuntimeState(
                 any(), any(), any(), any(), any(), any(), any(), any());
         assertThat(response.steps()).extracting(step -> step.status()).containsExactly("COMPLETED");
+    }
+
+    /**
+     * 验证上游步骤通过类型化产物发布事实时，产物名称被合并为共享事实，
+     * 类型化产物连同来源事件写入步骤结果，后继步骤以触发事件作为起点水位被激活。
+     */
+    @Test
+    void shouldPublishTypedArtifactAndActivateSuccessorWithWatermark() throws Exception {
+        DelegatedWorkflow runningWorkflow = workflow("RUNNING", "{}", "工作流正在执行。", null);
+        DelegatedTask activeRoot = task(
+                "ask_km", 1, "ACTIVE", "[]", "[]", "[\"class_time\"]");
+        DelegatedTask blockedChild = task(
+                "relay_xiaohao", 2, "BLOCKED", "[\"ask_km\"]",
+                "[\"class_time\"]", "[\"relay_result\"]");
+        DelegatedTask completedRoot = withStatus(activeRoot, "COMPLETED");
+        DelegatedTask activeChild = withStatus(blockedChild, "ACTIVE");
+        DelegatedWorkflow updatedWorkflow = workflow(
+                "RUNNING", "{\"class_time\":\"19:30\"}", "已完成 1/2 个步骤。", null);
+
+        when(workflowRepository.findByIdAndUserIdForUpdate(WORKFLOW_ID, USER_ID))
+                .thenReturn(Optional.of(runningWorkflow));
+        when(taskRepository.findByWorkflowId(WORKFLOW_ID)).thenReturn(
+                List.of(activeRoot, blockedChild),
+                List.of(completedRoot, blockedChild),
+                List.of(completedRoot, activeChild),
+                List.of(completedRoot, activeChild));
+        when(taskRepository.completeWorkflowStep(
+                eq(WORKFLOW_ID), eq("ask_km"), eq(USER_ID), any(), any(), any()))
+                .thenReturn(1);
+        when(taskRepository.activateWorkflowStep(
+                eq(WORKFLOW_ID), eq("relay_xiaohao"), eq(USER_ID), any(), any(), eq("event-km-reply")))
+                .thenReturn(1);
+        when(workflowRepository.findByIdAndUserId(WORKFLOW_ID, USER_ID))
+                .thenReturn(Optional.of(updatedWorkflow));
+
+        DelegatedWorkflowResponse response = service.completeStep(
+                USER_ID,
+                WORKFLOW_ID,
+                "ask_km",
+                new DelegatedWorkflowStepCompleteRequest(
+                        List.of(new DelegatedWorkflowArtifactRequest(
+                                "CLASS_TIME", "class_time", "19:30", "event-km-reply")),
+                        Map.of(),
+                        "已收到上课时间",
+                        Map.of("accepted", true),
+                        "event-km-reply"));
+
+        ArgumentCaptor<String> factsCaptor = ArgumentCaptor.forClass(String.class);
+        verify(workflowRepository).updateRuntimeState(
+                eq(WORKFLOW_ID), eq(USER_ID), eq("RUNNING"), factsCaptor.capture(),
+                contains("1/2"), eq(""), any(Instant.class), isNull());
+        assertThat(objectMapper.readTree(factsCaptor.getValue()).path("class_time").asText())
+                .isEqualTo("19:30");
+        // 类型化产物与来源事件必须原子写入步骤结果。
+        ArgumentCaptor<String> resultCaptor = ArgumentCaptor.forClass(String.class);
+        verify(taskRepository).completeWorkflowStep(
+                eq(WORKFLOW_ID), eq("ask_km"), eq(USER_ID), resultCaptor.capture(), any(), any());
+        var artifactsNode = objectMapper.readTree(resultCaptor.getValue()).path("artifacts");
+        assertThat(artifactsNode).isNotEmpty();
+        assertThat(artifactsNode.get(0).path("type").asText()).isEqualTo("CLASS_TIME");
+        assertThat(artifactsNode.get(0).path("sourceEventId").asText()).isEqualTo("event-km-reply");
+        // 后继步骤以触发事件为起点水位激活。
+        verify(taskRepository).activateWorkflowStep(
+                eq(WORKFLOW_ID), eq("relay_xiaohao"), eq(USER_ID), any(), any(Instant.class),
+                eq("event-km-reply"));
+        assertThat(response.steps()).extracting(step -> step.status())
+                .containsExactly("COMPLETED", "ACTIVE");
+    }
+
+    /**
+     * 验证类型化产物必须声明在 producesFacts 中，未声明产物被拒绝而不是静默入库。
+     */
+    @Test
+    void shouldRejectArtifactNotDeclaredInProducesFacts() {
+        DelegatedWorkflow runningWorkflow = workflow("RUNNING", "{}", "工作流正在执行。", null);
+        DelegatedTask activeRoot = task("ask_km", 1, "ACTIVE", "[]", "[]", "[\"class_time\"]");
+        when(workflowRepository.findByIdAndUserIdForUpdate(WORKFLOW_ID, USER_ID))
+                .thenReturn(Optional.of(runningWorkflow));
+        when(taskRepository.findByWorkflowId(WORKFLOW_ID)).thenReturn(List.of(activeRoot));
+
+        org.junit.jupiter.api.Assertions.assertThrows(
+                org.springframework.web.server.ResponseStatusException.class,
+                () -> service.completeStep(
+                        USER_ID,
+                        WORKFLOW_ID,
+                        "ask_km",
+                        new DelegatedWorkflowStepCompleteRequest(
+                                List.of(new DelegatedWorkflowArtifactRequest(
+                                        "SECRET", "leaked_value", "不应入库", null)),
+                                Map.of(),
+                                "错误产物",
+                                Map.of(),
+                                null)));
+
+        verify(taskRepository, never()).completeWorkflowStep(any(), any(), any(), any(), any(), any());
     }
 
     /** 创建测试用父工作流，集中维护与状态推进无关的固定字段。 */
@@ -211,6 +307,8 @@ class DelegatedWorkflowApplicationServiceTest {
                 "等待执行",
                 "{}",
                 "",
+                "",
+                "",
                 CREATED_AT,
                 null,
                 "",
@@ -228,7 +326,7 @@ class DelegatedWorkflowApplicationServiceTest {
                 task.platform(), task.chatType(), task.chatId(), task.targetName(), task.objective(),
                 task.successCriteria(), task.deadlineText(), task.confidence(), task.clarificationQuestion(),
                 task.requiresConfirmation(), task.executionMode(), task.progressSummary(), task.stateJson(),
-                task.lastEventId(), task.startedAt(),
+                task.lastEventId(), task.startEventId(), task.conversationScopeJson(), task.startedAt(),
                 "COMPLETED".equals(status) ? CREATED_AT.plusSeconds(60) : task.completedAt(),
                 task.completionReport(), task.createdAt(), CREATED_AT.plusSeconds(60));
     }

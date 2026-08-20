@@ -316,6 +316,8 @@ CREATE TABLE IF NOT EXISTS delegated_task (
     progress_summary CLOB NOT NULL DEFAULT '',
     state_json CLOB NOT NULL DEFAULT '{}',
     last_event_id VARCHAR(255) NOT NULL DEFAULT '',
+    start_event_id VARCHAR(255) NOT NULL DEFAULT '',
+    conversation_scope_json VARCHAR(512) NOT NULL DEFAULT '',
     started_at TIMESTAMP NULL,
     completed_at TIMESTAMP NULL,
     completion_report CLOB NOT NULL DEFAULT '',
@@ -337,3 +339,23 @@ CREATE UNIQUE INDEX IF NOT EXISTS uk_delegated_task_workflow_step
     ON delegated_task (workflow_id, step_key);
 CREATE INDEX IF NOT EXISTS idx_delegated_task_workflow_status
     ON delegated_task (workflow_id, status, step_order);
+
+-- L0 当前事件：每次 LangGraph 执行前把当前入站事件写入这里，历史接口失败时仍可基于它继续推理。
+CREATE TABLE IF NOT EXISTS delegated_task_current_event (
+    task_id VARCHAR(64) PRIMARY KEY,
+    workflow_id VARCHAR(64) NOT NULL,
+    step_key VARCHAR(128) NOT NULL DEFAULT '',
+    conversation_scope_json VARCHAR(512) NOT NULL DEFAULT '',
+    event_id VARCHAR(255) NOT NULL,
+    event_type VARCHAR(64) NOT NULL DEFAULT '',
+    sender_id VARCHAR(255) NOT NULL DEFAULT '',
+    text CLOB NOT NULL,
+    occurred_at TIMESTAMP NOT NULL,
+    payload_json CLOB NOT NULL,
+    updated_at TIMESTAMP NOT NULL,
+    CONSTRAINT fk_delegated_task_current_event_task
+        FOREIGN KEY (task_id) REFERENCES delegated_task(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_delegated_task_current_event_workflow
+    ON delegated_task_current_event (workflow_id, step_key, updated_at);

@@ -1,12 +1,18 @@
 package com.memoecho.eventcenter.service;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.memoecho.eventcenter.dto.ConversationSummaryResponse;
 import com.memoecho.eventcenter.dto.DelegatedTaskCompilationResponse;
+import com.memoecho.eventcenter.dto.DelegatedTaskCurrentEventResponse;
+import com.memoecho.eventcenter.dto.DelegatedTaskCurrentEventUpsertRequest;
 import com.memoecho.eventcenter.dto.DelegatedTaskEventClaimResponse;
 import com.memoecho.eventcenter.dto.DelegatedTaskResponse;
 import com.memoecho.eventcenter.dto.DelegatedTaskRuntimeUpdateRequest;
 import com.memoecho.eventcenter.dto.QqContactResponse;
 import com.memoecho.eventcenter.model.DelegatedTask;
+import com.memoecho.eventcenter.model.DelegatedTaskCurrentEvent;
+import com.memoecho.eventcenter.repository.JdbcDelegatedTaskCurrentEventRepository;
 import com.memoecho.eventcenter.repository.JdbcDelegatedTaskRepository;
 import com.memoecho.eventcenter.repository.JdbcDelegatedTaskEventClaimRepository;
 import org.slf4j.Logger;
@@ -38,25 +44,31 @@ public class DelegatedTaskApplicationService {
     private final DelegatedTaskIntentParser intentParser;
     private final JdbcDelegatedTaskRepository repository;
     private final JdbcDelegatedTaskEventClaimRepository eventClaimRepository;
+    private final JdbcDelegatedTaskCurrentEventRepository currentEventRepository;
     private final EventCenterApplicationService eventCenterApplicationService;
     private final QqConnectorContactClient qqConnectorContactClient;
     private final AgentRuntimeDispatchClient runtimeClient;
+    private final ObjectMapper objectMapper;
 
     /** 注入本地降级解析器、数据库、会话目录与 Python LangGraph 客户端。 */
     public DelegatedTaskApplicationService(
             DelegatedTaskIntentParser intentParser,
             JdbcDelegatedTaskRepository repository,
             JdbcDelegatedTaskEventClaimRepository eventClaimRepository,
+            JdbcDelegatedTaskCurrentEventRepository currentEventRepository,
             EventCenterApplicationService eventCenterApplicationService,
             QqConnectorContactClient qqConnectorContactClient,
-            AgentRuntimeDispatchClient runtimeClient
+            AgentRuntimeDispatchClient runtimeClient,
+            ObjectMapper objectMapper
     ) {
         this.intentParser = intentParser;
         this.repository = repository;
         this.eventClaimRepository = eventClaimRepository;
+        this.currentEventRepository = currentEventRepository;
         this.eventCenterApplicationService = eventCenterApplicationService;
         this.qqConnectorContactClient = qqConnectorContactClient;
         this.runtimeClient = runtimeClient;
+        this.objectMapper = objectMapper;
     }
 
     /**
@@ -328,6 +340,64 @@ public class DelegatedTaskApplicationService {
         requireTask(userId, taskId);
         if (!eventClaimRepository.release(taskId, userId, clean(eventId), clean(claimToken))) {
             throw new ResponseStatusException(HttpStatus.CONFLICT, "事件租约不存在、已过期或已被接管。");
+        }
+    }
+
+    /**
+     * 每次 LangGraph 执行前写入 L0 当前事件。
+     * 会话范围固定取自步骤自身固化的 conversationScopeJson，不从请求事件临时推导；
+     * 即使历史查询接口失败，Runtime 仍可读取当前事件继续推理。
+     */
+    public DelegatedTaskCurrentEventResponse upsertCurrentEvent(
+            String userId,
+            String taskId,
+            DelegatedTaskCurrentEventUpsertRequest request
+    ) {
+        DelegatedTask task = requireTask(userId, taskId);
+        String normalizedEventId = clean(request.eventId());
+        if (normalizedEventId.isBlank()) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "事件标识不能为空。");
+        }
+        Instant now = Instant.now();
+        Instant occurredAt = request.occurredAt() == null ? now : request.occurredAt();
+        DelegatedTaskCurrentEvent event = new DelegatedTaskCurrentEvent(
+                task.id(),
+                task.workflowId() == null ? "" : task.workflowId(),
+                task.stepKey(),
+                task.conversationScopeJson(),
+                normalizedEventId,
+                clean(request.eventType()),
+                clean(request.senderId()),
+                clean(request.text()),
+                occurredAt,
+                writeJson(request.payload() == null ? Map.of() : request.payload()),
+                now
+        );
+        currentEventRepository.upsert(event);
+        return toCurrentEventResponse(event);
+    }
+
+    /** 读取步骤最近一次入站事件；不存在时返回空，调用方决定是否用其他上下文继续。 */
+    public Optional<DelegatedTaskCurrentEventResponse> getCurrentEvent(String userId, String taskId) {
+        DelegatedTask task = requireTask(userId, taskId);
+        return currentEventRepository.findByTaskId(task.id())
+                .map(DelegatedTaskApplicationService::toCurrentEventResponse);
+    }
+
+    /** 将 L0 记录转换为 API 视图。 */
+    private static DelegatedTaskCurrentEventResponse toCurrentEventResponse(DelegatedTaskCurrentEvent event) {
+        return new DelegatedTaskCurrentEventResponse(
+                event.taskId(), event.workflowId(), event.stepKey(), event.conversationScopeJson(),
+                event.eventId(), event.eventType(), event.senderId(), event.text(),
+                event.occurredAt(), event.payloadJson());
+    }
+
+    /** 将入站事件载荷序列化为数据库 JSON 文本；序列化失败时视为无效输入。 */
+    private String writeJson(Object value) {
+        try {
+            return objectMapper.writeValueAsString(value);
+        } catch (JsonProcessingException exception) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "当前事件载荷无法序列化。", exception);
         }
     }
 

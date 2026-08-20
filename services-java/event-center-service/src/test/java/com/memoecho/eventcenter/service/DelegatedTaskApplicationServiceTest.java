@@ -2,8 +2,11 @@ package com.memoecho.eventcenter.service;
 
 import com.memoecho.eventcenter.dto.ConversationSummaryResponse;
 import com.memoecho.eventcenter.dto.DelegatedTaskCompilationResponse;
+import com.memoecho.eventcenter.dto.DelegatedTaskCurrentEventResponse;
+import com.memoecho.eventcenter.dto.DelegatedTaskCurrentEventUpsertRequest;
 import com.memoecho.eventcenter.dto.QqContactResponse;
 import com.memoecho.eventcenter.model.DelegatedTask;
+import com.memoecho.eventcenter.repository.JdbcDelegatedTaskCurrentEventRepository;
 import com.memoecho.eventcenter.repository.JdbcDelegatedTaskRepository;
 import com.memoecho.eventcenter.repository.JdbcDelegatedTaskEventClaimRepository;
 import org.junit.jupiter.api.Test;
@@ -26,11 +29,14 @@ class DelegatedTaskApplicationServiceTest {
     private final DelegatedTaskIntentParser parser = mock(DelegatedTaskIntentParser.class);
     private final JdbcDelegatedTaskRepository repository = mock(JdbcDelegatedTaskRepository.class);
     private final JdbcDelegatedTaskEventClaimRepository eventClaimRepository = mock(JdbcDelegatedTaskEventClaimRepository.class);
+    private final JdbcDelegatedTaskCurrentEventRepository currentEventRepository = mock(JdbcDelegatedTaskCurrentEventRepository.class);
     private final EventCenterApplicationService eventCenter = mock(EventCenterApplicationService.class);
     private final QqConnectorContactClient contactClient = mock(QqConnectorContactClient.class);
     private final AgentRuntimeDispatchClient runtimeDispatchClient = mock(AgentRuntimeDispatchClient.class);
     private final DelegatedTaskApplicationService service = new DelegatedTaskApplicationService(
-            parser, repository, eventClaimRepository, eventCenter, contactClient, runtimeDispatchClient);
+            parser, repository, eventClaimRepository, currentEventRepository,
+            eventCenter, contactClient, runtimeDispatchClient,
+            new com.fasterxml.jackson.databind.ObjectMapper());
 
     /** 创建任务时只能读取当前用户的会话摘要，不能使用全局会话列表。 */
     @Test
@@ -228,6 +234,65 @@ class DelegatedTaskApplicationServiceTest {
         assertThat(recovered).isTrue();
         verify(eventClaimRepository).recoverDormantCompleted(
                 "task-recover", "freeze", "event-001"
+        );
+    }
+
+    /**
+     * 写入 L0 当前事件时，会话范围必须取自步骤固化的 conversationScopeJson，
+     * 而不是请求事件中的临时值。
+     */
+    @Test
+    void shouldPersistCurrentEventWithStepBoundConversationScope() {
+        DelegatedTask task = taskWithScope("task-l0", "ACTIVE");
+        when(repository.findByIdAndUserId("task-l0", "freeze")).thenReturn(Optional.of(task));
+        when(currentEventRepository.upsert(any(com.memoecho.eventcenter.model.DelegatedTaskCurrentEvent.class)))
+                .thenAnswer(invocation -> invocation.getArgument(0));
+
+        DelegatedTaskCurrentEventResponse response = service.upsertCurrentEvent(
+                "freeze",
+                "task-l0",
+                new DelegatedTaskCurrentEventUpsertRequest(
+                        "event-km-reply",
+                        "message",
+                        "10001",
+                        "七点半",
+                        Instant.parse("2026-08-20T08:00:00Z"),
+                        java.util.Map.of("text", "七点半")));
+
+        assertThat(response.eventId()).isEqualTo("event-km-reply");
+        assertThat(response.text()).isEqualTo("七点半");
+        assertThat(response.conversationScopeJson()).contains("\"chatId\":\"10001\"");
+        assertThat(response.taskId()).isEqualTo("task-l0");
+    }
+
+    /** 读取步骤最近一次入站事件，供历史接口失败时继续推理。 */
+    @Test
+    void shouldReadCurrentEventForTask() {
+        DelegatedTask task = taskWithScope("task-l0", "ACTIVE");
+        when(repository.findByIdAndUserId("task-l0", "freeze")).thenReturn(Optional.of(task));
+        when(currentEventRepository.findByTaskId("task-l0"))
+                .thenReturn(Optional.of(new com.memoecho.eventcenter.model.DelegatedTaskCurrentEvent(
+                        "task-l0", "workflow-1", "ask_km",
+                        "{\"platform\":\"qq\",\"chatType\":\"private\",\"chatId\":\"10001\"}",
+                        "event-km-reply", "message", "10001", "七点半",
+                        Instant.parse("2026-08-20T08:00:00Z"), "{}", Instant.now())));
+
+        DelegatedTaskCurrentEventResponse response = service.getCurrentEvent("freeze", "task-l0").orElseThrow();
+        assertThat(response.eventId()).isEqualTo("event-km-reply");
+        assertThat(response.payloadJson()).isEqualTo("{}");
+    }
+
+    /** 构造带固定会话范围的任务，验证 L0 使用步骤固化范围而非事件临时值。 */
+    private DelegatedTask taskWithScope(String id, String status) {
+        Instant now = Instant.parse("2026-07-20T08:00:00Z");
+        return new DelegatedTask(
+                id, "workflow-1", "ask_km", 1, "ASK", "询问 km 上课时间",
+                "[]", "[]", "[\"class_time\"]", "{}", 1L,
+                "freeze", "WORKFLOW_STEP", status, "询问上课时间", "execution-1",
+                "km", "qq", "private", "10001", "km", "获得上课时间", "收到明确时间",
+                "", 0.9d, "", false, "AUTO_COMPLETE", "步骤已激活。", "{}", "",
+                "event-start", "{\"platform\":\"qq\",\"chatType\":\"private\",\"chatId\":\"10001\"}",
+                now, null, "", now, now
         );
     }
 

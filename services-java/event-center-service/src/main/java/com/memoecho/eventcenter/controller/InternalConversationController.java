@@ -77,12 +77,9 @@ public class InternalConversationController {
         String resolvedUserId = authorization != null && !authorization.isBlank()
                 ? userContextResolver.resolve(authorization, userId)
                 : userContextResolver.resolveRuntimeUser(runtimeToken, userId);
-        try {
-            return ResponseEntity.ok(applicationService.findConversationMessages(
-                    resolvedUserId, chatId, platform, chatType, limit, before, after));
-        } catch (Exception exception) {
-            // 历史上下文是可选能力，数据库中存在旧记录异常时不能阻塞私聊主链路。
-            return ResponseEntity.ok(List.of());
-        }
+        // 历史读取失败必须如实暴露：服务层已记录请求范围、数据库命中数、过滤前后数量等完整诊断，
+        // 调用方（Runtime）据此改用 L0 当前事件继续推理，而不是静默拿到空历史。
+        return ResponseEntity.ok(applicationService.findConversationMessages(
+                resolvedUserId, chatId, platform, chatType, limit, before, after));
     }
 }
