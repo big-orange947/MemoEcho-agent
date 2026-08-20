@@ -53,6 +53,10 @@ from app.tools.send_secure_asset_tool import SendSecureAssetTool
 from app.tools.base import ToolExecutionContext
 from app.tools.qq_group_operations_tool import ManageQqGroupTool, QueryQqGroupTool
 from app.workflows.delegated_task_graph import DelegatedTaskWorkflow, WorkflowPlanningError
+from app.workflows.delegated_execution_graph import (
+    DelegatedExecutionGraph,
+    build_delegated_execution_graph,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -163,6 +167,11 @@ class OrchestratorService:
             memory_candidate_extractor=MemoryCandidateExtractor(event_center_client, llm_client),
             task_completion_service=ConversationTaskCompletionService(event_center_client, llm_client),
             delegated_task_workflow=DelegatedTaskWorkflow(llm_client, event_center_client),
+        )
+        # 生产链路使用带 SQLite Checkpointer 的固定主链路执行图，以 workflowId 为 thread key。
+        service._delegated_execution_graph = build_delegated_execution_graph(
+            delegated_task_workflow=service.delegated_task_workflow,
+            event_center_client=event_center_client,
         )
         slow_channel_buffer.set_flush_callback(service._publish_slow_channel_digest)
         return service
@@ -902,20 +911,70 @@ class OrchestratorService:
             skill_context_enabled=bool(resolved_skills),
         )
         delegated_action = None
+        delegated_claim_token_effective = delegated_claim_token
+        execution_persisted = False
+        execution_write_back_actions: list[str] = []
         if delegated_task:
-            # 主控台委托先由任务图决定发送、等待或结束，不能先生成回复再补做状态判断。
+            # 主控台委托先由固定主链路图决定发送、等待或结束，不能先生成回复再补做状态判断。
             if (
                 self._is_delegated_peer_inbound(event)
                 and not await self._wait_for_latest_delegated_inbound(event, inbound_conversation_version)
             ):
+                # 同一会话已收到更新的联系人消息：本事件合并到最新上下文，仅保留等待状态。
                 delegated_action = self._build_superseded_delegated_wait_action(event, delegated_task)
             else:
-                delegated_action = await self._decide_delegated_task_action(
+                execution = await self._delegated_execution(
                     event=event,
                     task=delegated_task,
-                    history_context=history_context,
                     model_profile=resolved_model_profile,
+                    claim_token=delegated_claim_token or "",
                 )
+                delegated_claim_token_effective = str(
+                    execution.get("claim_token") or delegated_claim_token or ""
+                )
+                execution_persisted = bool(execution.get("persisted"))
+                execution_write_back_actions = list(execution.get("write_back_actions") or [])
+                if execution.get("decision"):
+                    delegated_action = DelegatedTaskActionDecision.model_validate(
+                        execution["decision"]
+                    )
+                if str(execution.get("route") or "") == "claim_unavailable":
+                    self._log_delegated_trace(
+                        "task_event_claim_skipped",
+                        execution_id=execution_id,
+                        event=event,
+                        task_id=str(delegated_task.get("id") or ""),
+                    )
+                    return OrchestratorResult(
+                        execution_id=execution_id,
+                        status="success",
+                        route="social_reply",
+                        summary="Delegated event is already leased or completed.",
+                        results=[],
+                        final_reply="",
+                        write_back_actions=["delegated_task_event:skipped"],
+                        notification=None,
+                        verified_memory_ids=[],
+                    )
+                if str(execution.get("route") or "") == "retry":
+                    # 主链路图持久化失败并已释放租约；返回无持久效果结果，让投递方重试。
+                    self._log_delegated_trace(
+                        "task_transition_retry",
+                        execution_id=execution_id,
+                        event=event,
+                        task_id=str(delegated_task.get("id") or ""),
+                    )
+                    return OrchestratorResult(
+                        execution_id=execution_id,
+                        status="success",
+                        route="social_reply",
+                        summary="Delegated transition persistence failed; claim released for retry.",
+                        results=[],
+                        final_reply="",
+                        write_back_actions=["delegated_task_transition:retry"],
+                        notification=None,
+                        verified_memory_ids=[],
+                    )
             if delegated_action:
                 self._log_delegated_trace(
                     "task_action_decided",
@@ -937,7 +996,7 @@ class OrchestratorService:
                 await self._complete_delegated_event(
                     event,
                     delegated_task,
-                    delegated_claim_token,
+                    delegated_claim_token_effective,
                 )
                 return OrchestratorResult(
                     execution_id=execution_id,
@@ -958,29 +1017,32 @@ class OrchestratorService:
                     structured_result=delegated_action.model_dump(by_alias=True),
                     reply_draft="",
                 )
-                persisted = await self._persist_delegated_task_decision(
-                    event=event,
-                    task=delegated_task,
-                    decision=delegated_action,
-                    results=[decision_result],
-                )
+                if not execution_persisted:
+                    # 兼容路径：经过超集判断但未由主链路图持久化的决策（如合并等待）
+                    # 回退到原持久化逻辑，再关闭事件租约。
+                    await self._persist_delegated_task_decision(
+                        event=event,
+                        task=delegated_task,
+                        decision=delegated_action,
+                        results=[decision_result],
+                    )
+                    await self._complete_delegated_event(
+                        event,
+                        delegated_task,
+                        delegated_claim_token_effective,
+                    )
                 self._log_delegated_trace(
                     "task_action_persisted",
                     execution_id=execution_id,
                     event=event,
                     task_id=str(delegated_task.get("id") or ""),
                     action=delegated_action.action,
-                    persisted=persisted,
+                    persisted=execution_persisted,
                 )
                 action_name = delegated_action.action.lower()
-                write_back_actions = [f"delegated_task_action:{action_name}"]
-                if persisted:
-                    write_back_actions.append(f"delegated_task_runtime_updated:{action_name}")
-                await self._complete_delegated_event(
-                    event,
-                    delegated_task,
-                    delegated_claim_token,
-                )
+                write_back_actions = execution_write_back_actions or [
+                    f"delegated_task_action:{action_name}"
+                ]
                 return OrchestratorResult(
                     execution_id=execution_id,
                     status="success",
@@ -1077,7 +1139,7 @@ class OrchestratorService:
             await self._complete_delegated_event(
                 event,
                 delegated_task,
-                delegated_claim_token,
+                delegated_claim_token_effective,
             )
             return OrchestratorResult(
                 execution_id=execution_id,
@@ -1155,7 +1217,7 @@ class OrchestratorService:
             await self._complete_delegated_event(
                 event,
                 delegated_task,
-                delegated_claim_token,
+                delegated_claim_token_effective,
             )
 
         return OrchestratorResult(
@@ -1693,6 +1755,29 @@ class OrchestratorService:
             task.get("allowPreTaskHistory", state.get("historyAccessAllowed", True)),
         )
         return str(value).strip().lower() not in {"false", "0", "no", "off"}
+
+    def _delegated_execution(
+        self,
+        *,
+        event: UnifiedEvent,
+        task: dict,
+        model_profile,
+        claim_token: str = "",
+    ):
+        """用固定主链路图执行委托事件；图随委托工作流实例懒加载重建。"""
+        graph = getattr(self, "_delegated_execution_graph", None)
+        if graph is None or getattr(graph, "delegated_task_workflow", None) is not self.delegated_task_workflow:
+            graph = DelegatedExecutionGraph(
+                delegated_task_workflow=self.delegated_task_workflow,
+                event_center_client=self.event_center_client,
+            )
+            self._delegated_execution_graph = graph
+        return graph.run(
+            event=event,
+            task=task,
+            model_profile=model_profile,
+            claim_token=claim_token,
+        )
 
     async def _decide_delegated_task_action(
         self,
