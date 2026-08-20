@@ -1840,11 +1840,11 @@ class OrchestratorWriteBackTest(unittest.IsolatedAsyncioTestCase):
             "startEventId": "qq:message:private:start",
         }
 
-        decision = await service._decide_delegated_task_action(
+        execution = await service._delegated_execution(
             event=event,
             task=task,
-            history_context=[],
             model_profile=None,
+            claim_token="claim:child-task-ask-km:km-reply",
         )
 
         # 1) 每次执行前都把当前入站事件写入 L0。
@@ -1867,21 +1867,9 @@ class OrchestratorWriteBackTest(unittest.IsolatedAsyncioTestCase):
             for row in (stub_workflow.seen_envelope.get("taskTimeline") or [])
         ]
         self.assertIn("七点半", timeline_texts)
-
-        # 4) 完成父步骤时发布类型化产物，Java 据此解锁小号步骤。
-        decision = SimpleNamespace(
-            action="COMPLETE_TASK",
-            requested_tool="complete_delegated_task",
-            progress_summary="已获得 km 的回复",
-            completion_report="km 回复七点半",
-            state_json="{}",
-            evidence=["km 回复：七点半"],
-        )
-        await service._persist_delegated_task_decision(
-            event=event,
-            task=task,
-            decision=decision,
-        )
+        # 4) 主链路图原子持久化转换并发布类型化产物，Java 据此解锁小号步骤。
+        self.assertEqual(execution.get("route"), "done")
+        self.assertTrue(execution.get("persisted"))
         self.assertEqual(1, len(event_center_client.delegated_workflow_completions))
         completion = event_center_client.delegated_workflow_completions[0]
         self.assertEqual(completion["producedFacts"], {"class_time": "七点半"})

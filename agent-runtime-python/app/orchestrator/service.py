@@ -24,7 +24,6 @@ from app.schemas.events import Sender, UnifiedEvent
 from app.schemas.delegated_tasks import (
     ConversationCandidate,
     DelegatedTaskActionDecision,
-    DelegatedTaskActionInput,
     DelegatedTaskCompileRequest,
     DelegatedTaskRuntimeInput,
 )
@@ -40,7 +39,6 @@ from app.schemas.skills import SkillDescriptor
 from app.schemas.tasks import AgentTaskContext
 from app.services.slow_channel_buffer import SlowChannelBuffer
 from app.services.conversation_state_service import ConversationStateService
-from app.services.delegated_task_context import DelegatedTaskContextAssembler
 from app.services.conversation_task_completion import ConversationTaskCompletionService
 from app.services.media_analysis_service import MediaAnalysisService
 from app.services.message_identity import canonical_message_identity, is_runtime_generated_message
@@ -1382,31 +1380,6 @@ class OrchestratorService:
                 type(exception).__name__,
             )
 
-    async def _persist_current_event(self, event: UnifiedEvent, task: dict) -> None:
-        """在每次 LangGraph 执行前把当前入站事件写入 L0，保证当前事件不丢失。
-
-        写入失败只记录诊断，不阻断推理：Java 事件表本身已在投递时持久化过该事件，
-        L0 是给“历史查询失败时仍能继续推理”提供的第二层事实源。
-        """
-        if self.event_center_client is None:
-            return
-        upsert = getattr(self.event_center_client, "upsert_delegated_task_current_event", None)
-        if not callable(upsert):
-            return
-        task_id = str(task.get("id") or "").strip()
-        if not task_id:
-            return
-        try:
-            await upsert(event, task_id)
-        except Exception as exception:
-            logger.warning(
-                "写入 L0 当前事件失败，继续使用内存事件推理：taskId=%s, eventId=%s, errorType=%s, message=%s",
-                task_id,
-                event.event_id,
-                type(exception).__name__,
-                str(exception),
-            )
-
     async def _load_current_event_for_task(self, event: UnifiedEvent, task: dict) -> dict | None:
         """历史查询失败时读取 L0 当前事件作为推理兜底；读取失败则返回 None。"""
         if self.event_center_client is None:
@@ -1499,53 +1472,6 @@ class OrchestratorService:
                 if merged:
                     return merged
             return history
-
-    async def _load_delegated_task_pre_history(
-        self,
-        event: UnifiedEvent,
-        task: dict,
-    ) -> list[dict]:
-        """按需读取起点前的有限窗口（L2），只作为背景，不能作为任务完成证据。"""
-        if self.event_center_client is None or not self._delegated_task_history_access_allowed(task):
-            return []
-        task_state = self._delegated_task_state(task)
-        platform, chat_type, chat_id = self._delegated_step_scope(task)
-        if not all((platform, chat_type, chat_id)):
-            platform, chat_type, chat_id = self._conversation_scope_from_row(
-                event.model_dump(by_alias=True)
-            )
-        started_at, _start_event_id = self._delegated_step_watermark(task, task_state)
-        query_before = (
-            started_at
-            or str(task_state.get("taskCreatedAt") or task.get("createdAt") or "").strip()
-        )
-        if not query_before:
-            return []
-        rows: list[dict] = []
-        try:
-            rows = await self.event_center_client.list_conversation_messages(
-                chat_id,
-                platform=platform,
-                chat_type=chat_type,
-                limit=30,
-                user_id=self._resolve_event_user_id(event),
-                before=query_before,
-            )
-            return self._filter_delegated_history_for_event(rows, event, task)
-        except Exception as exception:
-            logger.warning(
-                "读取任务前背景失败，继续使用任务内记忆。taskId=%s | %s",
-                task.get("id"),
-                self._history_failure_diagnostic(
-                    exception=exception,
-                    scope=(platform, chat_type, chat_id),
-                    after=None,
-                    before=query_before,
-                    limit=30,
-                    rows=rows,
-                ),
-            )
-            return []
 
     @classmethod
     def _history_failure_diagnostic(
@@ -1778,107 +1704,6 @@ class OrchestratorService:
             model_profile=model_profile,
             claim_token=claim_token,
         )
-
-    async def _decide_delegated_task_action(
-        self,
-        *,
-        event: UnifiedEvent,
-        task: dict,
-        history_context: list[dict],
-        model_profile,
-    ):
-        """在 SocialAgent 运行前恢复背景并决定发送、等待或结束。"""
-        task_id = str(task.get("id") or "").strip()
-        # 每次执行前先把当前入站事件写入 L0，历史接口失败时仍能基于它继续推理。
-        await self._persist_current_event(event, task)
-        history = await self._load_delegated_task_history(event, history_context, task)
-        task_state = self._delegated_task_state(task)
-        pre_task_history = list(task_state.get("preTaskHistory") or [])
-        history_access_allowed = self._delegated_task_history_access_allowed(task)
-        try:
-            decision = await self.delegated_task_workflow.decide_action(
-                DelegatedTaskActionInput(
-                    task=task,
-                    history=history,
-                    event=event.model_dump(by_alias=True),
-                    preTaskHistory=pre_task_history,
-                    historyAccessAllowed=history_access_allowed,
-                    contextEnvelope=self._build_delegated_context_envelope(
-                        event=event,
-                        task=task,
-                        task_history=history,
-                        pre_task_history=pre_task_history,
-                    ),
-                ),
-                model_profile,
-            )
-            # 只有模型显式请求、用户已授权且尚未缓存时，才读取起点前的有限背景（L2）。
-            if (
-                decision.requested_tool == "get_task_pre_history"
-                and history_access_allowed
-                and not pre_task_history
-            ):
-                pre_task_history = await self._load_delegated_task_pre_history(event, task)
-                decision = await self.delegated_task_workflow.decide_action(
-                    DelegatedTaskActionInput(
-                        task=task,
-                        history=history,
-                        event=event.model_dump(by_alias=True),
-                        preTaskHistory=pre_task_history,
-                        # 防止同一轮因为背景不足无限请求历史。
-                        historyAccessAllowed=False,
-                        contextEnvelope=self._build_delegated_context_envelope(
-                            event=event,
-                            task=task,
-                            task_history=history,
-                            pre_task_history=pre_task_history,
-                        ),
-                    ),
-                    model_profile,
-                )
-            return decision
-        except Exception as exception:
-            logger.warning(
-                "委托动作决策失败，本轮安全等待：taskId=%s, eventId=%s, error=%s",
-                task_id,
-                event.event_id,
-                type(exception).__name__,
-            )
-            # 决策图异常时不能伪造 SEND_MESSAGE。等待会保留任务和当前记忆，
-            # 下一条可信事件到达后再由模型重新决定，避免故障被放大成重复发送。
-            return DelegatedTaskActionDecision(
-                action="WAIT",
-                reason="决策图不可用，本轮不执行外部副作用",
-                progressSummary=str(task.get("progressSummary") or "等待下一次可靠决策"),
-                stateJson=str(task.get("stateJson") or "{}"),
-                lastEventId=self._stable_event_identity(event),
-                requestedTool="update_delegated_task",
-            )
-
-    def _build_delegated_context_envelope(
-        self,
-        *,
-        event: UnifiedEvent,
-        task: dict,
-        task_history: list[dict],
-        pre_task_history: list[dict],
-    ) -> dict:
-        """用统一 ContextAssembler 组装一次性可信上下文，状态图只消费该结果。"""
-        assembler = self._delegated_context_assembler()
-        return assembler.assemble(
-            event=event.model_dump(by_alias=True),
-            task=task,
-            task_history=task_history,
-            pre_task_history=pre_task_history or None,
-        )
-
-    def _delegated_context_assembler(self):
-        """延迟创建统一上下文组装器，避免在无委托任务的普通链路中承担初始化成本。"""
-        assembler = getattr(self, "_context_assembler", None)
-        if assembler is None:
-            assembler = DelegatedTaskContextAssembler()
-            object.__setattr__(self, "_context_assembler", assembler)
-        return assembler
 
     @staticmethod
     def _is_delegated_peer_inbound(event: UnifiedEvent) -> bool:
