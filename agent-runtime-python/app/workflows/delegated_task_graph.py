@@ -15,7 +15,8 @@ from langgraph.graph import END, START, StateGraph
 
 from app.clients.event_center_service import EventCenterServiceClient
 from app.clients.llm_service import LlmServiceClient
-from app.services.react_context import CandidateReplyGuard, MasterTaskContextBuilder
+from app.services.react_context import CandidateReplyGuard
+from app.services.delegated_task_context import build_model_context, internal_terms
 from app.services.message_identity import canonical_message_identity
 from app.schemas.react_protocol import CompletionReflectionDecision
 from app.schemas.delegated_tasks import (
@@ -106,8 +107,8 @@ class DelegatedTaskWorkflow:
         self.llm_client = llm_client
         # 历史读取属于只读观察，在 LangGraph 内执行后回灌模型上下文，不通过 Java 形成悬空动作。
         self.event_center_client = event_center_client or EventCenterServiceClient()
-        # 主控台任务只向模型暴露经过筛选的工作上下文，内部定位和执行字段保留在编排层。
-        self.context_builder = MasterTaskContextBuilder()
+        # 模型工作上下文统一由 delegated_task_context.build_model_context 投影，
+        # 不再保留独立的上下文构造器，避免重复组装同一份时间线。
         # 只有主控台委托图持有这些 LangChain 工具，会话设定集不经过该图，
         # 因而模型无法在设定集路径自主调用结束任务工具。
         self.action_tools = delegated_task_action_tools()
@@ -1265,7 +1266,7 @@ class DelegatedTaskWorkflow:
             pre_task_history = self._normalize_pre_task_history(
                 action_input.pre_task_history or previous_state.get("preTaskHistory")
             )
-        model_context = self.context_builder.build(
+        model_context = build_model_context(
             task=task,
             timeline=timeline,
             pre_task_history=pre_task_history,
@@ -1277,7 +1278,7 @@ class DelegatedTaskWorkflow:
                 previous_state.get("historyAccessAllowed", action_input.history_access_allowed)
             ),
             available_tools=(tool.name for tool in self.action_tools),
-        ).to_model_payload()
+        )
         system_prompt = (
             "你是 Memo Echo 主控台的任务执行规划器。只输出一个 JSON 对象，不要 Markdown。"
             "你不能直接执行任何操作，只能从以下工具中选择一个："
@@ -1454,7 +1455,7 @@ class DelegatedTaskWorkflow:
         if candidate:
             guard_result = self.reply_guard.validate(
                 candidate,
-                self.context_builder.internal_terms(task),
+                internal_terms(task),
             )
             if not guard_result.allowed:
                 evaluation.update(
@@ -1501,7 +1502,7 @@ class DelegatedTaskWorkflow:
         task = action_input.task
         guard_result = self.reply_guard.validate(
             candidate,
-            self.context_builder.internal_terms(task),
+            internal_terms(task),
         )
         if not guard_result.allowed:
             evaluation.update({"requestedTool": "update_delegated_task", "messageInstruction": ""})
@@ -1548,7 +1549,7 @@ class DelegatedTaskWorkflow:
         if revised:
             revised_guard = self.reply_guard.validate(
                 revised,
-                self.context_builder.internal_terms(task),
+                internal_terms(task),
             )
             if revised_guard.allowed:
                 evaluation["messageInstruction"] = revised
@@ -2528,8 +2529,7 @@ class DelegatedTaskWorkflow:
             "timeline": timeline[-500:],
             "currentEventId": str(event.get("eventId") or ""),
         }
-        # 旧 payload 仍在这里供编排层后续兼容使用；模型实际只接收安全工作上下文。
-        payload = self.context_builder.build(
+        payload = build_model_context(
             task=task,
             timeline=timeline,
             pre_task_history=self._normalize_pre_task_history(runtime_input.pre_task_history),
@@ -2541,7 +2541,7 @@ class DelegatedTaskWorkflow:
             resolved_time_text=resolved_time_text,
             history_access_allowed=runtime_input.history_access_allowed,
             available_tools=(tool.name for tool in self.action_tools),
-        ).to_model_payload()
+        )
         # 此分支仅作为旧入口的安全兜底。动作规划必须由上游 ReAct 节点通过
         # LangChain @tool 完成参数校验，不能再次让模型走另一套函数调用协议。
         try:
