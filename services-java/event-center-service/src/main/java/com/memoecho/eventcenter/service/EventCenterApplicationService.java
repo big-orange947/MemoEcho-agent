@@ -720,7 +720,7 @@ public class EventCenterApplicationService {
         } catch (Exception exception) {
             logHistoryFailure(ownerUserId, chatId, platform, chatType, safeLimit, before, after,
                     0, -1, -1, exception);
-            throw historyQueryFailure("事件表查询失败。", chatId);
+            throw historyQueryFailure("事件表查询失败。", chatId, 0, -1);
         }
         int dbHitCount = allEvents.size();
 
@@ -734,7 +734,7 @@ public class EventCenterApplicationService {
         } catch (Exception exception) {
             logHistoryFailure(ownerUserId, chatId, platform, chatType, safeLimit, before, after,
                     dbHitCount, -1, -1, exception);
-            throw historyQueryFailure("事件过滤失败。", chatId);
+            throw historyQueryFailure("事件过滤失败。", chatId, dbHitCount, -1);
         }
         int filteredCount = filtered.size();
 
@@ -743,7 +743,7 @@ public class EventCenterApplicationService {
         } catch (Exception exception) {
             logHistoryFailure(ownerUserId, chatId, platform, chatType, safeLimit, before, after,
                     dbHitCount, filteredCount, -1, exception);
-            throw historyQueryFailure("事件时间线解析失败。", chatId);
+            throw historyQueryFailure("事件时间线解析失败。", chatId, dbHitCount, filteredCount);
         }
     }
 
@@ -785,10 +785,17 @@ public class EventCenterApplicationService {
         return value == null || value.isBlank() ? fallback : value;
     }
 
-    /** 构造历史查询失败的 502 响应，明确告知调用方不可静默使用空历史继续。 */
-    private ResponseStatusException historyQueryFailure(String detail, String chatId) {
-        return new ResponseStatusException(
-                HttpStatus.BAD_GATEWAY, detail + " chatId=" + chatId);
+    /** 构造历史查询失败的 502 响应，并在消息中携带诊断计数供调用方记录。 */
+    private ResponseStatusException historyQueryFailure(
+            String detail,
+            String chatId,
+            int dbHitCount,
+            int filteredCount
+    ) {
+        String message = detail + " chatId=" + chatId
+                + ", dbHitCount=" + dbHitCount
+                + (filteredCount >= 0 ? ", filteredAfter=" + filteredCount : "");
+        return new ResponseStatusException(HttpStatus.BAD_GATEWAY, message);
     }
 
     /**

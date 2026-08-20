@@ -106,7 +106,9 @@ class InternalWorkspaceCommandControllerTest {
                 "对方明确接受或拒绝", "明天下午", 0.95, "", false,
                 "AUTO", "等待对方回复", "{}", "event-001", "2026-07-22T10:00:00Z",
                 null, "", "2026-07-22T09:59:00Z", "2026-07-22T10:01:00Z",
-                "workflow-001", "step-001", java.util.List.of("scheduled_time")
+                "workflow-001", "step-001", "ASK", "event-start",
+                "{\"platform\":\"qq\",\"chatType\":\"private\",\"chatId\":\"10002\"}",
+                java.util.List.of("scheduled_time")
         );
     }
 }

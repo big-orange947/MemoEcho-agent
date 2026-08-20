@@ -1,6 +1,7 @@
 import asyncio
 from contextlib import asynccontextmanager, suppress
 import logging
+from pathlib import Path
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 
@@ -27,6 +28,8 @@ from app.services.event_execution_registry import EventExecutionRegistry
 
 # 使用 Uvicorn 的错误日志器，确保首次自动下载和预热模型时用户能在启动控制台看到进度结果。
 logger = logging.getLogger("uvicorn.error")
+RUNTIME_REVISION = "delegated-workflow-facts-v2"
+RUNTIME_SOURCE_PATH = str(Path(__file__).resolve())
 orchestrator = OrchestratorService.build_default()
 conversation_progress_service = ConversationProgressService(
     orchestrator.event_center_client,
@@ -55,6 +58,12 @@ async def _warm_up_builtin_embedding() -> None:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     """管理运行时后台资源，在服务启动后自动加载无需配置的本地向量模型。"""
+    # 输出源码标识，便于发现端口上残留旧进程或从错误工作目录启动的问题。
+    logger.info(
+        "Agent Runtime 启动。revision=%s, source=%s",
+        RUNTIME_REVISION,
+        RUNTIME_SOURCE_PATH,
+    )
     warm_up_task = asyncio.create_task(_warm_up_builtin_embedding())
     yield
     if not warm_up_task.done():
@@ -68,7 +77,12 @@ app = FastAPI(title="Memo Echo Agent Runtime", version="0.1.0", lifespan=lifespa
 
 @app.get("/health")
 async def health() -> dict[str, str]:
-    return {"status": "ok"}
+    """返回健康状态及当前加载的代码标识，用于确认请求命中了预期进程。"""
+    return {
+        "status": "ok",
+        "runtimeRevision": RUNTIME_REVISION,
+        "sourcePath": RUNTIME_SOURCE_PATH,
+    }
 
 
 @app.post("/v1/events/handle", response_model=OrchestratorResult)

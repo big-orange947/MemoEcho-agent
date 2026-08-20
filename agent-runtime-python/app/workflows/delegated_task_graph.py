@@ -1005,7 +1005,14 @@ class DelegatedTaskWorkflow:
         elif not all(persisted_scope) and all(expected_scope) and task_scope != expected_scope:
             previous_state = {}
             task_anchor = self._resolve_task_anchor(runtime_input.task, previous_state)
-        rows = [*runtime_input.history, runtime_input.event]
+        # 统一组装器已生成可信时间线时直接复用，避免节点各自按时间或会话重复裁剪；
+        # 仅当未提供组装结果时，才回退到图内的历史 + 当前事件拼接。
+        # 输入可能是真实 Pydantic 模型或测试替身，因此用 getattr 兼容两者。
+        envelope_timeline = (getattr(runtime_input, "context_envelope", None) or {}).get("taskTimeline")
+        if isinstance(envelope_timeline, list) and envelope_timeline:
+            rows = [*envelope_timeline, runtime_input.event]
+        else:
+            rows = [*runtime_input.history, runtime_input.event]
         deduplicated: dict[str, dict[str, Any]] = {}
 
         # Java 的历史查询可能受分页窗口限制，先恢复上轮已持久化的规范时间线。
@@ -1108,6 +1115,7 @@ class DelegatedTaskWorkflow:
             writeBackActions=[],
             preTaskHistory=action_input.pre_task_history,
             historyAccessAllowed=action_input.history_access_allowed,
+            contextEnvelope=action_input.context_envelope,
         )
         timeline_state = self._build_timeline({"runtime_input": runtime_input})
         previous_state = timeline_state.get("previous_state") or {}

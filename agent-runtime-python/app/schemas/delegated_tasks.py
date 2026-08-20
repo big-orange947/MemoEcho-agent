@@ -88,6 +88,8 @@ class DelegatedTaskRuntimeInput(BaseModel):
     history: list[dict[str, Any]] = Field(default_factory=list)
     pre_task_history: list[dict[str, Any]] = Field(default_factory=list, alias="preTaskHistory")
     history_access_allowed: bool = Field(default=True, alias="historyAccessAllowed")
+    # 服务层一次性构建的可信上下文。状态图只读取该字段，避免节点重复裁剪历史消息。
+    context_envelope: dict[str, Any] = Field(default_factory=dict, alias="contextEnvelope")
     event: dict[str, Any]
     final_reply: str = Field(default="", alias="finalReply")
     write_back_actions: list[str] = Field(default_factory=list, alias="writeBackActions")
@@ -102,6 +104,8 @@ class DelegatedTaskActionInput(BaseModel):
     history: list[dict[str, Any]] = Field(default_factory=list)
     pre_task_history: list[dict[str, Any]] = Field(default_factory=list, alias="preTaskHistory")
     history_access_allowed: bool = Field(default=True, alias="historyAccessAllowed")
+    # 与运行时输入共用同一份上下文，保证动作决策与最终执行看到的事实一致。
+    context_envelope: dict[str, Any] = Field(default_factory=dict, alias="contextEnvelope")
     event: dict[str, Any]
 
     model_config = {"populate_by_name": True}

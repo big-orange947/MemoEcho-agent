@@ -40,6 +40,7 @@ from app.schemas.skills import SkillDescriptor
 from app.schemas.tasks import AgentTaskContext
 from app.services.slow_channel_buffer import SlowChannelBuffer
 from app.services.conversation_state_service import ConversationStateService
+from app.services.delegated_task_context import DelegatedTaskContextAssembler
 from app.services.conversation_task_completion import ConversationTaskCompletionService
 from app.services.media_analysis_service import MediaAnalysisService
 from app.services.message_identity import canonical_message_identity, is_runtime_generated_message
@@ -59,6 +60,14 @@ logger = logging.getLogger(__name__)
 
 class DelegatedWorkflowCompletionError(RuntimeError):
     """父工作流步骤完成回调失败；调用方必须保留当前消息以便重试。"""
+
+
+class DelegatedWorkflowFactsMissingError(DelegatedWorkflowCompletionError):
+    """父步骤声明事实不足；这是可恢复的业务等待状态，不是基础设施故障。"""
+
+    def __init__(self, missing_facts: list[str]) -> None:
+        self.missing_facts = tuple(missing_facts)
+        super().__init__("父工作流步骤缺少声明事实: " + ", ".join(missing_facts))
 
 
 class OrchestratorService:
@@ -1311,38 +1320,122 @@ class OrchestratorService:
                 type(exception).__name__,
             )
 
+    async def _persist_current_event(self, event: UnifiedEvent, task: dict) -> None:
+        """在每次 LangGraph 执行前把当前入站事件写入 L0，保证当前事件不丢失。
+
+        写入失败只记录诊断，不阻断推理：Java 事件表本身已在投递时持久化过该事件，
+        L0 是给“历史查询失败时仍能继续推理”提供的第二层事实源。
+        """
+        if self.event_center_client is None:
+            return
+        upsert = getattr(self.event_center_client, "upsert_delegated_task_current_event", None)
+        if not callable(upsert):
+            return
+        task_id = str(task.get("id") or "").strip()
+        if not task_id:
+            return
+        try:
+            await upsert(event, task_id)
+        except Exception as exception:
+            logger.warning(
+                "写入 L0 当前事件失败，继续使用内存事件推理：taskId=%s, eventId=%s, errorType=%s, message=%s",
+                task_id,
+                event.event_id,
+                type(exception).__name__,
+                str(exception),
+            )
+
+    async def _load_current_event_for_task(self, event: UnifiedEvent, task: dict) -> dict | None:
+        """历史查询失败时读取 L0 当前事件作为推理兜底；读取失败则返回 None。"""
+        if self.event_center_client is None:
+            return None
+        reader = getattr(self.event_center_client, "get_delegated_task_current_event", None)
+        if not callable(reader):
+            return None
+        task_id = str(task.get("id") or "").strip()
+        if not task_id:
+            return None
+        try:
+            stored = await reader(event, task_id)
+        except Exception as exception:
+            logger.warning(
+                "读取 L0 当前事件失败：taskId=%s, eventId=%s, errorType=%s, message=%s",
+                task_id,
+                event.event_id,
+                type(exception).__name__,
+                str(exception),
+            )
+            return None
+        if not isinstance(stored, dict) or not stored.get("eventId"):
+            return None
+        payload = stored.get("payload")
+        if isinstance(payload, dict):
+            return payload
+        payload_json = stored.get("payloadJson")
+        if isinstance(payload_json, str) and payload_json.strip():
+            parsed = self._parse_json_object(payload_json)
+            if parsed:
+                return parsed
+        return {
+            "eventId": stored.get("eventId"),
+            "eventType": stored.get("eventType") or "message",
+            "text": stored.get("text") or "",
+            "sentAt": stored.get("occurredAt"),
+        }
+
     async def _load_delegated_task_history(
         self,
         event: UnifiedEvent,
         fallback_history: list[dict],
         task: dict,
     ) -> list[dict]:
-        """读取委托任务的可信双方时间线；服务异常时保留内存历史继续执行。"""
+        """读取委托任务的可信双方时间线；服务异常时用当前事件继续推理。"""
         history = self._filter_delegated_history_for_event(fallback_history, event, task)
         task_id = str(task.get("id") or "").strip()
         task_state = self._delegated_task_state(task)
-        task_created_at = str(
-            task_state.get("taskCreatedAt") or task.get("createdAt") or ""
-        ).strip()
+        platform, chat_type, chat_id = self._delegated_step_scope(task)
+        if not all((platform, chat_type, chat_id)):
+            platform, chat_type, chat_id = self._conversation_scope_from_row(
+                event.model_dump(by_alias=True)
+            )
+        started_at, _start_event_id = self._delegated_step_watermark(task, task_state)
+        query_after = (
+            started_at
+            or str(task_state.get("taskCreatedAt") or task.get("createdAt") or "").strip()
+            or None
+        )
         if self.event_center_client is None:
             return history
+        rows: list[dict] = []
         try:
             rows = await self.event_center_client.list_conversation_messages(
-                event.chat_id,
-                platform=event.platform,
-                chat_type=event.chat_type,
-                # 任务内时间线从创建时刻开始；长期事实由 stateJson 的滚动记忆承载。
+                chat_id,
+                platform=platform,
+                chat_type=chat_type,
+                # L1 读取步骤开始后的全部消息；长期事实由 stateJson 的滚动记忆承载。
                 limit=500,
                 user_id=self._resolve_event_user_id(event),
-                after=task_created_at or None,
+                after=query_after or None,
             )
             return self._filter_delegated_history_for_event(rows, event, task)
         except Exception as exception:
             logger.warning(
-                "读取委托历史失败，使用当前内存上下文继续决策：taskId=%s, error=%s",
+                "委托历史查询失败，改用当前事件继续推理。taskId=%s | %s",
                 task_id,
-                type(exception).__name__,
+                self._history_failure_diagnostic(
+                    exception=exception,
+                    scope=(platform, chat_type, chat_id),
+                    after=query_after,
+                    before=None,
+                    limit=500,
+                    rows=rows,
+                ),
             )
+            current_event = await self._load_current_event_for_task(event, task)
+            if current_event:
+                merged = self._merge_current_event_into_history(history, current_event)
+                if merged:
+                    return merged
             return history
 
     async def _load_delegated_task_pre_history(
@@ -1350,32 +1443,172 @@ class OrchestratorService:
         event: UnifiedEvent,
         task: dict,
     ) -> list[dict]:
-        """按需读取任务前少量消息，只作为背景，不能作为任务完成证据。"""
+        """按需读取起点前的有限窗口（L2），只作为背景，不能作为任务完成证据。"""
         if self.event_center_client is None or not self._delegated_task_history_access_allowed(task):
             return []
         task_state = self._delegated_task_state(task)
-        task_created_at = str(
-            task_state.get("taskCreatedAt") or task.get("createdAt") or ""
-        ).strip()
-        if not task_created_at:
+        platform, chat_type, chat_id = self._delegated_step_scope(task)
+        if not all((platform, chat_type, chat_id)):
+            platform, chat_type, chat_id = self._conversation_scope_from_row(
+                event.model_dump(by_alias=True)
+            )
+        started_at, _start_event_id = self._delegated_step_watermark(task, task_state)
+        query_before = (
+            started_at
+            or str(task_state.get("taskCreatedAt") or task.get("createdAt") or "").strip()
+        )
+        if not query_before:
             return []
+        rows: list[dict] = []
         try:
             rows = await self.event_center_client.list_conversation_messages(
-                event.chat_id,
-                platform=event.platform,
-                chat_type=event.chat_type,
+                chat_id,
+                platform=platform,
+                chat_type=chat_type,
                 limit=30,
                 user_id=self._resolve_event_user_id(event),
-                before=task_created_at,
+                before=query_before,
             )
             return self._filter_delegated_history_for_event(rows, event, task)
         except Exception as exception:
             logger.warning(
-                "读取任务前背景失败，继续使用任务内记忆：taskId=%s, error=%s",
+                "读取任务前背景失败，继续使用任务内记忆。taskId=%s | %s",
                 task.get("id"),
-                type(exception).__name__,
+                self._history_failure_diagnostic(
+                    exception=exception,
+                    scope=(platform, chat_type, chat_id),
+                    after=None,
+                    before=query_before,
+                    limit=30,
+                    rows=rows,
+                ),
             )
             return []
+
+    @classmethod
+    def _history_failure_diagnostic(
+        cls,
+        *,
+        exception: Exception,
+        scope: tuple[str, str, str],
+        after: str | None,
+        before: str | None,
+        limit: int,
+        rows: list[dict],
+    ) -> str:
+        """把历史接口异常整理成可排查的完整诊断，不允许只显示“获取历史失败”。"""
+        http_status = ""
+        response_body = ""
+        if hasattr(exception, "response") and exception.response is not None:
+            response = exception.response
+            http_status = str(getattr(response, "status_code", ""))
+            response_body = " ".join(str(getattr(response, "text", "") or "").split())[:500]
+        return (
+            "请求范围=platform=" + str(scope[0] or "-")
+            + ",chatType=" + str(scope[1] or "-")
+            + ",chatId=" + str(scope[2] or "-")
+            + ",limit=" + str(limit)
+            + ",after=" + str(after or "-")
+            + ",before=" + str(before or "-")
+            + " | httpStatus=" + (http_status or "-")
+            + " | responseBody=" + (response_body or "-")
+            + " | dbHitCount=" + cls._extract_diagnostic_count(response_body, "dbHitCount")
+            + " | filteredAfter=" + cls._extract_diagnostic_count(response_body, "filteredAfter")
+            + " | localRows=" + str(len(rows) if isinstance(rows, list) else -1)
+            + " | errorType=" + type(exception).__name__
+            + " | message=" + " ".join(str(exception).split())[:300]
+        )
+
+    @staticmethod
+    def _extract_diagnostic_count(response_body: str, key: str) -> str:
+        """从 Java 失败响应正文中提取 dbHitCount / filteredAfter 等诊断计数。"""
+        marker = key + "="
+        if marker in response_body:
+            tail = response_body.split(marker, 1)[1].strip()
+            value = tail.split(",")[0].strip()
+            return value
+        return "-"
+
+    @classmethod
+    def _merge_current_event_into_history(
+        cls,
+        history: list[dict],
+        current_event: dict,
+    ) -> list[dict]:
+        """把 L0 当前事件无条件并入时间线，历史接口失败时仍能继续推理。"""
+        if not isinstance(current_event, dict) or not current_event.get("eventId"):
+            return history
+        event_id = str(current_event.get("eventId") or "").strip()
+        for row in history:
+            row_id = str(
+                row.get("eventId")
+                or row.get("event_id")
+                or row.get("platformMessageId")
+                or row.get("platform_message_id")
+                or ""
+            ).strip()
+            if row_id == event_id:
+                return history
+        normalized = {
+            "eventId": event_id,
+            "platformMessageId": str(current_event.get("platformMessageId") or "").strip(),
+            "clientMessageId": str(current_event.get("clientMessageId") or "").strip(),
+            "at": str(
+                current_event.get("sentAt")
+                or current_event.get("timestamp")
+                or current_event.get("occurredAt")
+                or current_event.get("receivedAt")
+                or ""
+            ).strip(),
+            "text": " ".join(
+                str(current_event.get("text") or current_event.get("content") or "").split()
+            ),
+            "eventType": str(current_event.get("eventType") or "message").lower(),
+            "direction": str(current_event.get("direction") or "").upper(),
+            "actorType": str(current_event.get("actorType") or "").upper(),
+            "messageOrigin": str(current_event.get("messageOrigin") or "").upper(),
+            "rawPayload": current_event.get("rawPayload") if isinstance(current_event.get("rawPayload"), dict) else {},
+            "platform": str(current_event.get("platform") or "").strip(),
+            "chatType": str(current_event.get("chatType") or "").strip(),
+            "chatId": str(current_event.get("chatId") or "").strip(),
+            "sender": current_event.get("sender") if isinstance(current_event.get("sender"), dict) else {},
+        }
+        return [*history, normalized]
+
+    @classmethod
+    def _delegated_step_scope(cls, task: dict) -> tuple[str, str, str]:
+        """从步骤固化的 conversationScopeJson 恢复会话范围；非法 JSON 时回退平台字段。"""
+        raw = task.get("conversationScopeJson") or task.get("conversation_scope_json") or task.get("conversationScope")
+        if isinstance(raw, str) and raw.strip():
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, dict):
+                platform = str(parsed.get("platform") or "").strip()
+                chat_type = str(
+                    parsed.get("chatType") or parsed.get("chat_type") or ""
+                ).strip().lower()
+                chat_id = str(parsed.get("chatId") or parsed.get("chat_id") or "").strip()
+                if platform and chat_type and chat_id:
+                    return platform, chat_type, chat_id
+        return cls._conversation_scope_from_row(task)
+
+    @staticmethod
+    def _delegated_step_watermark(task: dict, state: dict) -> tuple[str, str]:
+        """返回步骤起点水位（启动时间、起点事件 ID），供 L1/L2 历史窗口使用。"""
+        started_at = str(
+            task.get("startedAt")
+            or task.get("started_at")
+            or state.get("taskStartedAt")
+            or state.get("taskCreatedAt")
+            or task.get("createdAt")
+            or ""
+        ).strip()
+        start_event_id = str(
+            task.get("startEventId") or task.get("start_event_id") or ""
+        ).strip()
+        return started_at, start_event_id
 
     @staticmethod
     def _delegated_task_state(task: dict) -> dict:
@@ -1471,6 +1704,8 @@ class OrchestratorService:
     ):
         """在 SocialAgent 运行前恢复背景并决定发送、等待或结束。"""
         task_id = str(task.get("id") or "").strip()
+        # 每次执行前先把当前入站事件写入 L0，历史接口失败时仍能基于它继续推理。
+        await self._persist_current_event(event, task)
         history = await self._load_delegated_task_history(event, history_context, task)
         task_state = self._delegated_task_state(task)
         pre_task_history = list(task_state.get("preTaskHistory") or [])
@@ -1483,10 +1718,16 @@ class OrchestratorService:
                     event=event.model_dump(by_alias=True),
                     preTaskHistory=pre_task_history,
                     historyAccessAllowed=history_access_allowed,
+                    contextEnvelope=self._build_delegated_context_envelope(
+                        event=event,
+                        task=task,
+                        task_history=history,
+                        pre_task_history=pre_task_history,
+                    ),
                 ),
                 model_profile,
             )
-            # 只有模型显式请求、用户已授权且尚未缓存时，才读取任务创建前的有限背景。
+            # 只有模型显式请求、用户已授权且尚未缓存时，才读取起点前的有限背景（L2）。
             if (
                 decision.requested_tool == "get_task_pre_history"
                 and history_access_allowed
@@ -1501,6 +1742,12 @@ class OrchestratorService:
                         preTaskHistory=pre_task_history,
                         # 防止同一轮因为背景不足无限请求历史。
                         historyAccessAllowed=False,
+                        contextEnvelope=self._build_delegated_context_envelope(
+                            event=event,
+                            task=task,
+                            task_history=history,
+                            pre_task_history=pre_task_history,
+                        ),
                     ),
                     model_profile,
                 )
@@ -1523,24 +1770,55 @@ class OrchestratorService:
                 requestedTool="update_delegated_task",
             )
 
+    def _build_delegated_context_envelope(
+        self,
+        *,
+        event: UnifiedEvent,
+        task: dict,
+        task_history: list[dict],
+        pre_task_history: list[dict],
+    ) -> dict:
+        """用统一 ContextAssembler 组装一次性可信上下文，状态图只消费该结果。"""
+        assembler = self._delegated_context_assembler()
+        return assembler.assemble(
+            event=event.model_dump(by_alias=True),
+            task=task,
+            task_history=task_history,
+            pre_task_history=pre_task_history or None,
+        )
+
+    def _delegated_context_assembler(self):
+        """延迟创建统一上下文组装器，避免在无委托任务的普通链路中承担初始化成本。"""
+        assembler = getattr(self, "_context_assembler", None)
+        if assembler is None:
+            assembler = DelegatedTaskContextAssembler()
+            object.__setattr__(self, "_context_assembler", assembler)
+        return assembler
+
     @staticmethod
     def _is_delegated_peer_inbound(event: UnifiedEvent) -> bool:
         """在任务图异常回退时识别真实联系人消息，规则与任务图保持一致。
 
-        旧版 NapCat 事件可能没有 direction，但 ``message``、外部来源且没有自身参与者
-        标记时仍应继续委托；明确的出站或 Agent 回显始终不能触发下一轮回复。
+        新版连接器会提供 direction、actorType 或 messageOrigin，可直接据此判断。
+        旧版 NapCat 私聊事件可能完全缺少这些字段，因此还需要通过会话身份判断：
+        发送者必须等于私聊 chatId，并且不能等于当前登录账号 selfId。这个兼容规则
+        只应用于私聊，避免把群成员消息或机器人自身回显误当成委托任务的联系人回复。
         """
         event_type = str(event.event_type or "").lower()
         direction = str(event.direction or "").upper()
         actor = str(event.actor_type or "").upper()
         raw_payload = event.raw_payload or {}
         origin = str(raw_payload.get("messageOrigin") or "").upper()
+        sender_id = str(event.sender.id if event.sender else "").strip()
+        self_id = str(event.self_id or "").strip()
+        chat_id = str(event.chat_id or "").strip()
+        chat_type = str(event.chat_type or "").strip().lower()
         if not (event.text or "").strip() or event_type != "message":
             return False
         event_row = event.model_dump(by_alias=True)
         if is_runtime_generated_message(event_row):
             return False
-        if direction == "OUTBOUND" or actor in {"AGENT", "SYSTEM"}:
+        if direction == "OUTBOUND" or actor in {"AGENT", "SYSTEM", "SELF"}:
             return False
         if origin in {
             "INTERNAL",
@@ -1550,9 +1828,22 @@ class OrchestratorService:
             "USER_MANUAL",
         }:
             return False
-        if direction == "INBOUND" or actor == "CONTACT":
+        # 即使旧连接器没有方向字段，只要能确认发送者是登录账号本身，也必须拒绝。
+        if sender_id and self_id and sender_id == self_id:
+            return False
+        if direction == "INBOUND" or actor in {"CONTACT", "PEER", "REMOTE"}:
             return True
-        return origin in {"EXTERNAL", "PLATFORM"}
+        if origin in {"EXTERNAL", "PLATFORM"}:
+            return True
+        # 真实 NapCat 私聊载荷的兼容路径：sender 是该会话联系人，而不是当前账号。
+        return bool(
+            chat_type == "private"
+            and sender_id
+            and self_id
+            and chat_id
+            and sender_id == chat_id
+            and sender_id != self_id
+        )
 
     @staticmethod
     def _stable_event_identity(event: UnifiedEvent) -> str:
@@ -1773,9 +2064,71 @@ class OrchestratorService:
         idempotency_key = f"delegated:{task_id}:{stable_event_id}:{requested_tool}"
         try:
             if is_workflow_completion:
-                produced_facts = self._delegated_workflow_produced_facts(task, decision)
+                try:
+                    produced_facts = self._delegated_workflow_produced_facts(
+                        task,
+                        decision,
+                        event,
+                    )
+                except DelegatedWorkflowFactsMissingError as exception:
+                    # 模型判断任务完成但没有给齐父工作流声明事实时，不能让消息入口返回
+                    # 500。保留当前任务并明确记录缺口，后续联系人消息仍可继续推进。
+                    waiting_state = self._parse_json_object(
+                        getattr(decision, "state_json", "")
+                    )
+                    waiting_state["workflowCompletionPending"] = {
+                        "missingFacts": list(exception.missing_facts),
+                        "eventId": stable_event_id,
+                        "reason": str(exception),
+                    }
+                    waiting_key = (
+                        f"delegated:{task_id}:{stable_event_id}:workflow-facts-wait"
+                    )
+                    response = await self.tools.ainvoke(
+                        "update_delegated_task",
+                        context=tool_context,
+                        idempotency_key=waiting_key,
+                        arguments={
+                            "event": event.model_dump(mode="json"),
+                            "task_id": task_id,
+                            "progress_summary": (
+                                "等待补充父工作流事实："
+                                + "、".join(exception.missing_facts)
+                            ),
+                            "state_json": json.dumps(
+                                waiting_state,
+                                ensure_ascii=False,
+                            ),
+                            "last_event_id": stable_event_id,
+                            "completion_report": "",
+                        },
+                    )
+                    if results:
+                        results[-1].tool_calls.append(
+                            ToolCallRecord(
+                                tool="update_delegated_task",
+                                arguments={
+                                    "taskId": task_id,
+                                    "action": "WAIT",
+                                    "missingFacts": list(exception.missing_facts),
+                                    "idempotencyKey": waiting_key,
+                                },
+                            )
+                        )
+                    return response
                 completion_report = str(getattr(decision, "completion_report", "") or "")
                 progress_summary = str(getattr(decision, "progress_summary", "") or "")
+                # 把声明事实发布为类型化产物：type 由事实键推导，sourceEventId 指向触发事件，
+                # Java 在同一事务内原子保存产物、完成上游步骤并唤醒下游步骤。
+                artifacts = [
+                    {
+                        "type": str(key).strip().upper(),
+                        "name": key,
+                        "value": value,
+                        "sourceEventId": stable_event_id,
+                    }
+                    for key, value in produced_facts.items()
+                ]
                 response = await self.event_center_client.complete_delegated_workflow_step(
                     event,
                     workflow_id,
@@ -1789,6 +2142,8 @@ class OrchestratorService:
                         "state": self._parse_json_object(getattr(decision, "state_json", "")),
                         "completionReport": completion_report,
                     },
+                    artifacts=artifacts,
+                    source_event_id=stable_event_id,
                 )
             else:
                 response = await self.tools.ainvoke(
@@ -1851,8 +2206,13 @@ class OrchestratorService:
         return parsed if isinstance(parsed, dict) else {}
 
     @classmethod
-    def _delegated_workflow_produced_facts(cls, task: dict, decision) -> dict[str, Any]:
-        """只提取父步骤声明的事实；缺少任一事实时拒绝完成，禁止写入猜测。"""
+    def _delegated_workflow_produced_facts(
+        cls,
+        task: dict,
+        decision,
+        event: UnifiedEvent | None = None,
+    ) -> dict[str, Any]:
+        """提取父步骤声明事实，并从单一事实型联系人回复中恢复模型漏填的值。"""
         declared = task.get("producesFacts")
         fact_keys = (
             [str(item).strip() for item in declared if str(item).strip()]
@@ -1873,10 +2233,21 @@ class OrchestratorService:
                     break
             else:
                 missing.append(key)
+
+        # 对“询问一个信息，再转告给下一联系人”这类步骤，当前联系人原话就是唯一
+        # 声明事实的可靠来源。这里按事实槽位数量处理，不依赖时间、课程等业务词。
+        if (
+            missing
+            and len(fact_keys) == 1
+            and event is not None
+            and cls._is_delegated_peer_inbound(event)
+        ):
+            reply_text = " ".join(str(event.text or "").split()).strip()
+            if reply_text:
+                facts[fact_keys[0]] = reply_text
+                missing.clear()
         if missing:
-            raise DelegatedWorkflowCompletionError(
-                "父工作流步骤缺少声明事实: " + ", ".join(missing)
-            )
+            raise DelegatedWorkflowFactsMissingError(missing)
         return facts
 
     async def _update_delegated_task_runtime(

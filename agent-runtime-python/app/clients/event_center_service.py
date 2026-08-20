@@ -226,12 +226,28 @@ class EventCenterServiceClient:
         produced_facts: dict[str, Any],
         result_summary: str,
         result: object,
+        artifacts: list[dict[str, Any]] | None = None,
+        source_event_id: str | None = None,
     ) -> dict[str, Any]:
-        """提交子任务产出的精确事实，并由 Java 在同一事务内推进父工作流。"""
+        """提交子任务产出的精确事实与类型化产物，并由 Java 在同一事务内推进父工作流。
+
+        artifacts 是类型化产物（type/name/value/sourceEventId），name 必须属于该步骤声明的
+        producesFacts；sourceEventId 记录触发本次完成的事件，作为后继步骤的起点水位。
+        """
         normalized_workflow_id = workflow_id.strip()
         normalized_step_key = step_key.strip()
         if not normalized_workflow_id or not normalized_step_key:
             raise ValueError("workflow_id and step_key are required")
+
+        payload: dict[str, Any] = {
+            "producedFacts": produced_facts,
+            "resultSummary": result_summary,
+            "result": result,
+        }
+        if artifacts:
+            payload["artifacts"] = artifacts
+        if source_event_id and str(source_event_id).strip():
+            payload["sourceEventId"] = str(source_event_id).strip()
 
         async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
             response = await client.post(
@@ -240,11 +256,7 @@ class EventCenterServiceClient:
                     f"{quote(normalized_workflow_id, safe='')}/steps/"
                     f"{quote(normalized_step_key, safe='')}/complete"
                 ),
-                json={
-                    "producedFacts": produced_facts,
-                    "resultSummary": result_summary,
-                    "result": result,
-                },
+                json=payload,
                 headers=self._runtime_headers(self.resolve_event_user_id(event)),
             )
         response.raise_for_status()
@@ -252,6 +264,73 @@ class EventCenterServiceClient:
         if not isinstance(payload, dict):
             raise ValueError("delegated workflow completion response must be an object")
         return payload
+
+    async def upsert_delegated_task_current_event(
+        self,
+        event: UnifiedEvent,
+        task_id: str,
+    ) -> dict[str, Any]:
+        """在每次 LangGraph 执行前把当前入站事件写入 L0，保证当前事件不丢失。
+
+        Java 使用步骤自身固化的会话范围落库，不从请求事件推导；
+        历史查询失败时 Runtime 仍可读取当前事件继续推理。
+        """
+        normalized_task_id = task_id.strip()
+        if not normalized_task_id:
+            raise ValueError("task_id is required")
+        occurred_at = (
+            event.sent_at
+            or event.timestamp
+            or event.received_at
+            or datetime.now(timezone.utc)
+        )
+        payload = {
+            "eventId": event.event_id,
+            "eventType": event.event_type,
+            "senderId": event.sender.id if event.sender else "",
+            "text": event.text or "",
+            "occurredAt": occurred_at.isoformat() if hasattr(occurred_at, "isoformat") else str(occurred_at),
+            "payload": event.model_dump(mode="json", by_alias=True),
+        }
+        async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+            response = await client.post(
+                (
+                    f"{self.base_url}/internal/workspace/commands/delegated/"
+                    f"{quote(normalized_task_id, safe='')}/current-event"
+                ),
+                json=payload,
+                headers=self._runtime_headers(self.resolve_event_user_id(event)),
+            )
+        response.raise_for_status()
+        result = response.json()
+        if not isinstance(result, dict):
+            raise ValueError("delegated task current event response must be an object")
+        return result
+
+    async def get_delegated_task_current_event(
+        self,
+        event: UnifiedEvent,
+        task_id: str,
+    ) -> dict[str, Any] | None:
+        """读取步骤最近一次入站事件；不存在时返回 None，由调用方决定是否继续。"""
+        normalized_task_id = task_id.strip()
+        if not normalized_task_id:
+            raise ValueError("task_id is required")
+        async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+            response = await client.get(
+                (
+                    f"{self.base_url}/internal/workspace/commands/delegated/"
+                    f"{quote(normalized_task_id, safe='')}/current-event"
+                ),
+                headers=self._runtime_headers(self.resolve_event_user_id(event)),
+            )
+        if response.status_code == 404:
+            return None
+        response.raise_for_status()
+        result = response.json()
+        if not isinstance(result, dict):
+            raise ValueError("delegated task current event response must be an object")
+        return result
 
     async def get_delegated_workflow_runtime(self, user_id: str, workflow_id: str) -> dict[str, Any]:
         """读取工作流最新快照，供 Runtime 执行前校验步骤状态和激活版本。"""

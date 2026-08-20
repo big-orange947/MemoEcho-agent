@@ -34,6 +34,9 @@ public record DelegatedTaskResponse(
         String updatedAt,
         String workflowId,
         String stepKey,
+        String stepRole,
+        String startEventId,
+        String conversationScopeJson,
         List<String> producesFacts
 ) {
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
@@ -50,6 +53,7 @@ public record DelegatedTaskResponse(
                 task.lastEventId(), task.startedAt() == null ? null : task.startedAt().toString(),
                 task.completedAt() == null ? null : task.completedAt().toString(), task.completionReport(),
                 task.createdAt().toString(), task.updatedAt().toString(), task.workflowId(), task.stepKey(),
+                task.stepRole(), task.startEventId(), task.conversationScopeJson(),
                 readStringList(task.producesFactsJson())
         );
     }
