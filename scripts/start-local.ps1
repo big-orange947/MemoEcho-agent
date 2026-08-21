@@ -179,7 +179,7 @@ $javaCommand = Assert-CommandAvailable -Name "java"
 $mavenCommand = Assert-CommandAvailable -Name "mvn"
 $pythonCommand = Assert-CommandAvailable -Name "python"
 
-$javaVersionOutput = (& $javaCommand -version 2>&1) -join " "
+$javaVersionOutput = (& $env:ComSpec /c "`"$javaCommand`" -version 2>&1") -join " "
 if ($javaVersionOutput -notmatch 'version "21(?:\.|\")') {
     throw "当前 java 不是 JDK 21：$javaVersionOutput"
 }
@@ -214,7 +214,13 @@ try {
     }
 
     $pythonDirectory = Join-Path $projectRoot "agent-runtime-python"
-    $pythonEntry = Start-ManagedProcess -Name "agent-runtime" -FilePath $pythonCommand -ArgumentList @("-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", "8000") -WorkingDirectory $pythonDirectory -HealthUri "http://127.0.0.1:8000/health"
+    # 优先使用 uv 管理的虚拟环境（项目实际依赖安装在其中）；没有 uv 时回退到系统 python。
+    $uvCommand = Get-Command uv -ErrorAction SilentlyContinue
+    if ($null -ne $uvCommand) {
+        $pythonEntry = Start-ManagedProcess -Name "agent-runtime" -FilePath $uvCommand.Source -ArgumentList @("run", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", "8000") -WorkingDirectory $pythonDirectory -HealthUri "http://127.0.0.1:8000/health"
+    } else {
+        $pythonEntry = Start-ManagedProcess -Name "agent-runtime" -FilePath $pythonCommand -ArgumentList @("-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", "8000") -WorkingDirectory $pythonDirectory -HealthUri "http://127.0.0.1:8000/health"
+    }
     if ($null -ne $pythonEntry) {
         [void]$managedProcesses.Add($pythonEntry)
         Save-ManagedProcesses -Processes $managedProcesses

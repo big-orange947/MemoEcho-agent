@@ -21,6 +21,7 @@ LangGraph Checkpointer 只保存运行快照：以 workflowId 作为 thread key�
 支持恢复图执行，但不能代替 Event Center 的聊天事件与业务状态。
 """
 
+import asyncio
 import json
 import logging
 from typing import Any, TypedDict
@@ -76,15 +77,20 @@ class DelegatedExecutionGraph:
         event_center_client: EventCenterServiceClient,
         context_assembler: DelegatedTaskContextAssembler | None = None,
         checkpointer: Any = None,
+        checkpointer_factory: Any = None,
     ) -> None:
         # 决策逻辑复用主控台委托工作流（含 ReAct 规划、观察、审查闭环）。
         self.delegated_task_workflow = delegated_task_workflow
         self.event_center_client = event_center_client
         self.context_assembler = context_assembler or DelegatedTaskContextAssembler()
+        # checkpointer 可以是已构建实例，也可以是 async 工厂。工厂形式会在首次 run 的
+        # 事件循环内创建 AsyncSqliteSaver，避免 aiosqlite 连接绑定到错误的事件循环。
         self.checkpointer = checkpointer
-        self.graph = self._build_graph()
+        self._checkpointer_factory = checkpointer_factory
+        self._checkpointer_lock = asyncio.Lock()
+        self.graph = self._build_graph(self.checkpointer)
 
-    def _build_graph(self):
+    def _build_graph(self, checkpointer: Any = None):
         """按固定主链路组装委托执行图。"""
         graph = StateGraph(DelegatedExecutionState)
         graph.add_node("ingest_event", self._ingest_event)
@@ -121,7 +127,7 @@ class DelegatedExecutionGraph:
         )
         graph.add_edge("wait", END)
         graph.add_edge("end", END)
-        return graph.compile(checkpointer=self.checkpointer)
+        return graph.compile(checkpointer=checkpointer)
 
     async def run(
         self,
@@ -144,6 +150,12 @@ class DelegatedExecutionGraph:
         workflow_id = str(task.get("workflowId") or task.get("workflow_id") or "").strip()
         task_id = str(task.get("id") or task.get("taskId") or "").strip()
         thread_id = workflow_id or task_id or event.event_id
+        if self.checkpointer is None and self._checkpointer_factory is not None:
+            # 生产路径：async 工厂在当前事件循环内创建 SQLite 快照，并带 checkpointer 重建图。
+            async with self._checkpointer_lock:
+                if self.checkpointer is None:
+                    self.checkpointer = await self._checkpointer_factory()
+                    self.graph = self._build_graph(self.checkpointer)
         state = await self.graph.ainvoke(
             {
                 "event": event.model_dump(by_alias=True),
@@ -783,24 +795,26 @@ class DelegatedExecutionGraph:
         return tuple(text for value in values if len(text := " ".join(str(value or "").split())) >= 2)
 
 
-def build_execution_sqlite_checkpointer(db_path: str | None = None):
-    """构建跨重启可恢复的 SQLite Checkpointer。
+async def build_execution_sqlite_checkpointer(db_path: str | None = None):
+    """构建跨重启可恢复的异步 SQLite Checkpointer。
 
     Checkpoint 只保存 LangGraph 运行快照（以 workflowId 为 thread key），
-    不能代替 Event Center 的聊天事件与业务状态。
+    不能代替 Event Center 的聊天事件与业务状态。主链路图使用 async 调用，
+    因此必须使用 AsyncSqliteSaver；aiosqlite 连接绑定创建它的事件循环，
+    所以本函数只能由事件循环内的调用方 await（首次 run 时懒加载）。
     """
     import os
-    import sqlite3
 
-    from langgraph.checkpoint.sqlite import SqliteSaver
+    import aiosqlite
+    from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
     if not db_path:
         runtime_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".runtime")
         db_path = os.getenv("LANGGRAPH_CHECKPOINT_DB") or os.path.join(runtime_dir, "langgraph-checkpoints.sqlite")
     os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
-    connection = sqlite3.connect(db_path, check_same_thread=False)
-    saver = SqliteSaver(connection)
-    saver.setup()
+    connection = await aiosqlite.connect(db_path)
+    saver = AsyncSqliteSaver(connection)
+    await saver.setup()
     return saver
 
 
@@ -810,9 +824,13 @@ def build_delegated_execution_graph(
     event_center_client: EventCenterServiceClient,
     checkpointer: Any | None = None,
 ) -> DelegatedExecutionGraph:
-    """构造固定主链路执行图；未提供 checkpointer 时默认使用 SQLite 持久化快照。"""
+    """构造固定主链路执行图；未提供 checkpointer 时默认懒加载异步 SQLite 快照。"""
     if checkpointer is None:
-        checkpointer = build_execution_sqlite_checkpointer()
+        return DelegatedExecutionGraph(
+            delegated_task_workflow=delegated_task_workflow,
+            event_center_client=event_center_client,
+            checkpointer_factory=build_execution_sqlite_checkpointer,
+        )
     return DelegatedExecutionGraph(
         delegated_task_workflow=delegated_task_workflow,
         event_center_client=event_center_client,

@@ -190,6 +190,46 @@ class DelegatedExecutionGraphTest(unittest.IsolatedAsyncioTestCase):
         thread_ids = {str(getattr(c, "config", {}).get("configurable", {}).get("thread_id", "")) for c in checkpoints}
         self.assertIn("workflow-class-time", thread_ids)
 
+    async def test_should_build_async_sqlite_checkpointer_on_first_run(self) -> None:
+        """生产路径：async 工厂必须在事件循环内创建 AsyncSqliteSaver 并落盘快照。
+
+        回归：早期实现用同步 SqliteSaver 传给 async 主链路图，首次 run 抛
+        NotImplementedError。生产构建通过 checkpointer_factory 懒加载异步 saver。
+        """
+        import os
+        import sqlite3
+        import tempfile
+
+        from app.workflows.delegated_execution_graph import (
+            build_delegated_execution_graph,
+            build_execution_sqlite_checkpointer,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = os.path.join(tmp, "checkpoints.sqlite")
+            graph = build_delegated_execution_graph(
+                delegated_task_workflow=FixedDecisionWorkflow(),
+                event_center_client=DummyExecutionClient(),
+            )
+            # 生产构建默认不创建 checkpointer；首次 run 时通过 async 工厂创建。
+            self.assertIsNone(graph.checkpointer)
+            graph._checkpointer_factory = lambda: build_execution_sqlite_checkpointer(db_path)
+            await graph.run(event=self._event(), task=self._task(), model_profile=None)
+
+            self.assertIsNotNone(graph.checkpointer, "首次 run 必须创建异步 checkpointer")
+            connection = sqlite3.connect(db_path)
+            try:
+                count = connection.execute("SELECT COUNT(*) FROM checkpoints").fetchone()[0]
+                thread_ids = {
+                    row[0] for row in connection.execute("SELECT DISTINCT thread_id FROM checkpoints")
+                }
+            finally:
+                connection.close()
+            self.assertGreater(count, 0, "AsyncSqliteSaver 必须写入 checkpoints 表")
+            self.assertIn("workflow-class-time", thread_ids)
+            # 关闭 aiosqlite 连接，避免 Windows 上临时目录清理因文件被占用失败。
+            await graph.checkpointer.conn.close()
+
 
 if __name__ == "__main__":
     unittest.main()
