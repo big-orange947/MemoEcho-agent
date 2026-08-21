@@ -670,6 +670,16 @@ export type ThreadPatch = {
 export type ThreadMessageRole = "user" | "agent" | "system";
 export type ThreadMessageStatus = "pending" | "streaming" | "done" | "error" | "needs_confirmation";
 
+/** 流式阶段事件内嵌的任务进度视图（P2 前端本地增强，不落库）。 */
+export type ThreadLiveTask = {
+  id: string;
+  status: string;
+  stepKey: string;
+  objective: string;
+  progressSummary: string;
+  workflowId: string;
+};
+
 /** 一条对话消息：用户输入或 Agent 产出，可能携带关联的执行/任务/工作流引用。 */
 export type ThreadMessage = {
   id: string;
@@ -682,11 +692,13 @@ export type ThreadMessage = {
   workflowId: string | null;
   resultJson: string | null;
   createdAt: string;
+  /** 仅前端流式期间使用的实时任务进度（来自 SSE progress 事件）。 */
+  liveTasks?: ThreadLiveTask[];
 };
 
-/** 发送用户消息后后端同步返回的成对消息与命令结果（P1 同步链路）。 */
+/** 发送用户消息后后端立即返回：user 消息 + streaming agent 消息 + 预生成 commandId。 */
 export type ThreadMessageSendResult = {
   userMessage: ThreadMessage;
   agentMessage: ThreadMessage;
-  response: WorkspaceCommandResponse;
+  commandId: string;
 };

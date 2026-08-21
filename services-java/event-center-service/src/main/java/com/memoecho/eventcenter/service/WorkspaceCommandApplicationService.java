@@ -55,7 +55,15 @@ public class WorkspaceCommandApplicationService {
      * 把当前用户的桌面指令转换成不会回写聊天平台的标准事件，并返回适合 UI 展示的执行结果。
      */
     public WorkspaceCommandResponse execute(String userId, WorkspaceCommandRequest request) {
-        String commandId = "desktop:command:" + UUID.randomUUID();
+        return execute(userId, request, "desktop:command:" + UUID.randomUUID());
+    }
+
+    /**
+     * 与 {@link #execute(String, WorkspaceCommandRequest)} 相同，但允许调用方注入 commandId。
+     * 主控台线程消息需要预先确定 executionId，才能在命令执行期间按
+     * source_execution_id 轮询任务/工作流进度并推送 SSE 事件。
+     */
+    public WorkspaceCommandResponse execute(String userId, WorkspaceCommandRequest request, String commandId) {
         String requestedRoute = normalizeRoute(request.requestedRoute());
         // commandId 同时是跨 Java、Python 和任务状态回写的 executionId，便于一次命令的全链路检索。
         log.info("主控台委托闭环 | executionId={} | stage=command_received | userId={} | requestedRoute={} | promptLength={}",

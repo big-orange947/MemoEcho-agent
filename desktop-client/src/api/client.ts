@@ -696,3 +696,60 @@ export function getThreadMessage(credential: StoredCredential, threadId: string,
     credential.accessToken,
   );
 }
+
+/** SSE 阶段事件：stage 为 connected | processing | progress | done | error，其余字段随事件变化。 */
+export type ThreadStreamStagePayload = {
+  stage: string;
+  message?: string;
+  agentMessage?: ThreadMessage;
+  tasks?: Array<{
+    id: string;
+    status: string;
+    stepKey: string;
+    objective: string;
+    progressSummary: string;
+    workflowId: string;
+  }>;
+  workflow?: { id: string; status: string; progressSummary: string };
+};
+
+/**
+ * 订阅单条 agent 消息的执行进度 SSE（P2）。使用 fetch + ReadableStream
+ * 解析 text/event-stream，从而支持 Authorization 头（EventSource 无法设置）。
+ */
+export async function streamThreadMessage(
+  credential: StoredCredential,
+  threadId: string,
+  messageId: string,
+  onStage: (payload: ThreadStreamStagePayload) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  const response = await fetch(
+    `${normalizeBaseUrl(credential.baseUrl)}/internal/workspace/threads/${encodeURIComponent(threadId)}/messages/${encodeURIComponent(messageId)}/stream`,
+    { headers: { Authorization: `Bearer ${credential.accessToken}` }, signal },
+  );
+  if (!response.ok) {
+    throw new Error(`进度订阅失败：HTTP ${response.status}`);
+  }
+  const reader = response.body?.getReader();
+  if (!reader) return;
+  const decoder = new TextDecoder();
+  let buffer = "";
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let delimiter: number;
+    while ((delimiter = buffer.indexOf("\n\n")) >= 0) {
+      const rawEvent = buffer.slice(0, delimiter);
+      buffer = buffer.slice(delimiter + 2);
+      const dataLine = rawEvent.split("\n").find((line) => line.startsWith("data:"));
+      if (!dataLine) continue;
+      try {
+        onStage(JSON.parse(dataLine.slice(5).trim()) as ThreadStreamStagePayload);
+      } catch {
+        // 忽略无法解析的事件，不中断流。
+      }
+    }
+  }
+}

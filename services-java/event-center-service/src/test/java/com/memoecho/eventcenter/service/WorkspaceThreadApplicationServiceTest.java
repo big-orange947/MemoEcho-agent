@@ -21,6 +21,7 @@ import java.util.Optional;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
@@ -69,53 +70,72 @@ class WorkspaceThreadApplicationServiceTest {
     }
 
     @Test
-    void shouldBackfillTaskAndWorkflowIdsAfterCommandExecution() {
+    void shouldReturnImmediatelyWithStreamingAgentMessage() {
         when(threadRepository.findThreadByIdAndUserId(THREAD_ID, USER_ID))
                 .thenReturn(Optional.of(thread()));
         when(threadRepository.insertMessage(any(WorkspaceThreadMessage.class)))
                 .thenAnswer(invocation -> invocation.getArgument(0));
-        when(taskRepository.findTaskIdsBySourceExecutionId(USER_ID, "cmd-1"))
-                .thenReturn(List.of("task-a", "task-b"));
+
+        WorkspaceThreadMessageSendResponse result = service.sendMessage(USER_ID, THREAD_ID, "帮我和 km 约时间");
+
+        // P2 异步语义：立即返回 user + streaming agent 消息和预生成 commandId。
+        assertThat(result.userMessage().role()).isEqualTo("user");
+        assertThat(result.userMessage().content()).isEqualTo("帮我和 km 约时间");
+        assertThat(result.agentMessage().role()).isEqualTo("agent");
+        assertThat(result.agentMessage().status()).isEqualTo("streaming");
+        assertThat(result.agentMessage().executionId()).startsWith("desktop:command:");
+        assertThat(result.commandId()).isEqualTo(result.agentMessage().executionId());
+        // 异步执行线程结束后也会 touchThread，因此用至少一次断言。
+        verify(threadRepository, org.mockito.Mockito.atLeastOnce()).touchThread(eq(THREAD_ID), eq(USER_ID), any());
+    }
+
+    @Test
+    void shouldBackfillTaskAndWorkflowIdsAfterCommandCompletion() {
+        WorkspaceThreadMessage streaming = new WorkspaceThreadMessage(
+                "agent-1", THREAD_ID, USER_ID, "agent", "", "streaming",
+                "cmd-1", null, null, null, Instant.parse("2026-08-21T10:00:00Z"));
+        when(threadRepository.findMessageByIdAndUserId("agent-1", USER_ID))
+                .thenReturn(Optional.of(streaming));
+        when(taskRepository.findBySourceExecutionId(USER_ID, "cmd-1"))
+                .thenReturn(List.of());
         when(workflowRepository.findBySourceExecutionIdAndUserId("cmd-1", USER_ID))
                 .thenReturn(Optional.of(new DelegatedWorkflow(
                         "wf-1", USER_ID, "cmd-1", "原命令", "标题", "PLAN_EXECUTE", "RUNNING",
                         "{}", "{}", "", "", null, null, null)));
-        when(commandService.execute(eq(USER_ID), any()))
+        when(commandService.execute(eq(USER_ID), any(), eq("cmd-1")))
                 .thenReturn(new WorkspaceCommandResponse(
                         "cmd-1", "success", "delegated_task", "已创建 2 步骤工作流",
                         "委托任务已创建", false, List.of(), null, ""));
 
-        WorkspaceThreadMessageSendResponse result = service.sendMessage(USER_ID, THREAD_ID, "帮我和 km 约时间");
+        service.runMessageCommand(USER_ID, THREAD_ID, "user-1", "agent-1", "cmd-1", "帮我和 km 约时间");
 
-        assertThat(result.userMessage().role()).isEqualTo("user");
-        assertThat(result.userMessage().content()).isEqualTo("帮我和 km 约时间");
-        assertThat(result.agentMessage().role()).isEqualTo("agent");
-        assertThat(result.agentMessage().status()).isEqualTo("done");
-        assertThat(result.agentMessage().content()).contains("委托任务已创建");
-        assertThat(result.agentMessage().executionId()).isEqualTo("cmd-1");
-        // 多任务命令回填第一个任务 ID，工作流 ID 单独回填。
-        assertThat(result.agentMessage().taskId()).isEqualTo("task-a");
-        assertThat(result.agentMessage().workflowId()).isEqualTo("wf-1");
-        assertThat(result.agentMessage().resultJson()).isNotBlank();
-        assertThat(result.response().commandId()).isEqualTo("cmd-1");
-        verify(threadRepository).touchThread(eq(THREAD_ID), eq(USER_ID), any());
+        org.mockito.ArgumentCaptor<WorkspaceThreadMessage> captor =
+                org.mockito.ArgumentCaptor.forClass(WorkspaceThreadMessage.class);
+        verify(threadRepository).updateMessage(captor.capture());
+        WorkspaceThreadMessage updated = captor.getValue();
+        assertThat(updated.status()).isEqualTo("done");
+        assertThat(updated.content()).contains("委托任务已创建");
+        assertThat(updated.workflowId()).isEqualTo("wf-1");
+        assertThat(updated.resultJson()).contains("cmd-1");
     }
 
     @Test
     void shouldRecordErrorMessageWhenCommandFails() {
-        when(threadRepository.findThreadByIdAndUserId(THREAD_ID, USER_ID))
-                .thenReturn(Optional.of(thread()));
-        when(threadRepository.insertMessage(any(WorkspaceThreadMessage.class)))
-                .thenAnswer(invocation -> invocation.getArgument(0));
-        when(commandService.execute(eq(USER_ID), any()))
+        WorkspaceThreadMessage streaming = new WorkspaceThreadMessage(
+                "agent-2", THREAD_ID, USER_ID, "agent", "", "streaming",
+                "cmd-2", null, null, null, Instant.parse("2026-08-21T10:00:00Z"));
+        when(threadRepository.findMessageByIdAndUserId("agent-2", USER_ID))
+                .thenReturn(Optional.of(streaming));
+        when(commandService.execute(eq(USER_ID), any(), eq("cmd-2")))
                 .thenThrow(new IllegalStateException("runtime timeout"));
 
-        WorkspaceThreadMessageSendResponse result = service.sendMessage(USER_ID, THREAD_ID, "做点什么");
+        service.runMessageCommand(USER_ID, THREAD_ID, "user-2", "agent-2", "cmd-2", "做点什么");
 
-        assertThat(result.agentMessage().status()).isEqualTo("error");
-        assertThat(result.agentMessage().content()).contains("runtime timeout");
-        // 用户消息仍然落库，命令失败不阻断对话。
-        assertThat(result.userMessage().role()).isEqualTo("user");
+        org.mockito.ArgumentCaptor<WorkspaceThreadMessage> captor =
+                org.mockito.ArgumentCaptor.forClass(WorkspaceThreadMessage.class);
+        verify(threadRepository).updateMessage(captor.capture());
+        assertThat(captor.getValue().status()).isEqualTo("error");
+        assertThat(captor.getValue().content()).contains("runtime timeout");
     }
 
     @Test
@@ -141,5 +161,22 @@ class WorkspaceThreadApplicationServiceTest {
         assertThatThrownBy(() -> service.sendMessage(USER_ID, THREAD_ID, "   "))
                 .isInstanceOf(ResponseStatusException.class)
                 .hasMessageContaining("400");
+    }
+
+    @Test
+    void shouldMarkStaleStreamingMessagesAsErrorOnList() {
+        Instant stale = Instant.parse("2026-08-20T10:00:00Z");
+        WorkspaceThreadMessage staleMessage = new WorkspaceThreadMessage(
+                "msg-stale", THREAD_ID, USER_ID, "agent", "", "streaming",
+                "cmd-stale", null, null, null, stale);
+        when(threadRepository.findThreadByIdAndUserId(THREAD_ID, USER_ID))
+                .thenReturn(Optional.of(thread()));
+        when(threadRepository.listMessages(THREAD_ID, 50, null))
+                .thenReturn(List.of(staleMessage));
+
+        List<WorkspaceThreadMessageResponse> messages = service.listMessages(USER_ID, THREAD_ID, 50, null);
+
+        assertThat(messages).hasSize(1);
+        verify(threadRepository).updateMessageStatus(eq("msg-stale"), eq(USER_ID), eq("error"), anyString());
     }
 }

@@ -1,9 +1,9 @@
 package com.memoecho.eventcenter.dto;
 
-/** 发送一条主控台消息的返回：用户消息、Agent 回执消息与命令执行响应。 */
+/** 发送一条主控台消息的返回：用户消息、streaming agent 消息与预生成的命令 executionId。 */
 public record WorkspaceThreadMessageSendResponse(
         WorkspaceThreadMessageResponse userMessage,
         WorkspaceThreadMessageResponse agentMessage,
-        WorkspaceCommandResponse response
+        String commandId
 ) {
 }

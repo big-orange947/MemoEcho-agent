@@ -1,6 +1,6 @@
 import { CircleNotch, ShieldCheck, WarningCircle, User, Sparkle } from "@phosphor-icons/react";
 import type { StoredCredential, ThreadMessage } from "../../types";
-import { TaskCardInline } from "./TaskCardInline";
+import { LiveTaskCards, TaskCardInline } from "./TaskCardInline";
 
 function formatTime(value: string) {
   const date = new Date(value);
@@ -34,10 +34,10 @@ export function MessageBubble({
           <time>{formatTime(message.createdAt)}</time>
         </div>
         <div className={`ws-msg-bubble ${message.status === "error" ? "ws-msg-error" : ""}`}>
-          {message.status === "pending" ? (
+          {message.status === "pending" || message.status === "streaming" ? (
             <span className="ws-msg-pending">
               <CircleNotch className="spinning" size={14} />
-              {message.content || "正在思考…"}
+              {message.content || (message.status === "streaming" ? "正在执行…" : "正在思考…")}
             </span>
           ) : (
             <p className="ws-msg-text">{message.content || "（无文本回复）"}</p>
@@ -49,6 +49,9 @@ export function MessageBubble({
             </span>
           )}
         </div>
+        {!isUser && message.status === "streaming" && message.liveTasks && message.liveTasks.length > 0 && (
+          <LiveTaskCards tasks={message.liveTasks} />
+        )}
         {!isUser && message.taskId && <TaskCardInline credential={credential} message={message} />}
       </div>
     </article>

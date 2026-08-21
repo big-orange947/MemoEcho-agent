@@ -1354,3 +1354,5 @@ input:focus, select:focus, textarea:focus { border-color: #779c94; box-shadow: 0
 .ws-composer textarea:focus { border-color: var(--accent); background: #fff; box-shadow: 0 0 0 3px var(--accent-soft, #e7f3f0); }
 .ws-composer button { display: grid; width: 40px; height: 40px; place-items: center; border: 0; border-radius: 12px; background: var(--accent); color: #fff; cursor: pointer; }
 .ws-composer button:disabled { opacity: 0.45; cursor: not-allowed; }
+.ws-live-tasks { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
+.ws-live-tasks .ws-task-card { margin-top: 0; }

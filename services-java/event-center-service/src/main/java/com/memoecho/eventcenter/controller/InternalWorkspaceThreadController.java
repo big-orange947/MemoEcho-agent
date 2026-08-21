@@ -18,6 +18,7 @@ import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import java.util.List;
 
@@ -103,7 +104,7 @@ public class InternalWorkspaceThreadController {
         return ResponseEntity.ok(threadService.getMessage(resolvedUserId, threadId, messageId));
     }
 
-    /** 发送一条用户消息并同步执行命令，返回用户消息、Agent 回执与命令响应。 */
+    /** 发送一条用户消息并异步执行命令，立即返回 user/streaming agent 消息。 */
     @PostMapping("/{threadId}/messages")
     public ResponseEntity<WorkspaceThreadMessageSendResponse> sendMessage(
             @RequestHeader(name = "Authorization", required = false) String authorization,
@@ -113,6 +114,18 @@ public class InternalWorkspaceThreadController {
     ) {
         String resolvedUserId = userContextResolver.resolve(authorization, userId);
         return ResponseEntity.ok(threadService.sendMessage(resolvedUserId, threadId, request.content()));
+    }
+
+    /** 订阅单条 agent 消息的执行进度 SSE（P2 阶段事件流）。 */
+    @GetMapping(value = "/{threadId}/messages/{messageId}/stream", produces = "text/event-stream")
+    public SseEmitter streamMessage(
+            @RequestHeader(name = "Authorization", required = false) String authorization,
+            @RequestHeader(name = "X-Memo-Echo-User-Id", defaultValue = "local-user") String userId,
+            @PathVariable String threadId,
+            @PathVariable String messageId
+    ) {
+        String resolvedUserId = userContextResolver.resolve(authorization, userId);
+        return threadService.streamMessage(resolvedUserId, threadId, messageId);
     }
 
     public record CreateThreadRequest(@Size(max = 200) String title) {

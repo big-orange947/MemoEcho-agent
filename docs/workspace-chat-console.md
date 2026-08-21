@@ -119,13 +119,18 @@ GET    /internal/workspace/threads/{id}/messages/{mid}    读取单条消息（�
 - `GET /internal/workspace/commands/delegated-workflows/{id}/runtime`：前端刷新工作流步骤卡状态。
 - `WorkspaceEventStreamService`（SSE 基建）：P2 扩展为按 `threadId` 或 `messageId` 订阅，现在不动。
 
-### 5.3 P2 预留
+### 5.3 P2（已实现）
 
 ```text
-GET /internal/workspace/threads/{id}/messages/{mid}/stream   SSE：逐 token / 工具状态
+GET /internal/workspace/threads/{id}/messages/{mid}/stream   SSE：阶段事件流
 ```
 
-实现路径（P2 决策，不在 P1 做）：Java 对 Runtime 的同步派发改为**异步触发**（线程池），Runtime 侧 `_log_delegated_trace` 与 L0 状态回写已具备进度事件，Java 轮询或接收回调后经 `WorkspaceEventStreamService` 按 `messageId` 扇出。
+- `POST .../messages` 改为**异步**：立即落库 user + streaming agent 消息并返回（202 语义），命令在后台线程执行；`commandId` 由线程服务预生成并注入命令链路，保证执行期间可按 `source_execution_id` 轮询进度。
+- 进度来源：后台按 commandId 轮询 `delegated_task` / `delegated_workflow` / `delegated_workflow_step_dispatch`，变化时推送 `progress` 事件（任务列表 + 工作流状态）。
+- 事件类型：`connected`（快照）/ `processing` / `progress` / `done`（含终态 agent 消息）/ `error`。
+- 前端用 `fetch + ReadableStream` 解析 SSE（EventSource 无法携带 Authorization 头）；流中断时回退到 `GET .../messages/{mid}` 读取服务端终态。
+- 超时保护：`streaming` 消息超过 15 分钟未完成时在列表读取时自动标记为 error。
+- **范围边界**：本阶段是"阶段事件流"（任务创建、步骤激活、状态变化），不是逐 token 文本流。逐 token 需要 Python 侧把 LangGraph 单次 `ainvoke` 拆成可流式出口，属后续阶段。
 
 ## 6. 前端结构
 

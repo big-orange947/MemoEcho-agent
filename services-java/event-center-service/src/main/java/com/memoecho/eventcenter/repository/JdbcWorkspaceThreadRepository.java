@@ -142,4 +142,24 @@ public class JdbcWorkspaceThreadRepository {
                 .stream()
                 .findFirst();
     }
+
+    /** 更新消息状态与内容（如超时标记、执行终态回写）。 */
+    public void updateMessage(WorkspaceThreadMessage message) {
+        jdbcTemplate.update("""
+                UPDATE workspace_thread_message
+                SET content = ?, status = ?, task_id = ?, workflow_id = ?, result_json = ?
+                WHERE id = ? AND user_id = ?
+                """,
+                message.content(), message.status(), message.taskId(), message.workflowId(),
+                message.resultJson(), message.id(), message.userId());
+    }
+
+    /** 仅更新消息状态与内容（streaming 超时保护等）。 */
+    public void updateMessageStatus(String id, String userId, String status, String content) {
+        jdbcTemplate.update("""
+                UPDATE workspace_thread_message
+                SET content = ?, status = ?
+                WHERE id = ? AND user_id = ?
+                """, content, status, id, userId);
+    }
 }

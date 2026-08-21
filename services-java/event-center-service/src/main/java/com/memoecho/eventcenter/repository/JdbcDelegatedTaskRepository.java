@@ -117,6 +117,15 @@ public class JdbcDelegatedTaskRepository {
         return ids == null ? List.of() : ids;
     }
 
+    /** 按主控台执行 ID 读取完整任务列表，供消息流式进度轮询使用。 */
+    public List<DelegatedTask> findBySourceExecutionId(String userId, String sourceExecutionId) {
+        return jdbcTemplate.query("""
+                        SELECT * FROM delegated_task
+                        WHERE user_id = ? AND source_execution_id = ?
+                        ORDER BY step_order, created_at
+                        """, rowMapper, userId, sourceExecutionId);
+    }
+
     /**
      * 查找短时间内同一会话、同一原始命令创建的任务。
      * 这个方法用于抵御前端重复点击、Runtime 重试和并发事件导致的重复创建。
