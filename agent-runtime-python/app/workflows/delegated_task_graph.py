@@ -332,12 +332,14 @@ class DelegatedTaskWorkflow:
         command: str,
         candidates: list[ConversationCandidate],
         model_profile: Any = None,
+        thread_context: list[dict[str, str]] | None = None,
     ) -> list[ConversationCandidate]:
         """解析主控台自然语言命令要作用到哪些授权会话。
 
         主控台命令不能再由 Java 或正则提前拆联系人，否则容易把“km预约”这类动作词
         拼进联系人名称。这里先让模型在授权候选列表中选择目标；模型不可用或返回越界结果时，
-        再用保守的本地显式提及匹配兜底。
+        再用保守的本地显式提及匹配兜底。thread_context 提供线程前序消息，支持
+        “那后天呢？”这类省略联系人的追问。
         """
         if not candidates:
             return []
@@ -356,16 +358,19 @@ class DelegatedTaskWorkflow:
             "你的任务是从 authorizedConversations 中选择用户命令明确提到的目标会话，支持多选。"
             "只能返回候选里真实存在的 chatId 和 chatType，禁止创造联系人、禁止把任务动作词当联系人。"
             "如果用户明确说群聊、群里、群内、这个群，才优先选择群聊；否则提到人名时优先私聊。"
+            "threadContext 是当前对话线程的前序消息（role: user/agent）。"
+            "命令本身没提到联系人、但 threadContext 中用户上一轮明确委托过某人时（如追问“那后天呢？”），"
+            "可以依据 threadContext 推断该联系人；否则忽略 threadContext，不要凭空猜测。"
             "输出格式：{\"targets\":[{\"chatId\":\"...\",\"chatType\":\"private|group\",\"reason\":\"...\"}],\"reason\":\"...\"}。"
             "无法确定目标时 targets 返回空数组。"
         )
-        user_message = json.dumps(
-            {
-                "command": command,
-                "authorizedConversations": [self._candidate_payload(candidate) for candidate in candidates],
-            },
-            ensure_ascii=False,
-        )
+        payload: dict[str, Any] = {
+            "command": command,
+            "authorizedConversations": [self._candidate_payload(candidate) for candidate in candidates],
+        }
+        if thread_context:
+            payload["threadContext"] = thread_context
+        user_message = json.dumps(payload, ensure_ascii=False)
         try:
             raw = await self.llm_client.generate_reply(
                 system_prompt,
@@ -386,6 +391,7 @@ class DelegatedTaskWorkflow:
         command: str,
         candidates: list[ConversationCandidate],
         model_profile: Any = None,
+        thread_context: list[dict[str, str]] | None = None,
     ) -> DelegatedWorkflowPlan:
         """把一条主控台命令规划成带依赖关系的父工作流。
 
@@ -419,6 +425,9 @@ class DelegatedTaskWorkflow:
             "你是 Memo Echo 的委托任务规划器，只输出 JSON。"
             "你必须把用户命令规划成一个有向无环工作流，而不是为每个联系人复制整条命令。"
             "authorizedTargets 是唯一允许联系的会话，targetChatId 和 targetChatType 必须原样取自其中。"
+            "threadContext 是当前对话线程的前序消息（role: user/agent）。"
+            "当 command 是对前文的追问（如“那后天呢？”）时，依据 threadContext 补全缺失的联系人、日期与事项；"
+            "instruction 必须写成自包含的完整描述（含补全后的时间和对象），不能用“同上”“接着上次”之类的省略。"
             "如果命令是并行通知多人，每个目标创建一个无依赖根步骤。"
             "如果命令包含先询问 A、取得答案、再转告 B，则先创建询问 A 的根步骤，"
             "它通过 producesFacts 声明事实；转告 B 的步骤通过 dependsOn 和 requiredFacts 等待该事实。"
@@ -430,13 +439,13 @@ class DelegatedTaskWorkflow:
             "\"instruction\":\"...\",\"targetChatType\":\"private|group\",\"targetChatId\":\"...\","
             "\"dependsOn\":[],\"requiredFacts\":[],\"producesFacts\":[]}]}。"
         )
-        user_message = json.dumps(
-            {
-                "command": command,
-                "authorizedTargets": [self._candidate_payload(candidate) for candidate in authorized],
-            },
-            ensure_ascii=False,
-        )
+        planning_payload: dict[str, Any] = {
+            "command": command,
+            "authorizedTargets": [self._candidate_payload(candidate) for candidate in authorized],
+        }
+        if thread_context:
+            planning_payload["threadContext"] = thread_context
+        user_message = json.dumps(planning_payload, ensure_ascii=False)
         try:
             raw = await self.llm_client.generate_reply(
                 system_prompt,

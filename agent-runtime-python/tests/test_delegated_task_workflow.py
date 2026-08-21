@@ -558,6 +558,104 @@ class DelegatedTaskWorkflowTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([], result)
 
+    async def test_workspace_router_should_use_thread_context_for_followup(self) -> None:
+        """省略联系人的追问（如"那后天呢？"）必须借助线程前文推断目标联系人。"""
+
+        class CapturingRouterLlm:
+            def __init__(self) -> None:
+                self.user_messages: list[str] = []
+
+            def is_enabled(self, model_profile=None) -> bool:
+                return True
+
+            async def generate_reply(self, system_prompt, user_message, temperature=0.7, model_profile=None) -> str:
+                self.user_messages.append(user_message)
+                return json.dumps(
+                    {
+                        "targets": [{"chatId": "3807050597", "chatType": "private", "reason": "前文委托对象"}],
+                        "reason": "依据线程前文推断",
+                    },
+                    ensure_ascii=False,
+                )
+
+        llm = CapturingRouterLlm()
+        workflow = DelegatedTaskWorkflow(llm)
+        candidates = [
+            ConversationCandidate.model_validate(
+                {"platform": "qq", "chatType": "private", "chatId": "3807050597", "chatName": "km"}
+            ),
+            ConversationCandidate.model_validate(
+                {"platform": "qq", "chatType": "private", "chatId": "2597164807", "chatName": "小号"}
+            ),
+        ]
+
+        result = await workflow.resolve_workspace_command_targets(
+            "那后天呢？",
+            candidates,
+            thread_context=[
+                {"role": "user", "content": "帮我和 km 约明天晚上打游戏"},
+                {"role": "agent", "content": "已创建委托工作流，正在执行"},
+            ],
+        )
+
+        self.assertEqual(["3807050597"], [item.chat_id for item in result])
+        # 模型必须看到线程前文，否则"那后天呢？"无法定位联系人。
+        self.assertTrue(any("threadContext" in message for message in llm.user_messages))
+
+    async def test_workspace_planner_should_use_thread_context_for_followup(self) -> None:
+        """规划器必须把线程前文交给模型，让追问的指令补全为自包含步骤。"""
+
+        class CapturingPlannerLlm:
+            def __init__(self) -> None:
+                self.calls: list[dict] = []
+
+            def is_enabled(self, model_profile=None) -> bool:
+                return True
+
+            async def generate_reply(self, system_prompt, user_message, temperature=0.7, model_profile=None) -> str:
+                self.calls.append({"systemPrompt": system_prompt, "userMessage": user_message})
+                return json.dumps(
+                    {
+                        "title": "约km后天打游戏",
+                        "workflowType": "PLAN_EXECUTE",
+                        "steps": [
+                            {
+                                "stepKey": "step_1",
+                                "order": 1,
+                                "role": "executor",
+                                "instruction": "询问 km 后天晚上打游戏的空闲时间",
+                                "targetChatType": "private",
+                                "targetChatId": "3807050597",
+                                "dependsOn": [],
+                                "requiredFacts": [],
+                                "producesFacts": ["km_available_time"],
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                )
+
+        llm = CapturingPlannerLlm()
+        workflow = DelegatedTaskWorkflow(llm)
+        candidates = [
+            ConversationCandidate.model_validate(
+                {"platform": "qq", "chatType": "private", "chatId": "3807050597", "chatName": "km"}
+            )
+        ]
+
+        plan = await workflow.plan_workspace_command(
+            "那后天呢？",
+            candidates,
+            thread_context=[
+                {"role": "user", "content": "帮我和 km 约明天晚上打游戏"},
+                {"role": "agent", "content": "已创建委托工作流，正在执行"},
+            ],
+        )
+
+        self.assertEqual("step_1", plan.steps[0].step_key)
+        self.assertTrue(any("threadContext" in call["userMessage"] for call in llm.calls))
+        self.assertTrue(any("threadContext" in call["systemPrompt"] for call in llm.calls))
+
     def test_should_normalize_langchain_snake_case_completion_arguments(self) -> None:
         """LangChain 默认下划线参数不能导致完成证据在归一化阶段丢失。"""
         result = DelegatedTaskWorkflow._normalize_tool_decision(

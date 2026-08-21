@@ -166,6 +166,13 @@ GET /internal/workspace/threads/{id}/messages/{mid}/stream   SSE：阶段事件�
 - 状态管理：P1 用 React state + 简单 context（线程列表、当前线程消息、loading/error），不引入额外库。
 - API 层：`src/api/client.ts` 新增线程函数，沿用现有 `StoredCredential` 与 JWT 头。
 
+### P3（已实现：多轮追问）
+
+- **线程上下文透传**：`WorkspaceCommandRequest` 增加可选 `threadHistory`（最近 8 条 user/agent 消息，正序、过滤失败/空消息），随命令事件 `rawPayload.threadHistory` 透传 Runtime。
+- **Router 上下文推断**：命令本身无联系人时，模型可依据 threadContext 推断上一轮委托对象（"那后天呢？"→ km）。
+- **Planner 上下文补全**：规划器依据 threadContext 补全联系人/日期/事项，instruction 必须自包含（实机验证：追问生成"询问km后天安排"工作流，指令引用前文"明天你已回复9点，后天是否也9点"）。
+- **范围边界**：线程历史仅用于编译期上下文；线程绑定模型/会话设定、线程级长期记忆仍在后续。
+
 ## 7. 分期
 
 ### P1（本阶段，按此实现）

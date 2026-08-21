@@ -267,6 +267,7 @@ class OrchestratorService:
         )
         user_id = EventCenterServiceClient.resolve_event_user_id(event)
         command = (event.text or "").strip()
+        thread_history = self._extract_thread_history(raw_payload)
         self._log_delegated_trace(
             "command_received",
             execution_id=execution_id,
@@ -274,7 +275,9 @@ class OrchestratorService:
             userId=user_id,
             commandLength=len(command),
             requestedRoute=str(raw_payload.get("requestedRoute") or "auto"),
+            threadHistoryCount=len(thread_history),
         )
+
         if not command:
             return OrchestratorResult(
                 execution_id=execution_id,
@@ -355,6 +358,7 @@ class OrchestratorService:
                 command=command,
                 candidates=candidates,
                 model_profile=model_profile,
+                thread_context=thread_history,
             )
         except Exception as exception:
             self._log_delegated_trace(
@@ -418,6 +422,7 @@ class OrchestratorService:
                 command=command,
                 candidates=target_candidates,
                 model_profile=model_profile,
+                thread_context=thread_history,
             )
             candidate_map = {
                 (self._normalize_workspace_chat_type(candidate.chat_type), candidate.chat_id): candidate
@@ -546,6 +551,28 @@ class OrchestratorService:
                 ],
                 final_reply="委托工作流创建失败，请稍后重试",
             )
+
+    @staticmethod
+    def _extract_thread_history(raw_payload: dict) -> list[dict[str, str]]:
+        """从命令事件负载提取线程最近消息，供多轮追问解析前文。
+
+        只保留 user/agent 的非空文本，按时间顺序截取最近 8 条；
+        透传内容不包含任务引用与内部 ID，避免模型上下文被控制面数据污染。
+        """
+        raw = raw_payload.get("threadHistory")
+        if not isinstance(raw, list):
+            return []
+        entries: list[dict[str, str]] = []
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role") or "").strip()
+            if role not in {"user", "agent"}:
+                continue
+            content = " ".join(str(item.get("content") or "").split())
+            if content:
+                entries.append({"role": role, "content": content})
+        return entries[-8:]
 
     async def _safe_resolve_workspace_command_model(
         self,

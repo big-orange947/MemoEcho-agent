@@ -81,6 +81,10 @@ public class WorkspaceCommandApplicationService {
         if (requestedRoute != null) {
             rawPayload.put("requestedRoute", requestedRoute);
         }
+        // 多轮追问上下文：线程最近消息随命令透传，供 Runtime 解析"那后天呢？"这类省略句。
+        if (request.threadHistory() != null && !request.threadHistory().isEmpty()) {
+            rawPayload.putPOJO("threadHistory", request.threadHistory());
+        }
 
         UnifiedEventPayload event = new UnifiedEventPayload(
                 commandId,

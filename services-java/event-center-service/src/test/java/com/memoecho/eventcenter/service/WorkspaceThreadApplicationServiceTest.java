@@ -107,7 +107,7 @@ class WorkspaceThreadApplicationServiceTest {
                         "cmd-1", "success", "delegated_task", "已创建 2 步骤工作流",
                         "委托任务已创建", false, List.of(), null, ""));
 
-        service.runMessageCommand(USER_ID, THREAD_ID, "user-1", "agent-1", "cmd-1", "帮我和 km 约时间");
+        service.runMessageCommand(USER_ID, THREAD_ID, "user-1", "agent-1", "cmd-1", "帮我和 km 约时间", List.of());
 
         org.mockito.ArgumentCaptor<WorkspaceThreadMessage> captor =
                 org.mockito.ArgumentCaptor.forClass(WorkspaceThreadMessage.class);
@@ -129,7 +129,7 @@ class WorkspaceThreadApplicationServiceTest {
         when(commandService.execute(eq(USER_ID), any(), eq("cmd-2")))
                 .thenThrow(new IllegalStateException("runtime timeout"));
 
-        service.runMessageCommand(USER_ID, THREAD_ID, "user-2", "agent-2", "cmd-2", "做点什么");
+        service.runMessageCommand(USER_ID, THREAD_ID, "user-2", "agent-2", "cmd-2", "做点什么", List.of());
 
         org.mockito.ArgumentCaptor<WorkspaceThreadMessage> captor =
                 org.mockito.ArgumentCaptor.forClass(WorkspaceThreadMessage.class);

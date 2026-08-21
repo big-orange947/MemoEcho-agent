@@ -953,11 +953,11 @@ class OrchestratorWriteBackTest(unittest.IsolatedAsyncioTestCase):
         class WorkspaceCommandWorkflow:
             """固定路由和编译结果，使测试只关注 Orchestrator 的返回契约。"""
 
-            async def resolve_workspace_command_targets(self, command, candidates, model_profile):
+            async def resolve_workspace_command_targets(self, command, candidates, model_profile, thread_context=None):
                 # 明确联系人应由本地解析器命中，这里直接返回全部授权候选。
                 return candidates
 
-            async def plan_workspace_command(self, command, candidates, model_profile):
+            async def plan_workspace_command(self, command, candidates, model_profile, thread_context=None):
                 # 这个函数的作用是模拟 RouterAgent 生成单步骤执行计划。
                 target = candidates[0]
                 return DelegatedWorkflowPlan(
@@ -1081,11 +1081,11 @@ class OrchestratorWriteBackTest(unittest.IsolatedAsyncioTestCase):
                 # 明确联系人应由本地解析器命中；若意外调用模型，该测试会直接暴露属性错误。
                 self.router = DelegatedTaskWorkflow(object())
 
-            async def resolve_workspace_command_targets(self, command, candidates, model_profile):
+            async def resolve_workspace_command_targets(self, command, candidates, model_profile, thread_context=None):
                 # 先复用真实联系人解析，只挑选命令明确提到的私聊目标。
                 return await self.router.resolve_workspace_command_targets(command, candidates, model_profile)
 
-            async def plan_workspace_command(self, command, candidates, model_profile):
+            async def plan_workspace_command(self, command, candidates, model_profile, thread_context=None):
                 return DelegatedWorkflowPlan(
                     title="通知 km 和小号今晚有课",
                     steps=[

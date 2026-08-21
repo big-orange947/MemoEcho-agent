@@ -3,6 +3,7 @@ package com.memoecho.eventcenter.service;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.memoecho.eventcenter.dto.WorkspaceCommandRequest;
 import com.memoecho.eventcenter.dto.WorkspaceCommandResponse;
+import com.memoecho.eventcenter.dto.WorkspaceThreadHistoryEntry;
 import com.memoecho.eventcenter.dto.WorkspaceThreadMessageSendResponse;
 import com.memoecho.eventcenter.dto.WorkspaceThreadMessageResponse;
 import com.memoecho.eventcenter.dto.WorkspaceThreadResponse;
@@ -158,6 +159,21 @@ public class WorkspaceThreadApplicationService {
         }
         Instant now = Instant.now();
         String commandId = "desktop:command:" + UUID.randomUUID();
+        // 多轮追问上下文：发送前取线程最近消息（不含本条），随命令透传 Runtime。
+        // listMessages 按时间倒序返回，这里反转为正序并过滤失败/空消息，减少模型噪声。
+        List<WorkspaceThreadHistoryEntry> threadHistory = new java.util.ArrayList<>(
+                threadRepository
+                        .listMessages(thread.id(), 12, null).stream()
+                        .filter(message -> "user".equals(message.role())
+                                || ("agent".equals(message.role()) && "done".equals(message.status())))
+                        .filter(message -> message.content() != null && !message.content().isBlank())
+                        .map(message -> new WorkspaceThreadHistoryEntry(message.role(), message.content()))
+                        .toList());
+        java.util.Collections.reverse(threadHistory);
+        if (threadHistory.size() > 8) {
+            threadHistory = new java.util.ArrayList<>(threadHistory.subList(0, 8));
+        }
+        final List<WorkspaceThreadHistoryEntry> resolvedThreadHistory = threadHistory;
         WorkspaceThreadMessage userMessage = threadRepository.insertMessage(new WorkspaceThreadMessage(
                 UUID.randomUUID().toString(),
                 thread.id(),
@@ -185,7 +201,8 @@ public class WorkspaceThreadApplicationService {
                 now
         ));
         threadRepository.touchThread(thread.id(), userId, now);
-        COMMAND_EXECUTOR.submit(() -> runMessageCommand(userId, thread.id(), userMessage.id(), agentMessage.id(), commandId, normalizedContent));
+        COMMAND_EXECUTOR.submit(() -> runMessageCommand(
+                userId, thread.id(), userMessage.id(), agentMessage.id(), commandId, normalizedContent, resolvedThreadHistory));
         return new WorkspaceThreadMessageSendResponse(
                 WorkspaceThreadMessageResponse.from(userMessage),
                 WorkspaceThreadMessageResponse.from(agentMessage),
@@ -291,13 +308,15 @@ public class WorkspaceThreadApplicationService {
             String userMessageId,
             String agentMessageId,
             String commandId,
-            String content
+            String content,
+            List<WorkspaceThreadHistoryEntry> threadHistory
     ) {
         WorkspaceCommandResponse response = null;
         String errorText = "";
         try {
             emitStage(agentMessageId, "processing", Map.of("message", "已受理，正在编译任务…"));
-            response = commandApplicationService.execute(userId, new WorkspaceCommandRequest(content, null), commandId);
+            response = commandApplicationService.execute(
+                    userId, new WorkspaceCommandRequest(content, null, threadHistory), commandId);
             // 命令返回时 runtime 已同步完成本次动作，任务/工作流已在库中，无需长时间轮询。
         } catch (Exception exception) {
             errorText = String.valueOf(
