@@ -37,7 +37,12 @@ export function WorkspaceConsole({ credential }: { credential: StoredCredential 
       .finally(() => setThreadsLoading(false));
   }, [credential]);
 
-  // 自动选中线程后加载其消息（仅在 activeThreadId 变化且来自自动选择时触发）。
+  // 挂载与线程刷新统一入口：列表加载后自动选中最近线程。
+  useEffect(() => {
+    refreshThreads();
+  }, [refreshThreads]);
+
+  // 自动选中线程后加载其消息（activeThreadId 变化时触发）。
   useEffect(() => {
     if (!activeThreadId) return;
     listThreadMessages(credential, activeThreadId)
