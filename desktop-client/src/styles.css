@@ -1290,3 +1290,67 @@ input:focus, select:focus, textarea:focus { border-color: #779c94; box-shadow: 0
   .schedule-board-actions { gap: 7px; }
   .schedule-board-actions > span { display: none; }
 }
+
+/* ============ 主控台对话式工作区（P1） ============ */
+.ws-layout { display: flex; height: 100%; min-height: 0; }
+.ws-sidebar { width: 240px; flex: 0 0 240px; border-right: 1px solid var(--border, #e4ece9); display: flex; flex-direction: column; min-height: 0; background: var(--panel, #fbfdfc); }
+.ws-sidebar-head { display: flex; align-items: center; justify-content: space-between; padding: 14px 14px 10px; }
+.ws-sidebar-head strong { font-size: 13px; letter-spacing: 0.04em; color: #45615a; }
+.ws-new-thread { display: grid; width: 28px; height: 28px; place-items: center; border: 1px solid #cfe0db; border-radius: 8px; color: var(--accent); background: #f2f8f6; cursor: pointer; }
+.ws-new-thread:hover { background: var(--accent-soft, #e7f3f0); }
+.ws-sidebar-notice { margin: 8px 14px; font-size: 12px; color: #8aa29b; }
+.ws-thread-list { flex: 1; overflow-y: auto; padding: 0 8px; min-height: 0; }
+.ws-thread-item { display: flex; align-items: center; gap: 8px; width: 100%; padding: 9px 10px; border: 0; border-radius: 9px; background: transparent; color: #33453f; text-align: left; cursor: pointer; font-size: 13px; }
+.ws-thread-item:hover { background: #f0f6f4; }
+.ws-thread-item.active { background: var(--accent-soft, #e7f3f0); color: var(--accent); }
+.ws-thread-title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ws-thread-actions { display: none; gap: 4px; }
+.ws-thread-item:hover .ws-thread-actions { display: flex; }
+.ws-thread-actions i { display: grid; place-items: center; width: 20px; height: 20px; border-radius: 6px; color: #7b948c; cursor: pointer; }
+.ws-thread-actions i:hover { background: #dfece8; color: var(--accent); }
+.ws-thread-archived { border-top: 1px solid var(--border, #e4ece9); padding: 10px 8px; max-height: 30%; overflow-y: auto; }
+.ws-thread-archived p { margin: 0 10px 6px; font-size: 11px; color: #9ab0a9; letter-spacing: 0.06em; }
+.ws-thread-archived .ws-thread-item { color: #7b948c; }
+.ws-chat { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+.ws-chat-list { flex: 1; overflow-y: auto; padding: 22px 26px; min-height: 0; scroll-behavior: smooth; }
+.ws-chat-empty { display: grid; place-items: center; gap: 16px; height: 100%; color: #7b948c; }
+.ws-chat-empty p { font-size: 14px; }
+.ws-chat-capabilities { display: flex; flex-wrap: wrap; gap: 10px; justify-content: center; max-width: 480px; }
+.ws-chat-capabilities button { display: flex; align-items: center; gap: 8px; padding: 10px 14px; border: 1px solid #d6e3df; border-radius: 12px; background: #fff; color: #33453f; font-size: 13px; cursor: pointer; }
+.ws-chat-capabilities button:hover { border-color: var(--accent); color: var(--accent); background: var(--accent-soft, #e7f3f0); }
+.ws-chat-notice { margin: 8px 0; padding: 10px 14px; border-radius: 10px; font-size: 13px; background: #fff4e8; color: #9a5b13; }
+.ws-chat-notice-error { background: #fdeceb; color: #a33; }
+.ws-msg { display: flex; gap: 10px; margin-bottom: 18px; max-width: 860px; }
+.ws-msg-user { flex-direction: row-reverse; margin-left: auto; }
+.ws-msg-avatar { flex: 0 0 30px; width: 30px; height: 30px; display: grid; place-items: center; border-radius: 50%; background: var(--accent-soft, #e7f3f0); color: var(--accent); font-size: 13px; }
+.ws-msg-user .ws-msg-avatar { background: #eef1ff; color: #5a6bd6; }
+.ws-msg-body { min-width: 0; max-width: 78%; }
+.ws-msg-meta { display: flex; align-items: baseline; gap: 8px; margin-bottom: 4px; }
+.ws-msg-meta strong { font-size: 12px; color: #45615a; }
+.ws-msg-meta time { font-size: 11px; color: #9ab0a9; }
+.ws-msg-bubble { padding: 10px 14px; border: 1px solid #e0e9e6; border-radius: 4px 14px 14px 14px; background: #fff; }
+.ws-msg-user .ws-msg-bubble { border-radius: 14px 4px 14px 14px; background: var(--accent-soft, #e7f3f0); border-color: transparent; }
+.ws-msg-text { margin: 0; font-size: 13.5px; line-height: 1.65; color: #2c3d37; white-space: pre-wrap; word-break: break-word; }
+.ws-msg-error .ws-msg-text { color: #a33; }
+.ws-msg-pending { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; color: #7b948c; }
+.ws-msg-warn { color: #c74; vertical-align: -2px; }
+.ws-msg-confirm-hint { display: inline-flex; align-items: center; gap: 5px; margin-top: 6px; font-size: 12px; color: #9a5b13; }
+.ws-task-card { margin-top: 8px; border: 1px solid #dbe7e3; border-radius: 10px; background: #fbfdfc; padding: 9px 12px; font-size: 12.5px; color: #45615a; }
+.ws-task-card-loading { display: inline-flex; align-items: center; gap: 8px; color: #7b948c; }
+.ws-task-card-done { border-color: #cde5dc; background: #f4faf7; }
+.ws-task-card-head { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+.ws-task-state { padding: 2px 8px; border-radius: 999px; font-size: 11px; background: #eef3f1; color: #567; }
+.ws-task-state.state-completed { background: #e2f3ea; color: #1c7a55; }
+.ws-task-state.state-active, .ws-task-state.state-running { background: #e8f1fb; color: #2f6fb2; }
+.ws-task-state.state-failed, .ws-task-state.state-cancelled { background: #fdeceb; color: #a33; }
+.ws-task-card-head strong { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ws-task-caret { color: #9ab0a9; transition: transform 0.15s; }
+.ws-task-caret.open { transform: rotate(180deg); }
+.ws-task-card-body { margin-top: 8px; padding-top: 8px; border-top: 1px dashed #dbe7e3; }
+.ws-task-card-body p { margin: 0 0 6px; font-size: 12.5px; color: #33453f; }
+.ws-task-card-body small { display: inline-flex; align-items: center; gap: 5px; color: #7b948c; }
+.ws-composer { display: flex; align-items: flex-end; gap: 10px; padding: 14px 18px; border-top: 1px solid var(--border, #e4ece9); background: #fff; }
+.ws-composer textarea { flex: 1; resize: none; min-height: 44px; max-height: 140px; padding: 11px 14px; border: 1px solid #d3e2dd; border-radius: 12px; font: inherit; font-size: 13.5px; color: #2c3d37; background: #fbfdfc; outline: none; }
+.ws-composer textarea:focus { border-color: var(--accent); background: #fff; box-shadow: 0 0 0 3px var(--accent-soft, #e7f3f0); }
+.ws-composer button { display: grid; width: 40px; height: 40px; place-items: center; border: 0; border-radius: 12px; background: var(--accent); color: #fff; cursor: pointer; }
+.ws-composer button:disabled { opacity: 0.45; cursor: not-allowed; }

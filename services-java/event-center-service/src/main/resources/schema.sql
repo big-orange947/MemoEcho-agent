@@ -359,3 +359,36 @@ CREATE TABLE IF NOT EXISTS delegated_task_current_event (
 
 CREATE INDEX IF NOT EXISTS idx_delegated_task_current_event_workflow
     ON delegated_task_current_event (workflow_id, step_key, updated_at);
+
+-- 主控台对话式工作区：线程与消息。与 V15 迁移保持一致。
+CREATE TABLE IF NOT EXISTS workspace_thread (
+    id VARCHAR(36) PRIMARY KEY,
+    user_id VARCHAR(64) NOT NULL,
+    title VARCHAR(200) NOT NULL DEFAULT '',
+    pinned BOOLEAN NOT NULL DEFAULT FALSE,
+    archived BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMP NOT NULL,
+    updated_at TIMESTAMP NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_workspace_thread_user
+    ON workspace_thread (user_id, updated_at);
+
+CREATE TABLE IF NOT EXISTS workspace_thread_message (
+    id VARCHAR(36) PRIMARY KEY,
+    thread_id VARCHAR(36) NOT NULL,
+    user_id VARCHAR(64) NOT NULL,
+    role VARCHAR(16) NOT NULL,
+    content CLOB NOT NULL,
+    status VARCHAR(24) NOT NULL DEFAULT 'done',
+    execution_id VARCHAR(128) NOT NULL DEFAULT '',
+    task_id VARCHAR(36),
+    workflow_id VARCHAR(36),
+    result_json CLOB,
+    created_at TIMESTAMP NOT NULL,
+    CONSTRAINT fk_workspace_thread_message_thread
+        FOREIGN KEY (thread_id) REFERENCES workspace_thread(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_workspace_thread_message_thread
+    ON workspace_thread_message (thread_id, created_at);

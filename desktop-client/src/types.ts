@@ -648,3 +648,45 @@ export type WorkspaceCommandResponse = {
   delegatedTask: DelegatedTask | null;
   error: string;
 };
+
+/** 工作区对话线程，按主题组织用户与 Agent 的多轮消息。 */
+export type Thread = {
+  id: string;
+  userId: string;
+  title: string;
+  pinned: boolean;
+  archived: boolean;
+  createdAt: string;
+  updatedAt: string;
+};
+
+/** 仅更新线程的可变字段，未提供的字段由后端保留原值。 */
+export type ThreadPatch = {
+  title?: string;
+  pinned?: boolean;
+  archived?: boolean;
+};
+
+export type ThreadMessageRole = "user" | "agent" | "system";
+export type ThreadMessageStatus = "pending" | "streaming" | "done" | "error" | "needs_confirmation";
+
+/** 一条对话消息：用户输入或 Agent 产出，可能携带关联的执行/任务/工作流引用。 */
+export type ThreadMessage = {
+  id: string;
+  threadId: string;
+  role: ThreadMessageRole;
+  content: string;
+  status: ThreadMessageStatus;
+  executionId: string | null;
+  taskId: string | null;
+  workflowId: string | null;
+  resultJson: string | null;
+  createdAt: string;
+};
+
+/** 发送用户消息后后端同步返回的成对消息与命令结果（P1 同步链路）。 */
+export type ThreadMessageSendResult = {
+  userMessage: ThreadMessage;
+  agentMessage: ThreadMessage;
+  response: WorkspaceCommandResponse;
+};

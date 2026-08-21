@@ -34,6 +34,10 @@ import type {
   WorkspaceScheduleSourceContext,
   SecureAsset,
   SecureAssetDraft,
+  Thread,
+  ThreadPatch,
+  ThreadMessage,
+  ThreadMessageSendResult,
 } from "../types";
 
 /** 归一化服务地址，避免用户输入末尾斜杠导致路径拼接错误。 */
@@ -633,4 +637,62 @@ export function completeDelegatedTask(credential: StoredCredential, taskId: stri
   return request<DelegatedTask>(credential.baseUrl, `/internal/workspace/commands/delegated/${taskId}/complete`, {
     method: "POST",
   }, credential.accessToken);
+}
+
+/** 列出当前用户的对话线程，默认不返回已归档项。 */
+export function listThreads(credential: StoredCredential, includeArchived = false) {
+  const params = new URLSearchParams();
+  if (includeArchived) params.set("includeArchived", "true");
+  const suffix = params.size ? `?${params.toString()}` : "";
+  return request<Thread[]>(credential.baseUrl, `/internal/workspace/threads${suffix}`, {}, credential.accessToken);
+}
+
+/** 新建一个空对话线程，标题可选；返回后立即作为当前线程聚焦输入框。 */
+export function createThread(credential: StoredCredential, title?: string) {
+  return request<Thread>(credential.baseUrl, "/internal/workspace/threads", {
+    method: "POST",
+    body: JSON.stringify(title ? { title } : {}),
+  }, credential.accessToken);
+}
+
+/** 更新线程标题、置顶或归档状态；未提供字段由后端保留原值。 */
+export function updateThread(credential: StoredCredential, threadId: string, patch: ThreadPatch) {
+  return request<Thread>(credential.baseUrl, `/internal/workspace/threads/${encodeURIComponent(threadId)}`, {
+    method: "PATCH",
+    body: JSON.stringify(patch),
+  }, credential.accessToken);
+}
+
+/** 分页读取线程内的消息，用于切换线程时恢复历史对话。 */
+export function listThreadMessages(credential: StoredCredential, threadId: string, limit = 50) {
+  const safeLimit = Math.min(200, Math.max(1, Math.trunc(limit)));
+  return request<ThreadMessage[]>(
+    credential.baseUrl,
+    `/internal/workspace/threads/${encodeURIComponent(threadId)}/messages?limit=${safeLimit}`,
+    {},
+    credential.accessToken,
+  );
+}
+
+/**
+ * 发送一条用户消息；P1 走同步链路，后端复用命令链路写回 agent 消息后一次性返回。
+ * 返回成对的 user/agent 消息与底层命令结果，前端在请求返回前以 pending 气泡兜底。
+ */
+export function sendThreadMessage(credential: StoredCredential, threadId: string, content: string) {
+  return request<ThreadMessageSendResult>(
+    credential.baseUrl,
+    `/internal/workspace/threads/${encodeURIComponent(threadId)}/messages`,
+    { method: "POST", body: JSON.stringify({ content }) },
+    credential.accessToken,
+  );
+}
+
+/** 读取线程内单条消息，用于刷新 agent 消息的最终结果或任务引用。 */
+export function getThreadMessage(credential: StoredCredential, threadId: string, messageId: string) {
+  return request<ThreadMessage>(
+    credential.baseUrl,
+    `/internal/workspace/threads/${encodeURIComponent(threadId)}/messages/${encodeURIComponent(messageId)}`,
+    {},
+    credential.accessToken,
+  );
 }

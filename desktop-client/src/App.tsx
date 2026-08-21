@@ -5,6 +5,7 @@ import {
   Bell,
   CalendarDots,
   ChatCircleDots,
+  ChatText,
   Cpu,
   DotsThree,
   DownloadSimple,
@@ -139,6 +140,7 @@ import type {
   WorkspaceInbox,
   WorkspaceInboxItem,
 } from "./types";
+import { WorkspaceConsole } from "./components/workspace/WorkspaceConsole";
 
 const DEFAULT_BASE_URL = "http://127.0.0.1:8093";
 const MONITOR_PROFILE_MARKER = "__MESSAGE_MONITORING__";
@@ -150,9 +152,10 @@ const EMPTY_CONNECTION: PlatformConnectionDraft = {
   credential: "",
 };
 
-type View = "dashboard" | "messages" | "monitoring" | "profiles" | "memories" | "models" | "connections";
+type View = "console" | "dashboard" | "messages" | "monitoring" | "profiles" | "memories" | "models" | "connections";
 
 const VIEW_LABELS: Record<View, string> = {
+  console: "主控台",
   dashboard: "今日脉搏",
   messages: "消息空间",
   monitoring: "消息监控",
@@ -328,7 +331,7 @@ export function App() {
   const [password, setPassword] = useState("");
   const [displayName, setDisplayName] = useState("");
   const [registerMode, setRegisterMode] = useState(false);
-  const [activeView, setActiveView] = useState<View>("dashboard");
+  const [activeView, setActiveView] = useState<View>("console");
   const [connections, setConnections] = useState<PlatformConnection[]>([]);
   const [modelProfiles, setModelProfiles] = useState<ModelProfile[]>([]);
   const [modelDraft, setModelDraft] = useState<ModelProfileDraft>(EMPTY_MODEL);
@@ -1606,11 +1609,12 @@ export function App() {
           <span className="brand-symbol">M</span>
           <div><strong>Memo Echo</strong><small>Personal agent</small></div>
         </div>
-        <button className="new-task-button" onClick={() => setActiveView("dashboard")} type="button">
+        <button className="new-task-button" onClick={() => setActiveView("console")} type="button">
           <Plus size={18} weight="bold" />新建任务
         </button>
         <nav className="primary-nav" aria-label="主导航">
           <p>工作台</p>
+          <button className={activeView === "console" ? "active" : ""} onClick={() => setActiveView("console")}><ChatText size={19} /><span>主控台</span></button>
           <button className={activeView === "dashboard" ? "active" : ""} onClick={() => setActiveView("dashboard")}><House size={19} /><span>今日脉搏</span></button>
           <button className={activeView === "messages" ? "active" : ""} onClick={() => setActiveView("messages")}><ChatCircleDots size={19} /><span>消息空间</span>{unseenHandoffCount > 0 && <i className="nav-alert-dot" aria-label={`${unseenHandoffCount} 条未查看接管事项`} />}</button>
             <button className={activeView === "monitoring" ? "active" : ""} onClick={() => setActiveView("monitoring")}><Bell size={19} /><span>消息监控</span></button>
@@ -1634,6 +1638,7 @@ export function App() {
           </button>
         </header>
         <div className="workspace-content">
+          {activeView === "console" && <WorkspaceConsole credential={credential} />}
           {activeView === "dashboard" && <Dashboard connections={connections} models={modelProfiles} status={status} onExecute={runWorkspaceCommand} onListTasks={loadWorkspaceDelegatedTasks} onGetTask={loadWorkspaceDelegatedTask} onConfirmTask={confirmWorkspaceDelegatedTask} onControlTask={controlWorkspaceDelegatedTask} onOpenModels={() => setActiveView("models")} onOpenProfiles={() => setActiveView("profiles")} onOpenConnections={() => setActiveView("connections")} />}
             {activeView === "messages" && <Messages cacheScope={credential.userId} conversations={conversations} inbox={workspaceInbox} taskCompletions={pendingTaskCompletions} digests={conversationDigests} briefing={workspaceBriefing} status={status} memories={memoryCandidates} onRefresh={() => loadView("messages", credential)} onHandoffsViewed={markHandoffsViewed} onSendHandoff={sendHumanHandoffReply} onFinishHandoff={finishHumanHandoff} onDecideTaskCompletion={decideProxyTaskCompletion} onLoadGroupOperation={loadPendingGroupOperation} onApproveGroupOperation={approveGroupOperation} onLoadConversationProgress={loadConversationProgress} onLoadEventDetail={loadStoredEventDetail} onViewMemoryEvidence={(item) => void openMemoryEvidence(item)} onCreateSchedule={addWorkspaceSchedule} onDeleteSchedule={removeWorkspaceSchedule} onLoadScheduleSource={loadWorkspaceScheduleSource} busy={busy} />}
             {activeView === "monitoring" && <Monitoring contacts={qqContacts} profiles={conversationProfiles.filter((item) => item.description === MONITOR_PROFILE_MARKER)} error={qqContactsError} busy={busy} onRetry={() => credential ? loadView("monitoring", credential) : Promise.resolve()} onSave={saveMonitoringSelection} />}
