@@ -79,3 +79,34 @@ def test_should_block_dynamic_internal_term_without_static_ban_list() -> None:
     terms = internal_terms({"targetName": "内部代号", "targetQuery": "内部代号"})
     assert not CandidateReplyGuard().validate("内部代号，晚上见", terms).allowed
     assert CandidateReplyGuard().validate("晚上见", terms).allowed
+
+
+def test_should_project_workflow_facts_into_model_context() -> None:
+    """父工作流已发布的事实必须进入模型上下文，下游步骤才能引用具体数值。
+
+    回归：km 回复"九点"发布为 km_available_time 后，step_2 的提示词看不到该事实，
+    只按指令"明晚"推断出"明天晚上"，转告消息丢失了具体时间。
+    """
+    payload = build_model_context(
+        task={
+            "objective": "将 km 确认的打游戏时间告知小号",
+            "successCriteria": "小号已收到确认时间",
+            "deadlineText": "明晚",
+        },
+        timeline=[],
+        pre_task_history=[],
+        previous_state={
+            "workflowFacts": {"km_available_time": "九点", "class_time": "七点半"},
+            "chatId": "chat-1",
+        },
+        task_created_at="2026-07-23T09:00:00+08:00",
+        current_time=datetime(2026, 7, 23, 10, 1, tzinfo=timezone.utc),
+        resolved_time_text="明天（2026-08-22）晚上",
+        history_access_allowed=True,
+        available_tools=["send_qq_message"],
+    )
+
+    # 具体事实必须原样进入投影，不能被 resolvedTimeText 的模糊说法替代。
+    assert payload["workflowFacts"] == {"km_available_time": "九点", "class_time": "七点半"}
+    # 控制字段不得泄漏。
+    assert "chatId" not in payload["workflowFacts"]

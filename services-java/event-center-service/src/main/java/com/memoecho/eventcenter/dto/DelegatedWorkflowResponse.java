@@ -18,6 +18,7 @@ public record DelegatedWorkflowResponse(
         Instant createdAt,
         Instant updatedAt,
         Instant completedAt,
+        String factsJson,
         List<DelegatedWorkflowStepResponse> steps
 ) {
     /** 将领域对象和步骤视图合并为 API 响应。 */
@@ -28,6 +29,7 @@ public record DelegatedWorkflowResponse(
         return new DelegatedWorkflowResponse(
                 workflow.id(), workflow.sourceExecutionId(), workflow.originalCommand(), workflow.title(),
                 workflow.workflowType(), workflow.status(), workflow.progressSummary(), workflow.failureReason(),
-                workflow.createdAt(), workflow.updatedAt(), workflow.completedAt(), List.copyOf(steps));
+                workflow.createdAt(), workflow.updatedAt(), workflow.completedAt(), workflow.factsJson(),
+                List.copyOf(steps));
     }
 }

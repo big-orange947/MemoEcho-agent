@@ -483,6 +483,65 @@ class OrchestratorWriteBackTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([], event_center_client.delegated_runtime_updates)
         self.assertEqual([], send_tool.calls)
 
+    async def test_should_attach_workflow_facts_to_downstream_task_state(self) -> None:
+        """下游步骤加载时必须注入父工作流已发布的事实，供上下文投影引用。
+
+        回归：km 回复"九点"发布为 km_available_time，但 step_2 的模型上下文只有
+        指令里的"明晚"，转告消息丢失了具体时间。这里验证任务加载后 stateJson
+        携带 workflowFacts，后续 build_model_context 才能投影给模型。
+        """
+
+        class FactsClient(DummyEventCenterServiceClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.active_delegated_task = {
+                    "id": "step-2-task",
+                    "status": "ACTIVE",
+                    "workflowId": "wf-1",
+                    "platform": "qq",
+                    "chatType": "private",
+                    "chatId": "2597164807",
+                    "targetName": "小号",
+                    "stateJson": '{"workingMemory": {"phase": "ACTIVE"}}',
+                }
+
+            async def get_delegated_workflow_runtime(self, user_id: str, workflow_id: str) -> dict:
+                return {"id": workflow_id, "factsJson": '{"km_available_time": "九点"}'}
+
+        client = FactsClient()
+        service = OrchestratorService(
+            router=RouterService(),
+            planner=PlannerService(),
+            tools=ToolRegistry(),
+            memory=MemoryManager(),
+            slow_channel_buffer=SlowChannelBuffer(window_seconds=600, max_messages=10),
+            event_center_client=client,
+        )
+        event = UnifiedEvent(
+            eventId="qq:private:2597164807:client:step-2:1",
+            platform="qq",
+            scene="delegated_task",
+            eventType="delegated_workflow_step_activated",
+            chatType="private",
+            chatId="2597164807",
+            sender=Sender(id="freeze", name="任务发起人", role="owner"),
+            text="",
+            attachments=[],
+            mentions=[],
+            timestamp="2026-08-21T16:30:00+08:00",
+            rawPayload={"userId": "freeze"},
+            actorType="SYSTEM",
+            delegatedTaskId="step-2-task",
+        )
+
+        task = await service._get_active_delegated_task(event)
+
+        self.assertIsNotNone(task)
+        state = json.loads(task["stateJson"])
+        self.assertEqual({"km_available_time": "九点"}, state["workflowFacts"])
+        # 原始工作记忆不能被覆盖。
+        self.assertEqual({"phase": "ACTIVE"}, state["workingMemory"])
+
     async def test_should_supersede_old_delegated_inbound_when_new_message_arrives(self) -> None:
         """同一会话连续来信时，旧消息在发送前必须让位给最新消息。"""
         service = OrchestratorService(

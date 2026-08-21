@@ -56,6 +56,7 @@ def build_model_context(
         "taskCreatedAt": task_created_at,
         "currentTime": current_time.isoformat(),
         "resolvedTimeText": resolved_time_text,
+        "workflowFacts": _safe_workflow_facts(previous_state.get("workflowFacts")),
         "conversationTimeline": _normalize_messages(timeline, limit=500),
         "preTaskContext": _normalize_messages(pre_task_history, limit=30),
         "workingMemory": _safe_memory(previous_state.get("workingMemory")),
@@ -70,6 +71,13 @@ def _safe_memory(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         return {}
     return {str(key): item for key, item in value.items() if str(key) not in _CONTROL_KEYS}
+
+
+def _safe_workflow_facts(value: Any) -> dict[str, str]:
+    """投影父工作流已发布的事实，让下游步骤看到"km 回复九点"这类跨步骤事实。"""
+    if not isinstance(value, dict):
+        return {}
+    return {str(key): str(item) for key, item in value.items() if str(item)}
 
 
 def _sanitize_task_text(text: str, terms: Iterable[str]) -> str:

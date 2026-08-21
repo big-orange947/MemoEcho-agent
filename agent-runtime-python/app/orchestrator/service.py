@@ -1223,7 +1223,7 @@ class OrchestratorService:
             # 兼容尚未升级的客户端实现和只覆盖旧接口的测试替身，不把能力缺失误报成服务异常。
             return None
         try:
-            return await resolver(event)
+            task = await resolver(event)
         except Exception as exception:
             logger.warning(
                 "读取活动委托失败，继续使用普通路由：eventId=%s, error=%s",
@@ -1231,6 +1231,46 @@ class OrchestratorService:
                 type(exception).__name__,
             )
             return None
+        if task:
+            await self._attach_workflow_facts(event, task)
+        return task
+
+    async def _attach_workflow_facts(self, event: UnifiedEvent, task: dict) -> None:
+        """把父工作流已发布的事实注入任务状态，供上下文投影生成 workflowFacts。
+
+        下游步骤只有 step 指令与自身状态，Java 的活动任务响应不含工作流事实；
+        这里按 workflowId 读取父工作流 factsJson 并合并进 stateJson.workflowFacts，
+        让"km 回复九点"这类跨步骤事实真正进入下游模型的上下文。读取失败时保持原状态。
+        """
+        workflow_id = str(task.get("workflowId") or task.get("workflow_id") or "").strip()
+        if not workflow_id or self.event_center_client is None:
+            return
+        fetch = getattr(self.event_center_client, "get_delegated_workflow_runtime", None)
+        if not callable(fetch):
+            return
+        user_id = EventCenterServiceClient.resolve_event_user_id(event)
+        try:
+            workflow = await fetch(user_id, workflow_id)
+        except Exception as exception:
+            logger.warning(
+                "读取父工作流事实失败，继续使用任务自身状态：workflowId=%s, error=%s",
+                workflow_id,
+                type(exception).__name__,
+            )
+            return
+        raw_facts = workflow.get("factsJson") or workflow.get("facts") or {}
+        if isinstance(raw_facts, str):
+            try:
+                raw_facts = json.loads(raw_facts)
+            except Exception:
+                raw_facts = {}
+        if not isinstance(raw_facts, dict) or not raw_facts:
+            return
+        state = self._parse_json_object(task.get("stateJson"))
+        merged = dict(state.get("workflowFacts") or {})
+        merged.update(raw_facts)
+        state["workflowFacts"] = merged
+        task["stateJson"] = json.dumps(state, ensure_ascii=False)
 
     async def _claim_delegated_event(
         self,
