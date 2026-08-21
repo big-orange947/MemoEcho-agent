@@ -16,6 +16,8 @@
     "@phosphor-icons/react": "^2.1.10",
     "@tauri-apps/api": "^2.0.0",
     "@vitejs/plugin-react": "latest",
+    "dompurify": "^3.4.14",
+    "marked": "^18.0.10",
     "react": "latest",
     "react-dom": "latest",
     "vite": "latest"

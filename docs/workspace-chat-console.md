@@ -108,7 +108,7 @@ GET    /internal/workspace/threads/{id}/messages/{mid}    读取单条消息（�
 3. **沿用现有同步派发**（P1 不做异步）：调用 `WorkspaceCommandApplicationService` 同款链路，把事件派发给 Python Runtime，收到结果后：
    - 写入 `role=agent` 消息（content=finalReply，result_json=结构化结果，task_id/workflow_id 从结果中提取）；
    - 返回 `{ userMessageId, agentMessageId, response }`。
-4. 前端在请求返回前显示 `pending` 气泡，返回后刷新为 `done`。
+4. 前端在请求返回前显示 pending 状态行，返回后刷新为 `done`。
 
 > P1 故意保留同步：优先打通"多线程 + 消息入流 + 任务内嵌"骨架。流式在 P2 引入，届时本接口语义不变，只是把返回改成 `202 + SSE`。
 

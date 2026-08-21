@@ -1,3 +1,6 @@
+import { useMemo } from "react";
+import { marked } from "marked";
+import DOMPurify from "dompurify";
 import { CircleNotch, ShieldCheck, WarningCircle, User, Sparkle } from "@phosphor-icons/react";
 import type { StoredCredential, ThreadMessage } from "../../types";
 import { LiveTaskCards, TaskCardInline } from "./TaskCardInline";
@@ -12,7 +15,7 @@ function formatTime(value: string) {
     : date.toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
 }
 
-/** 单条对话消息：用户 / Agent / 系统气泡，含 pending、error、需确认状态与任务内嵌卡片。 */
+/** 普通 AI 对话风格：无气泡盒，agent/系统消息按 markdown 渲染（支持任务汇报）。 */
 export function MessageBubble({
   credential,
   message,
@@ -23,32 +26,45 @@ export function MessageBubble({
   const isUser = message.role === "user";
   const isSystem = message.role === "system";
 
+  const markdownHtml = useMemo(() => {
+    if (isUser || message.status === "pending" || message.status === "streaming") {
+      return "";
+    }
+    try {
+      return DOMPurify.sanitize(marked.parse(message.content || "", { async: false }));
+    } catch {
+      return "";
+    }
+  }, [isUser, message.content, message.status]);
+
   return (
-    <article className={`ws-msg ws-msg-${message.role}`}>
+    <article className={`ws-msg ${isUser ? "ws-msg-user" : ""} ${message.status === "error" ? "ws-msg-error" : ""}`}>
       <span className="ws-msg-avatar" aria-hidden="true">
-        {isUser ? <User size={15} /> : isSystem ? <ShieldCheck size={15} /> : <Sparkle size={15} />}
+        {isUser ? <User size={13} /> : isSystem ? <ShieldCheck size={13} /> : <Sparkle size={13} />}
       </span>
       <div className="ws-msg-body">
         <div className="ws-msg-meta">
           <strong>{isUser ? "你" : isSystem ? "系统" : "Memo Echo"}</strong>
           <time>{formatTime(message.createdAt)}</time>
         </div>
-        <div className={`ws-msg-bubble ${message.status === "error" ? "ws-msg-error" : ""}`}>
-          {message.status === "pending" || message.status === "streaming" ? (
-            <span className="ws-msg-pending">
-              <CircleNotch className="spinning" size={14} />
-              {message.content || (message.status === "streaming" ? "正在执行…" : "正在思考…")}
-            </span>
-          ) : (
-            <p className="ws-msg-text">{message.content || "（无文本回复）"}</p>
-          )}
-          {message.status === "error" && <WarningCircle className="ws-msg-warn" size={15} />}
-          {message.status === "needs_confirmation" && (
-            <span className="ws-msg-confirm-hint">
-              <ShieldCheck size={13} />本次结果需要你确认后会执行外部操作
-            </span>
-          )}
-        </div>
+        {message.status === "pending" || message.status === "streaming" ? (
+          <div className="ws-msg-streaming">
+            <CircleNotch className="spinning" size={14} />
+            <span>{message.content || (message.status === "streaming" ? "正在执行…" : "正在思考…")}</span>
+          </div>
+        ) : isUser ? (
+          <p className="ws-msg-text ws-msg-text-plain">{message.content || "（空消息）"}</p>
+        ) : (
+          <div
+            className="ws-msg-text ws-msg-markdown"
+            dangerouslySetInnerHTML={{ __html: markdownHtml || message.content || "（无文本回复）" }}
+          />
+        )}
+        {message.status === "needs_confirmation" && (
+          <span className="ws-msg-confirm-hint">
+            <ShieldCheck size={13} />本次结果需要你确认后会执行外部操作
+          </span>
+        )}
         {!isUser && message.status === "streaming" && message.liveTasks && message.liveTasks.length > 0 && (
           <LiveTaskCards tasks={message.liveTasks} />
         )}
