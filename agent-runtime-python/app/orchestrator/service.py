@@ -17,6 +17,8 @@ from app.clients.schedule_service import ScheduleServiceClient
 from app.clients.task_service import TaskServiceClient
 from app.memory.manager import MemoryManager
 from app.memory.candidate_extractor import MemoryCandidateExtractor
+from app.memory.graph_episode_writer import MemoryGraphEpisodeWriter
+from app.memory.graph_service import MemoryGraphService
 from app.orchestrator.registry import build_agent_registry
 from app.planner.service import PlannerService
 from app.router.service import RouterService
@@ -78,6 +80,7 @@ class OrchestratorService:
         memory_candidate_extractor: MemoryCandidateExtractor | None = None,
         task_completion_service: ConversationTaskCompletionService | None = None,
         delegated_task_workflow: DelegatedTaskWorkflow | None = None,
+        memory_graph_writer: MemoryGraphEpisodeWriter | None = None,
     ) -> None:
         # 这个构造函数的作用是保存运行时依赖，并一次性构建 agent 注册表。
         self.router = router
@@ -93,6 +96,7 @@ class OrchestratorService:
         self.schedule_intent_classifier = schedule_intent_classifier
         self.conversation_state_service = conversation_state_service or ConversationStateService()
         self.memory_candidate_extractor = memory_candidate_extractor
+        self.memory_graph_writer = memory_graph_writer
         self.task_completion_service = task_completion_service
         # 委托图复用同一个模型客户端，确保命令编译和运行态审查遵守用户选择的模型配置。
         self.delegated_task_workflow = delegated_task_workflow or DelegatedTaskWorkflow(
@@ -153,6 +157,10 @@ class OrchestratorService:
             memory_candidate_extractor=MemoryCandidateExtractor(event_center_client, llm_client),
             task_completion_service=ConversationTaskCompletionService(event_center_client, llm_client),
             delegated_task_workflow=DelegatedTaskWorkflow(llm_client, event_center_client),
+            # 记忆图谱写入默认由 MEMORY_GRAPH_ENABLED 控制；未启用时 schedule 直接跳过，零开销。
+            memory_graph_writer=MemoryGraphEpisodeWriter(
+                MemoryGraphService(event_center_client=event_center_client)
+            ),
         )
         # 生产链路使用带 SQLite Checkpointer 的固定主链路执行图，以 workflowId 为 thread key。
         service._delegated_execution_graph = build_delegated_execution_graph(
@@ -877,6 +885,9 @@ class OrchestratorService:
         if self.memory_candidate_extractor is not None:
             # 长期记忆提取独立于当前路由异步执行；未授权、非 OWNER 或无模型时内部会直接跳过。
             self.memory_candidate_extractor.schedule(event, profile_match, resolved_model_profile)
+        if self.memory_graph_writer is not None:
+            # 事件级记忆图谱写入异步执行（会话级节流合并）；未启用时内部直接跳过。
+            self.memory_graph_writer.schedule(event)
         # 主控台委托已经由任务决策图确定动作，不再交给旧 Planner 二次规划。
         # 这样可以避免历史 plan 中的额外 Agent 重复生成回复或重复调用发送工具。
         if delegated_task:
