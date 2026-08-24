@@ -16,7 +16,7 @@ class ReviewLlmStub:
         """测试环境始终视为模型已启用。"""
         return True
 
-    async def generate_reply(self, system_prompt, user_message, temperature=0.0, model_profile=None):
+    async def generate_reply(self, system_prompt, user_message, temperature=0.0, model_profile=None, *, fast=False):
         """返回审批通过结果，具体越界判断由 ReviewAgent 的确定性规则完成。"""
         return '{"decision":"APPROVE","reason":"supported"}'
 
@@ -28,7 +28,7 @@ class CapturingReviewLlmStub(ReviewLlmStub):
         self.system_prompt = ""
         self.user_message = ""
 
-    async def generate_reply(self, system_prompt, user_message, temperature=0.0, model_profile=None):
+    async def generate_reply(self, system_prompt, user_message, temperature=0.0, model_profile=None, *, fast=False):
         """保存本次调用参数后返回通过，避免测试依赖真实模型。"""
         self.system_prompt = system_prompt
         self.user_message = user_message
@@ -38,7 +38,7 @@ class CapturingReviewLlmStub(ReviewLlmStub):
 class HandoffReviewLlmStub(ReviewLlmStub):
     """模拟缺少来源证据时的审查结论。"""
 
-    async def generate_reply(self, system_prompt, user_message, temperature=0.0, model_profile=None):
+    async def generate_reply(self, system_prompt, user_message, temperature=0.0, model_profile=None, *, fast=False):
         return '{"decision":"HANDOFF","reason":"missing source evidence"}'
 
 
@@ -48,7 +48,7 @@ class RewriteReviewLlmStub(ReviewLlmStub):
     def __init__(self) -> None:
         self.call_count = 0
 
-    async def generate_reply(self, system_prompt, user_message, temperature=0.0, model_profile=None):
+    async def generate_reply(self, system_prompt, user_message, temperature=0.0, model_profile=None, *, fast=False):
         """按调用顺序模拟纠偏和复审，避免测试依赖提示词的具体措辞。"""
         self.call_count += 1
         if self.call_count == 1:
@@ -62,7 +62,7 @@ class HandoffThenRewriteLlmStub(ReviewLlmStub):
     def __init__(self) -> None:
         self.call_count = 0
 
-    async def generate_reply(self, system_prompt, user_message, temperature=0.0, model_profile=None):
+    async def generate_reply(self, system_prompt, user_message, temperature=0.0, model_profile=None, *, fast=False):
         """依次返回 HANDOFF、纠偏结果和 APPROVE。"""
         self.call_count += 1
         if self.call_count == 1:
@@ -79,7 +79,7 @@ class AlwaysRejectRewritesLlmStub(ReviewLlmStub):
         self.rewrite_count = 0
         self.review_count = 0
 
-    async def generate_reply(self, system_prompt, user_message, temperature=0.0, model_profile=None):
+    async def generate_reply(self, system_prompt, user_message, temperature=0.0, model_profile=None, *, fast=False):
         """纠偏调用返回递增草稿，审批调用始终拒绝。"""
         if "自动回复纠偏 Agent" in system_prompt:
             self.rewrite_count += 1
@@ -91,7 +91,7 @@ class AlwaysRejectRewritesLlmStub(ReviewLlmStub):
 class DelegatedRewriteLlmStub(ReviewLlmStub):
     """模拟主控台委托先安全改写、再通过最终复审。"""
 
-    async def generate_reply(self, system_prompt, user_message, temperature=0.0, model_profile=None):
+    async def generate_reply(self, system_prompt, user_message, temperature=0.0, model_profile=None, *, fast=False):
         """纠偏阶段删除无依据的私人状态，复审阶段批准任务内协商问句。"""
         if "自动回复纠偏 Agent" in system_prompt:
             return '{"rewrittenDraft":"下午具体几点方便"}'
@@ -331,8 +331,8 @@ class ReviewAgentTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.structured_result["approvedDraft"], "能说一下具体的吗")
         self.assertTrue(result.structured_result["autoRewriteApplied"])
 
-    async def test_auto_rewrite_forces_last_draft_after_three_failed_reviews(self):
-        """连续三次纠偏仍未通过时应发送第三版草稿，且不得生成接管事项。"""
+    async def test_auto_rewrite_handoffs_after_three_failed_reviews(self):
+        """连续三次纠偏仍未通过时转为人工确认，不自动发送（审查不能跳过）。"""
         context = build_context("今天有点累 明晚见")
         context.metadata["conversation_profile_match"]["profile"]["reviewMode"] = "AUTO_REWRITE"
         context.metadata["resolved_model_profile"] = {
@@ -342,11 +342,10 @@ class ReviewAgentTest(unittest.IsolatedAsyncioTestCase):
 
         result = await ReviewAgent(ToolRegistry(), llm_client=llm).run(context, "review_reply")
 
-        self.assertFalse(result.need_confirmation)
-        self.assertEqual("APPROVE", result.structured_result["reviewDecision"])
-        self.assertEqual("纠偏版本3", result.structured_result["approvedDraft"])
-        self.assertEqual(3, result.structured_result["autoRewriteAttempts"])
-        self.assertTrue(result.structured_result["autoRewriteForcedAfterRetries"])
+        self.assertTrue(result.need_confirmation)
+        self.assertEqual("HANDOFF", result.structured_result["reviewDecision"])
+        # 最后一次改写稿作为待确认草稿交给人工，不自动发送
+        self.assertEqual("纠偏版本3", result.structured_result.get("proposedDraft"))
         self.assertEqual(3, llm.rewrite_count)
 
     async def test_auto_rewrite_handoffs_when_review_model_is_unavailable(self):

@@ -34,8 +34,8 @@ class ReviewAgent(BaseAgent):
             or ""
         ).strip()
         profile = self._extract_profile(task_context)
-        # 审查层必须看到 Profile 2.0 的结构化事实，而不能只读取旧版自由提示词。
-        authorized_prompt = ConversationPromptCompiler().compile(profile, include_legacy_prompt=True)
+        # 审查层只需授权边界（P4 瘦身），不需要完整身份/对方/背景/任务/legacy 长提示词。
+        authorized_prompt = ConversationPromptCompiler().compile_review_boundaries(profile)
         authorized_prompt = self._append_conversation_state_evidence(
             authorized_prompt,
             task_context.conversation_state,
@@ -196,25 +196,19 @@ class ReviewAgent(BaseAgent):
 
             reason = review_reason or reason
             if attempt == self.MAX_AUTO_REWRITE_ATTEMPTS:
-                # 用户已选择“无需接管”。第三次纠偏仍被模型拒绝时，不再创建接管事项，
-                # 而是发送最后一次改写稿，同时把强制放行原因写入执行元数据供事后汇报。
-                return self._approve(
+                # 用户要求"审查不能跳过"：三次纠偏仍未通过审批时不再强制放行，
+                # 改为转人工确认（最后一次改写稿作为待确认草稿，不自动发送）。
+                return self._reject(
                     task_context,
-                    social,
                     candidate,
-                    reason or "自动纠偏达到重试上限",
-                    rewrite_attempts=attempt,
-                    forced_after_retries=True,
+                    reason or "自动纠偏三次仍未通过审批，需人工确认后发送",
                 )
 
         # 循环边界由常量控制，正常情况下不会走到这里。
-        return self._approve(
+        return self._reject(
             task_context,
-            social,
             candidate,
-            reason,
-            rewrite_attempts=self.MAX_AUTO_REWRITE_ATTEMPTS,
-            forced_after_retries=True,
+            reason or "自动纠偏未通过审批，需人工确认",
         )
 
     @staticmethod
@@ -384,6 +378,7 @@ class ReviewAgent(BaseAgent):
             ),
             temperature=0.1,
             model_profile=model_profile,
+            fast=True,
         )
         data = json.loads(response.strip().removeprefix("```json").removesuffix("```").strip())
         rewritten = str(data.get("rewrittenDraft", "")).strip()
@@ -455,6 +450,7 @@ class ReviewAgent(BaseAgent):
             ),
             temperature=0.0,
             model_profile=model_profile,
+            fast=True,
         )
         data = json.loads(response.strip().removeprefix("```json").removesuffix("```").strip())
         decision = str(data.get("decision", "")).upper()
@@ -466,7 +462,7 @@ class ReviewAgent(BaseAgent):
     def _format_history_for_review(history: list[dict]) -> str:
         """标注双方、时间和代理来源；代理旧草稿只能衔接语境，不能证明用户事实。"""
         lines: list[str] = []
-        for item in history[-12:]:
+        for item in history[-6:]:
             text = " ".join(str(item.get("text", "")).split()).strip()
             if not text:
                 continue

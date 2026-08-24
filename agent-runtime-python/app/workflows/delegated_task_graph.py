@@ -1628,11 +1628,21 @@ class DelegatedTaskWorkflow:
             "仅在候选确实缺乏依据或明显不自然时 REVISE；不要因信息不完整而替用户编造内容。"
         )
         try:
+            # P4b 瘦身：审查只看任务目标 + 跨步骤事实 + 最近时间线，
+            # 不传完整 model_context（500 条 timeline + preTaskContext + workingMemory）。
+            model_context = state.get("model_context") or {}
+            timeline = model_context.get("conversationTimeline") or []
+            review_context = {
+                "taskGoal": model_context.get("taskGoal"),
+                "successCriteria": model_context.get("successCriteria"),
+                "workflowFacts": model_context.get("workflowFacts") or {},
+                "recentTimeline": timeline[-6:],
+            }
             raw = await self.llm_client.generate_reply(
                 system_prompt,
                 json.dumps(
                     {
-                        "context": state.get("model_context") or {},
+                        "context": review_context,
                         "candidateMessage": candidate,
                         "requestedTool": requested_tool,
                     },
