@@ -28,7 +28,11 @@ from app.schemas.delegated_tasks import (
     DelegatedTaskRuntimeDecision,
     DelegatedTaskRuntimeInput,
 )
-from app.schemas.delegated_workflows import DelegatedWorkflowPlan, DelegatedWorkflowPlanStep
+from app.schemas.delegated_workflows import (
+    CompactWorkflowPlan,
+    DelegatedWorkflowPlan,
+    DelegatedWorkflowPlanStep,
+)
 from app.tools.langchain_delegated_task_tools import delegated_task_action_tools
 
 
@@ -461,6 +465,89 @@ class DelegatedTaskWorkflow:
             raise
         except Exception as exception:
             raise WorkflowPlanningError(f"工作流规划结果无效: {exception}") from exception
+
+    async def plan_workspace_command_compact(
+        self,
+        command: str,
+        candidates: list[ConversationCandidate],
+        model_profile: Any = None,
+        thread_context: list[dict[str, str]] | None = None,
+    ) -> CompactWorkflowPlan:
+        """单次规划：一次 fast 模型调用输出目标会话 + 父工作流 + 每步契约。
+
+        P2b：替代 resolve_workspace_command_targets + plan_workspace_command +
+        每步 compile_task 的 2+N 次调用。输出经结构校验；失败抛 WorkflowPlanningError，
+        由调用层回退到原有分步逻辑。
+        """
+        authorized = [candidate for candidate in candidates if candidate.chat_id]
+        if not authorized:
+            raise WorkflowPlanningError("没有已授权的目标会话")
+        if not self.llm_client.is_enabled(model_profile, fast=True):
+            raise WorkflowPlanningError("快速规划模型不可用")
+
+        system_prompt = (
+            "你是 Memo Echo 的委托任务规划器，只输出 JSON。"
+            "把用户命令规划成有向无环工作流，并为每个步骤生成目标与成功条件。"
+            "authorizedTargets 是唯一允许联系的会话，targetChatId/targetChatType 必须原样取自其中。"
+            "threadContext 是当前对话线程前序消息（role: user/agent）；对前文追问（如“那后天呢？”）"
+            "依据 threadContext 补全联系人、日期与事项，instruction 必须自包含（不得用“同上”）。"
+            "若命令包含先询问 A、取得答案再转告 B，则询问 A 为根步骤（producesFacts 声明事实），"
+            "转告 B 的步骤用 dependsOn/requiredFacts 等待该事实。并行通知多人时每个目标建独立根步骤。"
+            "每个步骤的 objective 是达成目标，successCriteria 是判定该步完成的明确条件，必须写完整。"
+            "只输出 JSON：{\"title\":\"...\",\"workflowType\":\"PLAN_EXECUTE\",\"steps\":["
+            "{\"stepKey\":\"step_1\",\"order\":1,\"role\":\"executor\",\"instruction\":\"...\","
+            "\"targetChatType\":\"private|group\",\"targetChatId\":\"...\",\"dependsOn\":[],"
+            "\"requiredFacts\":[],\"producesFacts\":[],\"objective\":\"...\",\"successCriteria\":\"...\"}]}"
+        )
+        payload: dict[str, Any] = {
+            "command": command,
+            "authorizedTargets": [self._candidate_payload(candidate) for candidate in authorized],
+        }
+        if thread_context:
+            payload["threadContext"] = thread_context
+        raw = await self.llm_client.generate_reply(
+            system_prompt,
+            json.dumps(payload, ensure_ascii=False),
+            temperature=0.05,
+            model_profile=model_profile,
+            fast=True,
+        )
+        try:
+            plan = CompactWorkflowPlan.model_validate(self._parse_json_object(raw))
+        except Exception as exception:
+            raise WorkflowPlanningError(f"单次规划输出无法解析: {type(exception).__name__}") from exception
+        return self._validate_compact_workflow_plan(plan, authorized)
+
+    def _validate_compact_workflow_plan(
+        self,
+        plan: CompactWorkflowPlan,
+        authorized: list[ConversationCandidate],
+    ) -> CompactWorkflowPlan:
+        """结构校验：目标白名单、步骤唯一、依赖合法、契约字段兜底。"""
+        if not plan.steps:
+            raise WorkflowPlanningError("工作流没有可执行步骤")
+        step_keys = [step.step_key.strip() for step in plan.steps]
+        if any(not key for key in step_keys) or len(set(step_keys)) != len(step_keys):
+            raise WorkflowPlanningError("工作流步骤标识为空或重复")
+        step_map = {step.step_key.strip(): step for step in plan.steps}
+        authorized_keys = {
+            (self._normalize_chat_type(candidate.chat_type), candidate.chat_id)
+            for candidate in authorized
+        }
+        for step in plan.steps:
+            key = (self._normalize_chat_type(step.target_chat_type), step.target_chat_id)
+            if key not in authorized_keys:
+                raise WorkflowPlanningError(f"步骤 {step.step_key} 引用了未授权会话")
+            for dep in step.depends_on:
+                if dep not in step_map:
+                    raise WorkflowPlanningError(f"步骤 {step.step_key} 依赖了不存在的步骤 {dep}")
+            if not str(step.instruction or "").strip():
+                raise WorkflowPlanningError(f"步骤 {step.step_key} 缺少指令")
+            if not str(step.objective or "").strip():
+                step.objective = step.instruction
+            if not str(step.success_criteria or "").strip():
+                step.success_criteria = "对方明确回应或按指令完成"
+        return plan
 
     def _validate_workspace_workflow_plan(
         self,

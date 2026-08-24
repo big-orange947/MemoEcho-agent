@@ -29,6 +29,33 @@ class DelegatedWorkflowPlan(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class CompactWorkflowStep(DelegatedWorkflowPlanStep):
+    """单次规划输出的步骤：在基础步骤上额外携带目标与成功条件（对齐任务契约）。
+
+    objective/successCriteria 对应原 compile_task 产出的任务契约，用于直接落库，
+    不再为每个步骤单独调用一次编译图。
+    """
+
+    objective: str = ""
+    success_criteria: str = Field(default="", alias="successCriteria")
+
+    model_config = {"populate_by_name": True}
+
+
+class CompactWorkflowPlan(BaseModel):
+    """单次规划输出：目标会话 + 父工作流 + 每步契约。
+
+    一次 fast 模型调用替代 resolve_workspace_command_targets + plan_workspace_command
+    + 每步 compile_task 的 2+N 次调用。失败时由调用层回退到原有分步逻辑。
+    """
+
+    title: str
+    workflow_type: str = Field(default="PLAN_EXECUTE", alias="workflowType")
+    steps: list[CompactWorkflowStep]
+
+    model_config = {"populate_by_name": True}
+
+
 class DelegatedWorkflowStepExecutionRequest(BaseModel):
     """承载 Java outbox 投递的工作流步骤执行请求。"""
 

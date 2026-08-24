@@ -30,6 +30,7 @@ from app.schemas.delegated_tasks import (
     DelegatedTaskRuntimeInput,
 )
 from app.schemas.delegated_workflows import (
+    CompactWorkflowStep,
     DelegatedWorkflowStepExecutionRequest,
     DelegatedWorkflowStepExecutionResponse,
 )
@@ -424,63 +425,113 @@ class OrchestratorService:
                 for candidate in target_candidates
             ],
         )
+        # P2b：单次规划主路径——一次 fast 模型调用替代 target+plan+compile。
+        # 失败（模型不可用/输出不合规）时回退到下方原有分步逻辑，不影响可用性。
+        compact_plan = None
         try:
-            # RouterAgent 先生成父工作流。依赖关系在这里一次性确定，后续不得再按联系人拆成独立任务。
-            plan = await self.delegated_task_workflow.plan_workspace_command(
+            compact_plan = await self.delegated_task_workflow.plan_workspace_command_compact(
                 command=command,
-                candidates=target_candidates,
+                candidates=candidates,
                 model_profile=model_profile,
                 thread_context=thread_history,
             )
-            candidate_map = {
-                (self._normalize_workspace_chat_type(candidate.chat_type), candidate.chat_id): candidate
-                for candidate in target_candidates
-            }
-            compiled_steps: list[dict[str, Any]] = []
-            for step in sorted(plan.steps, key=lambda item: item.order):
-                candidate = candidate_map.get((step.target_chat_type, step.target_chat_id))
-                if candidate is None:
-                    raise WorkflowPlanningError(f"步骤 {step.step_key} 引用了未授权会话")
+            self._log_delegated_trace(
+                "workflow_compact_planned",
+                execution_id=execution_id,
+                event=event,
+                stepCount=len(compact_plan.steps),
+            )
+        except Exception as exception:
+            self._log_delegated_trace(
+                "workflow_compact_fallback",
+                execution_id=execution_id,
+                event=event,
+                error=type(exception).__name__,
+            )
+        try:
+            if compact_plan is not None:
+                # 单次规划已产出目标会话 + 父工作流 + 每步契约，直接落库，不再逐步 compile。
+                candidate_map = {
+                    (self._normalize_workspace_chat_type(candidate.chat_type), candidate.chat_id): candidate
+                    for candidate in candidates
+                }
+                compiled_steps: list[dict[str, Any]] = []
+                for step in sorted(compact_plan.steps, key=lambda item: item.order):
+                    candidate = candidate_map.get(
+                        (self._normalize_workspace_chat_type(step.target_chat_type), step.target_chat_id)
+                    )
+                    if candidate is None:
+                        raise WorkflowPlanningError(f"步骤 {step.step_key} 引用了未授权会话")
+                    compiled_steps.append(self._compact_step_to_compiled(step, candidate))
+                    self._log_delegated_trace(
+                        "workflow_step_compiled",
+                        execution_id=execution_id,
+                        event=event,
+                        stepKey=step.step_key,
+                        dependsOn=step.depends_on,
+                        targetChatId=step.target_chat_id,
+                    )
+                plan_title = compact_plan.title
+                plan_workflow_type = compact_plan.workflow_type
+            else:
+                # 原有分步逻辑：RouterAgent 先生成父工作流，再逐步编译每步契约。
+                plan = await self.delegated_task_workflow.plan_workspace_command(
+                    command=command,
+                    candidates=target_candidates,
+                    model_profile=model_profile,
+                    thread_context=thread_history,
+                )
+                candidate_map = {
+                    (self._normalize_workspace_chat_type(candidate.chat_type), candidate.chat_id): candidate
+                    for candidate in target_candidates
+                }
+                compiled_steps = []
+                for step in sorted(plan.steps, key=lambda item: item.order):
+                    candidate = candidate_map.get((step.target_chat_type, step.target_chat_id))
+                    if candidate is None:
+                        raise WorkflowPlanningError(f"步骤 {step.step_key} 引用了未授权会话")
 
-                compilation = await self.delegated_task_workflow.compile_task(
-                    DelegatedTaskCompileRequest(
-                        userId=user_id,
-                        command=step.instruction,
-                        conversations=[candidate],
-                        targetResolvedByRouter=True,
-                    ),
-                    model_profile,
-                )
-                if not compilation.recognized or bool(getattr(compilation, "needs_clarification", False)):
-                    question = compilation.clarification_question or f"步骤 {step.step_key} 缺少执行信息"
-                    raise WorkflowPlanningError(question)
+                    compilation = await self.delegated_task_workflow.compile_task(
+                        DelegatedTaskCompileRequest(
+                            userId=user_id,
+                            command=step.instruction,
+                            conversations=[candidate],
+                            targetResolvedByRouter=True,
+                        ),
+                        model_profile,
+                    )
+                    if not compilation.recognized or bool(getattr(compilation, "needs_clarification", False)):
+                        question = compilation.clarification_question or f"步骤 {step.step_key} 缺少执行信息"
+                        raise WorkflowPlanningError(question)
 
-                compiled_steps.append(
-                    {
-                        "stepKey": step.step_key,
-                        "order": step.order,
-                        "role": step.role,
-                        "instruction": step.instruction,
-                        "dependsOn": step.depends_on,
-                        "requiredFacts": step.required_facts,
-                        "producesFacts": step.produces_facts,
-                        "compilation": compilation.model_dump(by_alias=True),
-                    }
-                )
-                self._log_delegated_trace(
-                    "workflow_step_compiled",
-                    execution_id=execution_id,
-                    event=event,
-                    stepKey=step.step_key,
-                    dependsOn=step.depends_on,
-                    targetChatId=step.target_chat_id,
-                )
+                    compiled_steps.append(
+                        {
+                            "stepKey": step.step_key,
+                            "order": step.order,
+                            "role": step.role,
+                            "instruction": step.instruction,
+                            "dependsOn": step.depends_on,
+                            "requiredFacts": step.required_facts,
+                            "producesFacts": step.produces_facts,
+                            "compilation": compilation.model_dump(by_alias=True),
+                        }
+                    )
+                    self._log_delegated_trace(
+                        "workflow_step_compiled",
+                        execution_id=execution_id,
+                        event=event,
+                        stepKey=step.step_key,
+                        dependsOn=step.depends_on,
+                        targetChatId=step.target_chat_id,
+                    )
+                plan_title = plan.title
+                plan_workflow_type = plan.workflow_type
 
             workflow = await self.event_center_client.create_delegated_workflow(
                 user_id=user_id,
                 command=command,
-                title=plan.title,
-                workflow_type=plan.workflow_type,
+                title=plan_title,
+                workflow_type=plan_workflow_type,
                 steps=compiled_steps,
                 execution_id=execution_id,
             )
@@ -559,6 +610,39 @@ class OrchestratorService:
                 ],
                 final_reply="委托工作流创建失败，请稍后重试",
             )
+
+    @staticmethod
+    def _compact_step_to_compiled(step: CompactWorkflowStep, candidate: Any) -> dict[str, Any]:
+        """把单次规划步骤转成 create_delegated_workflow 需要的 compiled_steps 项。
+
+        单次规划已产出每步的目标与成功条件，直接构造等价的任务契约，不再逐步调编译图。
+        """
+        from app.schemas.delegated_tasks import DelegatedTaskCompileResponse
+
+        compilation = DelegatedTaskCompileResponse(
+            recognized=True,
+            taskType="CONVERSATION_GOAL",
+            targetQuery=step.instruction,
+            platform=candidate.platform,
+            chatType=candidate.chat_type,
+            chatId=candidate.chat_id,
+            targetName=candidate.chat_name,
+            objective=step.objective,
+            successCriteria=step.success_criteria,
+            confidence=0.9,
+            executionMode="AUTO_COMPLETE",
+            initialProgress="任务已解析，准备联系对方",
+        )
+        return {
+            "stepKey": step.step_key,
+            "order": step.order,
+            "role": step.role,
+            "instruction": step.instruction,
+            "dependsOn": step.depends_on,
+            "requiredFacts": step.required_facts,
+            "producesFacts": step.produces_facts,
+            "compilation": compilation.model_dump(by_alias=True),
+        }
 
     @staticmethod
     def _extract_thread_history(raw_payload: dict) -> list[dict[str, str]]:

@@ -2292,5 +2292,95 @@ class DelegatedTaskWorkflowTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(["peer-confirm-1", "peer-confirm-2"], result["evidenceEventIds"])
 
 
+class CompactPlannerLlm:
+    """返回固定单次规划契约，并记录调用是否走 fast 通道。"""
+
+    def __init__(self, payload: dict) -> None:
+        self.payload = payload
+        self.calls: list[dict] = []
+
+    def is_enabled(self, model_profile=None, *, fast=False) -> bool:
+        return True
+
+    async def generate_reply(self, system_prompt, user_message, temperature=0.7, model_profile=None, *, fast=False) -> str:
+        self.calls.append({"fast": fast, "userMessage": user_message})
+        return json.dumps(self.payload, ensure_ascii=False)
+
+
+def _km_candidate() -> ConversationCandidate:
+    return ConversationCandidate.model_validate(
+        {"platform": "qq", "chatType": "private", "chatId": "3807050597", "chatName": "km"}
+    )
+
+
+class CompactPlannerTest(unittest.IsolatedAsyncioTestCase):
+    """P2b：单次规划（一次 fast 调用替代 target+plan+compile）。"""
+
+    def _valid_payload(self) -> dict:
+        return {
+            "title": "约游戏",
+            "workflowType": "PLAN_EXECUTE",
+            "steps": [
+                {
+                    "stepKey": "step_1",
+                    "order": 1,
+                    "role": "executor",
+                    "instruction": "询问 km 明天晚上几点有空打游戏",
+                    "targetChatType": "private",
+                    "targetChatId": "3807050597",
+                    "dependsOn": [],
+                    "requiredFacts": [],
+                    "producesFacts": [],
+                    "objective": "拿到 km 明天晚上的空闲时间",
+                    "successCriteria": "km 明确给出时间",
+                }
+            ],
+        }
+
+    async def test_compact_plan_success_uses_fast_channel(self) -> None:
+        llm = CompactPlannerLlm(self._valid_payload())
+        workflow = DelegatedTaskWorkflow(llm)
+        plan = await workflow.plan_workspace_command_compact(
+            "帮我和 km 约明天晚上打游戏",
+            [_km_candidate()],
+        )
+        self.assertEqual(len(plan.steps), 1)
+        self.assertEqual(plan.steps[0].objective, "拿到 km 明天晚上的空闲时间")
+        self.assertEqual(plan.steps[0].success_criteria, "km 明确给出时间")
+        # P2b 必须走 fast 通道
+        self.assertTrue(llm.calls[0]["fast"])
+        # 线程前序要传给模型
+        self.assertIn("command", llm.calls[0]["userMessage"])
+
+    async def test_compact_plan_rejects_unauthorized_target(self) -> None:
+        from app.workflows.delegated_task_graph import WorkflowPlanningError
+
+        payload = self._valid_payload()
+        payload["steps"][0]["targetChatId"] = "99999999"  # 不在白名单
+        llm = CompactPlannerLlm(payload)
+        workflow = DelegatedTaskWorkflow(llm)
+        with self.assertRaises(WorkflowPlanningError):
+            await workflow.plan_workspace_command_compact("约游戏", [_km_candidate()])
+
+    async def test_compact_plan_objective_fallback(self) -> None:
+        payload = self._valid_payload()
+        payload["steps"][0]["objective"] = ""
+        payload["steps"][0]["successCriteria"] = ""
+        llm = CompactPlannerLlm(payload)
+        workflow = DelegatedTaskWorkflow(llm)
+        plan = await workflow.plan_workspace_command_compact("约游戏", [_km_candidate()])
+        # 契约字段空时用 instruction 兜底
+        self.assertEqual(plan.steps[0].objective, plan.steps[0].instruction)
+        self.assertTrue(plan.steps[0].success_criteria)
+
+    async def test_compact_plan_empty_steps_rejected(self) -> None:
+        from app.workflows.delegated_task_graph import WorkflowPlanningError
+
+        llm = CompactPlannerLlm({"title": "空", "steps": []})
+        workflow = DelegatedTaskWorkflow(llm)
+        with self.assertRaises(WorkflowPlanningError):
+            await workflow.plan_workspace_command_compact("约游戏", [_km_candidate()])
+
+
 if __name__ == "__main__":
     unittest.main()
