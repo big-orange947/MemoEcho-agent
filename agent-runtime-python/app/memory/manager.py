@@ -41,9 +41,15 @@ class MemoryManager:
         "你刚",
     )
 
-    def __init__(self, event_center_client: EventCenterServiceClient | None = None) -> None:
+    def __init__(
+        self,
+        event_center_client: EventCenterServiceClient | None = None,
+        graph_service: Any = None,
+    ) -> None:
         # 上下文仍以 Event Center 为唯一数据源，Runtime 不额外复制聊天记录。
+        # graph_service 是 Graphiti 时间感知记忆图谱（06 文档 P-C），可选注入。
         self.event_center_client = event_center_client
+        self.graph_service = graph_service
         self.knowledge_retriever = KnowledgeRetriever()
         self.context_compressor = HistoryContextCompressor()
 
@@ -55,6 +61,35 @@ class MemoryManager:
             return await self.event_center_client.list_verified_memories(event)
         except Exception as exception:
             logger.warning("读取已确认长期记忆失败，已跳过记忆注入：%s", exception)
+            return []
+
+    async def build_graph_memories(self, event: UnifiedEvent, query: str | None = None) -> list[dict[str, Any]]:
+        """从图谱检索当前会话相关记忆片段（P4d / 06 文档 P-C）。
+
+        检索按会话 group 隔离，只返回当前会话 + 全局层可用的低权威线索；
+        图谱不可用或检索失败时降级为空列表，不阻塞主链路。
+        """
+        if self.graph_service is None or not self.graph_service.is_enabled:
+            return []
+        query_text = str(query if query is not None else (event.text or "")).strip()
+        if not query_text:
+            return []
+        try:
+            from app.memory.graph_episode_writer import MemoryGraphEpisodeWriter
+
+            group_id = MemoryGraphEpisodeWriter._group_id(event)
+            edges = await self.graph_service.search(query_text, group_ids=[group_id], num_results=5)
+            return [
+                {
+                    "fact": str(getattr(edge, "fact", "") or "").strip(),
+                    "source": str(getattr(edge, "episodes", "") or ""),
+                    "validAt": getattr(edge, "valid_at", None),
+                }
+                for edge in edges
+                if str(getattr(edge, "fact", "") or "").strip()
+            ]
+        except Exception as exception:
+            logger.warning("图谱记忆检索失败，已跳过记忆注入：%s", exception)
             return []
 
     async def build_history_context(

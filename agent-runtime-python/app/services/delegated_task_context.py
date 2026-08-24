@@ -38,6 +38,7 @@ def build_model_context(
     resolved_time_text: str,
     history_access_allowed: bool,
     available_tools: Iterable[str],
+    graph_memories: Iterable[Any] | None = None,
 ) -> dict[str, Any]:
     """把统一上下文投影为模型可读的工作上下文，隔离执行控制数据。
 
@@ -57,9 +58,13 @@ def build_model_context(
         "currentTime": current_time.isoformat(),
         "resolvedTimeText": resolved_time_text,
         "workflowFacts": _safe_workflow_facts(previous_state.get("workflowFacts")),
-        # P-C 预留：图谱检索的记忆片段（06 文档 §7.1 graphMemories）。
-        # 当前为空结构，P-C 双闭环打通后由 MemoryGraphService 检索结果注入。
-        "graphMemories": list(previous_state.get("graphMemories") or []),
+        # P-C：图谱检索的记忆片段（06 文档 §7.1 graphMemories）。
+        # 调用方检索后显式传入；未提供时回退 previous_state 预留字段。
+        "graphMemories": (
+            list(graph_memories)
+            if graph_memories is not None
+            else list(previous_state.get("graphMemories") or [])
+        ),
         "conversationTimeline": _normalize_messages(timeline, limit=500),
         "preTaskContext": _normalize_messages(pre_task_history, limit=30),
         "workingMemory": _safe_memory(previous_state.get("workingMemory")),

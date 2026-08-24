@@ -140,11 +140,12 @@ class OrchestratorService:
         # 群管理的批准、拒绝属于 Runtime 内部回调，不能作为 Agent 直接调用的工具暴露。
         tools.register_internal_service("manage_qq_group", group_operation_manager)
         slow_channel_buffer = SlowChannelBuffer()
+        memory_graph_service = MemoryGraphService(event_center_client=event_center_client)
         service = cls(
             router=RouterService(),
             planner=PlannerService(),
             tools=tools,
-            memory=MemoryManager(event_center_client),
+            memory=MemoryManager(event_center_client, graph_service=memory_graph_service),
             slow_channel_buffer=slow_channel_buffer,
             event_center_client=event_center_client,
             llm_client=llm_client,
@@ -157,11 +158,13 @@ class OrchestratorService:
             schedule_intent_classifier=SemanticScheduleIntentClassifier.build_default(),
             memory_candidate_extractor=MemoryCandidateExtractor(event_center_client, llm_client),
             task_completion_service=ConversationTaskCompletionService(event_center_client, llm_client),
-            delegated_task_workflow=DelegatedTaskWorkflow(llm_client, event_center_client),
-            # 记忆图谱写入默认由 MEMORY_GRAPH_ENABLED 控制；未启用时 schedule 直接跳过，零开销。
-            memory_graph_writer=MemoryGraphEpisodeWriter(
-                MemoryGraphService(event_center_client=event_center_client)
+            delegated_task_workflow=DelegatedTaskWorkflow(
+                llm_client,
+                event_center_client,
+                memory_manager=MemoryManager(event_center_client, graph_service=memory_graph_service),
             ),
+            # 记忆图谱写入默认由 MEMORY_GRAPH_ENABLED 控制；未启用时 schedule 直接跳过，零开销。
+            memory_graph_writer=MemoryGraphEpisodeWriter(memory_graph_service),
         )
         # 生产链路使用带 SQLite Checkpointer 的固定主链路执行图，以 workflowId 为 thread key。
         service._delegated_execution_graph = build_delegated_execution_graph(
