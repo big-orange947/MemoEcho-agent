@@ -568,7 +568,7 @@ class DelegatedTaskWorkflowTest(unittest.IsolatedAsyncioTestCase):
             def is_enabled(self, model_profile=None) -> bool:
                 return True
 
-            async def generate_reply(self, system_prompt, user_message, temperature=0.7, model_profile=None) -> str:
+            async def generate_reply(self, system_prompt, user_message, temperature=0.7, model_profile=None, *, fast=False) -> str:
                 self.user_messages.append(user_message)
                 return json.dumps(
                     {
@@ -612,7 +612,7 @@ class DelegatedTaskWorkflowTest(unittest.IsolatedAsyncioTestCase):
             def is_enabled(self, model_profile=None) -> bool:
                 return True
 
-            async def generate_reply(self, system_prompt, user_message, temperature=0.7, model_profile=None) -> str:
+            async def generate_reply(self, system_prompt, user_message, temperature=0.7, model_profile=None, *, fast=False) -> str:
                 self.calls.append({"systemPrompt": system_prompt, "userMessage": user_message})
                 return json.dumps(
                     {

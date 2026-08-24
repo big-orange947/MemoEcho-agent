@@ -187,7 +187,7 @@ class FastChannelTest(unittest.TestCase):
         self.assertEqual(merged["base_url"], "https://fast.example.com/v1")
         self.assertEqual(merged["api_key"], "fast-key")
 
-    def test_merge_fast_ignores_user_profile(self) -> None:
+    def test_merge_fast_uses_fast_model_but_profile_key(self) -> None:
         from app.schemas.model_profiles import ResolvedUserModelProfile
 
         client = LlmServiceClient(
@@ -205,9 +205,11 @@ class FastChannelTest(unittest.TestCase):
             apiKey="profile-key",
         )
         merged = client._merge_runtime_config(profile, fast=True)
-        # fast 通道是全局配置，不被用户 profile 覆盖，保证判断类调用稳定走快模型
+        # 模型名固定用 fast_model（非思考），不被用户 profile 覆盖；
+        # 但 API key/base_url 回退到 profile（真实密钥在 profile 里，env 不落地）。
         self.assertEqual(merged["model"], "deepseek-chat")
-        self.assertEqual(merged["api_key"], "main-key")
+        self.assertEqual(merged["api_key"], "profile-key")
+        self.assertEqual(merged["base_url"], "https://profile.example.com/v1")
 
     def test_fast_defaults_fallback_to_main(self) -> None:
         client = LlmServiceClient(
@@ -215,9 +217,11 @@ class FastChannelTest(unittest.TestCase):
             api_key="main-key",
             model="deepseek-v4-pro",
         )
-        self.assertEqual(client.fast_model, "deepseek-v4-pro")
-        self.assertEqual(client.fast_api_key, "main-key")
-        self.assertEqual(client.fast_base_url, "https://main.example.com/v1")
+        # fast 配置未显式提供时为空，回退发生在 _merge_runtime_config(fast=True)
+        self.assertEqual(client.fast_model, "")
+        merged = client._merge_runtime_config(fast=True)
+        self.assertEqual(merged["model"], "deepseek-v4-pro")
+        self.assertEqual(merged["api_key"], "main-key")
 
     def test_is_enabled_fast(self) -> None:
         client = LlmServiceClient(api_key="", model="")

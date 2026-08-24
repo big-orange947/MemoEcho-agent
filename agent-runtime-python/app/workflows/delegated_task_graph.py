@@ -377,6 +377,7 @@ class DelegatedTaskWorkflow:
                 user_message,
                 temperature=0.05,
                 model_profile=model_profile,
+                fast=True,
             )
             parsed = self._parse_json_object(raw)
             selected = self._materialize_router_targets(parsed.get("targets") or [], candidates)
@@ -452,6 +453,7 @@ class DelegatedTaskWorkflow:
                 user_message,
                 temperature=0.05,
                 model_profile=model_profile,
+                fast=True,
             )
             plan = DelegatedWorkflowPlan.model_validate(self._parse_json_object(raw))
             return self._validate_workspace_workflow_plan(plan, authorized)
@@ -722,6 +724,7 @@ class DelegatedTaskWorkflow:
                 user_message,
                 temperature=0.1,
                 model_profile=model_profile,
+                fast=True,
             )
             parsed = self._parse_json_object(raw)
             if parsed:

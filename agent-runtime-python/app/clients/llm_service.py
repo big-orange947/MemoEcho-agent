@@ -85,11 +85,11 @@ class LlmServiceClient:
         self.api_key = api_key or os.getenv("OPENAI_API_KEY") or ""
         self.model = model or os.getenv("OPENAI_MODEL") or "gpt-4o-mini"
         self.timeout_seconds = self._resolve_timeout_seconds(timeout_seconds)
-        self.fast_base_url = (
-            fast_base_url or os.getenv("OPENAI_FAST_BASE_URL") or self.base_url or "https://api.openai.com/v1"
-        ).rstrip("/")
-        self.fast_api_key = fast_api_key or os.getenv("OPENAI_FAST_API_KEY") or self.api_key or ""
-        self.fast_model = fast_model or os.getenv("OPENAI_FAST_MODEL") or self.model or "gpt-4o-mini"
+        # fast 通道只读取显式参数/环境变量（OPENAI_FAST_*），不在构造时回退主配置；
+        # 真正的回退（profile 密钥 → 主 env）推迟到 _merge_runtime_config(fast=True) 时处理。
+        self.fast_base_url = (fast_base_url or os.getenv("OPENAI_FAST_BASE_URL") or "").rstrip("/")
+        self.fast_api_key = fast_api_key or os.getenv("OPENAI_FAST_API_KEY") or ""
+        self.fast_model = fast_model or os.getenv("OPENAI_FAST_MODEL") or ""
 
     @staticmethod
     def _resolve_timeout_seconds(configured_timeout: float | None) -> float:
@@ -415,12 +415,19 @@ class LlmServiceClient:
         fast: bool = False,
     ) -> dict[str, Any]:
         # 这个函数的作用是把环境变量默认模型配置与后端返回的用户模型配置合并成最终请求参数。
-        # fast 模式使用全局快速通道（不按用户 profile 覆盖），保证判断类调用稳定走快模型。
+        # fast 模式使用全局快速通道：模型名固定用 OPENAI_FAST_MODEL（非思考），
+        # 但 API key/base_url 按 fast env > 用户 profile > 主 env 的优先级解析
+        # （真实密钥通常只在 profile 里，env 不落地）。
         if fast:
+            profile_key = (model_profile.api_key if model_profile is not None else "") or ""
+            profile_base = (model_profile.base_url if model_profile is not None else "") or ""
+            api_key = (self.fast_api_key or profile_key or self.api_key).strip()
+            base_url = (self.fast_base_url or profile_base or self.base_url).rstrip("/")
+            model = self.fast_model or self.model
             return {
-                "base_url": self.fast_base_url,
-                "api_key": self.fast_api_key,
-                "model": self.fast_model,
+                "base_url": base_url,
+                "api_key": api_key,
+                "model": model,
                 "max_tokens": None,
             }
         merged_base_url = self.base_url
