@@ -483,9 +483,13 @@ class DelegatedTaskWorkflow:
         每步 compile_task 的 2+N 次调用。输出经结构校验；失败抛 WorkflowPlanningError，
         由调用层回退到原有分步逻辑。
         """
-        authorized = [candidate for candidate in candidates if candidate.chat_id]
+        authorized = [
+            candidate
+            for candidate in candidates
+            if candidate.chat_id and str(candidate.platform or "").lower() == "qq"
+        ]
         if not authorized:
-            raise WorkflowPlanningError("没有已授权的目标会话")
+            raise WorkflowPlanningError("没有已授权的 QQ 目标会话")
         if not self.llm_client.is_enabled(model_profile, fast=True):
             raise WorkflowPlanningError("快速规划模型不可用")
 

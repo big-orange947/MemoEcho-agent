@@ -457,9 +457,11 @@ class OrchestratorService:
         try:
             if compact_plan is not None:
                 # 单次规划已产出目标会话 + 父工作流 + 每步契约，直接落库，不再逐步 compile。
+                # 委托目标必须是 QQ 会话，排除 desktop 内部工作台（候选列表含 desktop 时模型可能选错）。
                 candidate_map = {
                     (self._normalize_workspace_chat_type(candidate.chat_type), candidate.chat_id): candidate
                     for candidate in candidates
+                    if str(candidate.platform or "").lower() == "qq"
                 }
                 compiled_steps: list[dict[str, Any]] = []
                 for step in sorted(compact_plan.steps, key=lambda item: item.order):
