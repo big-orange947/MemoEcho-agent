@@ -745,5 +745,22 @@ class SocialAgentTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("尚未开始", prompt)
 
 
+class GraphMemoriesInjectionTest(unittest.TestCase):
+    """P4d：设定集链路图谱记忆注入（低权威线索）。"""
+
+    def test_append_graph_memories_injects_low_authority_hint(self) -> None:
+        prompt = SocialAgent._append_graph_memories(
+            "基础提示",
+            [{"fact": "OWNER 下周要搬家到城东"}, {"fact": ""}],
+        )
+        self.assertIn("[图谱记忆线索]", prompt)
+        self.assertIn("搬家到城东", prompt)
+        self.assertIn("不得直接当作证据", prompt)
+
+    def test_append_graph_memories_skips_empty(self) -> None:
+        self.assertEqual("基础提示", SocialAgent._append_graph_memories("基础提示", []))
+        self.assertEqual("基础提示", SocialAgent._append_graph_memories("基础提示", [{"fact": "  "}]))
+
+
 if __name__ == "__main__":
     unittest.main()

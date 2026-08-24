@@ -1179,6 +1179,8 @@ class OrchestratorService:
             history_context=history_context,
             conversation_state=conversation_state,
             verified_memories=verified_memories,
+            # P4d：设定集链路也注入图谱记忆线索（低权威，供话题连贯）。
+            graph_memories=await self.memory.build_graph_memories(event, query=event.text or ""),
             retrieved_knowledge=await self.memory.build_retrieved_knowledge(event, profile_match),
             allowed_tools=self._resolve_allowed_tools(profile_match, resolved_skills),
             execution_mode="confirm_required" if self._needs_human_confirmation(profile_match) else "suggest_only",

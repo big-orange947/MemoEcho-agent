@@ -127,6 +127,10 @@ class SocialAgent(BaseAgent):
             effective_system_prompt,
             task_context.verified_memories,
         )
+        effective_system_prompt = self._append_graph_memories(
+            effective_system_prompt,
+            task_context.graph_memories,
+        )
         effective_system_prompt = self._append_retrieved_knowledge(
             effective_system_prompt,
             task_context.retrieved_knowledge,
@@ -758,6 +762,30 @@ class SocialAgent(BaseAgent):
             "[用户已确认的长期记忆]\n"
             "以下事实经过用户确认，可作为本轮回复依据，但不得扩展出未记录的新事实。\n"
             f"{memory_text}"
+        )
+
+    @staticmethod
+    def _append_graph_memories(system_prompt: str, graph_memories: list[dict]) -> str:
+        """注入图谱检索的长期记忆线索（P4d / 06 P-C）。
+
+        图谱记忆是自动提取的低权威线索：只能维持话题连贯或提示"之前聊过什么"，
+        不能单独作为付款、承诺、账号、时间等现实事实的证据——需要时回查确认层记忆或原文。
+        """
+        if not graph_memories:
+            return system_prompt
+        lines: list[str] = []
+        for memory in graph_memories[:8]:
+            fact = str(memory.get("fact") or "").strip()
+            if fact:
+                lines.append(f"- {fact}")
+        if not lines:
+            return system_prompt
+        return (
+            f"{system_prompt}\n\n"
+            "[图谱记忆线索]\n"
+            "以下来自会话事件图谱的自动提取，仅作话题连贯与背景参考；"
+            "涉及付款、承诺、账号、时间等现实事实必须回查已确认记忆或原始消息，不得直接当作证据。\n"
+            + "\n".join(lines)
         )
 
     @staticmethod

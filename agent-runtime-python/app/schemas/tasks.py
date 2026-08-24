@@ -18,6 +18,8 @@ class AgentTaskContext(BaseModel):
     history_context: list[dict[str, Any]] = Field(default_factory=list)
     conversation_state: ConversationOpenState | None = None
     verified_memories: list[VerifiedMemory] = Field(default_factory=list)
+    # 图谱检索的长期记忆线索（06 文档 P-C）：低权威，供话题连贯与事实参考，不单独证明现实状态。
+    graph_memories: list[dict[str, Any]] = Field(default_factory=list)
     retrieved_knowledge: list[dict[str, Any]] = Field(default_factory=list)
     allowed_tools: list[str] = Field(default_factory=list)
     execution_mode: str = "suggest_only"
