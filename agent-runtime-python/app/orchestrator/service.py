@@ -6,7 +6,7 @@ import json
 import logging
 import os
 import unicodedata
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import uuid4
 
@@ -64,6 +64,9 @@ logger = logging.getLogger(__name__)
 
 
 class OrchestratorService:
+    # P5：委托任务超过该时长无进展视为僵尸任务（残留/停滞），不进普通消息的委托判定。
+    _STALE_DELEGATED_TASK_HOURS = 24
+
     def __init__(
         self,
         router: RouterService,
@@ -1356,9 +1359,44 @@ class OrchestratorService:
                 type(exception).__name__,
             )
             return None
+        if task and self._is_stale_delegated_task(task):
+            # P5 普通消息防护：残留/停滞的 ACTIVE 任务（如历史测试、长期无进展）会把
+            # 普通 QQ 消息误卷入委托图。超时未更新的任务视为僵尸，不进委托判定。
+            logger.info(
+                "委托任务停滞超时，忽略普通消息委托判定：taskId=%s",
+                task.get("id") or task.get("taskId") or "unknown",
+            )
+            return None
         if task:
             await self._attach_workflow_facts(event, task)
         return task
+
+    @classmethod
+    def _is_stale_delegated_task(cls, task: dict, now: datetime | None = None) -> bool:
+        """委托任务超过阈值无进展视为僵尸任务（P5）。
+
+        阈值内的活跃任务仍正常推进；只有长时间未更新的 ACTIVE 任务才被忽略，
+        防止历史残留任务把普通消息误卷入委托图。
+        """
+        raw = str(
+            task.get("updatedAt")
+            or task.get("updated_at")
+            or task.get("createdAt")
+            or task.get("created_at")
+            or ""
+        ).strip()
+        if not raw:
+            return False
+        try:
+            parsed = datetime.fromisoformat(raw)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            else:
+                parsed = parsed.astimezone(timezone.utc)
+        except (TypeError, ValueError):
+            return False
+        now = now or datetime.now(timezone.utc)
+        return (now - parsed) > timedelta(hours=cls._STALE_DELEGATED_TASK_HOURS)
 
     async def _attach_workflow_facts(self, event: UnifiedEvent, task: dict) -> None:
         """把父工作流已发布的事实注入任务状态，供上下文投影生成 workflowFacts。

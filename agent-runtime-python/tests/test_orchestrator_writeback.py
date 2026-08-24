@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import unittest
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 from app.memory.manager import MemoryManager
@@ -2085,6 +2086,69 @@ class OrchestratorWriteBackTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(response.get("persisted"))
         self.assertEqual(0, len(event_center_client.delegated_workflow_completions))
         self.assertEqual(1, len(event_center_client.delegated_event_releases))
+
+
+class StaleDelegatedTaskFilterTest(unittest.IsolatedAsyncioTestCase):
+    """P5：普通消息防护——停滞/残留委托任务不进委托判定，防止普通消息误入委托图。"""
+
+    def test_stale_task_detected(self) -> None:
+        old = (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat()
+        self.assertTrue(OrchestratorService._is_stale_delegated_task({"updatedAt": old}))
+        self.assertTrue(OrchestratorService._is_stale_delegated_task({"updated_at": old}))
+
+    def test_fresh_task_not_stale(self) -> None:
+        fresh = datetime.now(timezone.utc).isoformat()
+        self.assertFalse(OrchestratorService._is_stale_delegated_task({"updatedAt": fresh}))
+
+    def test_missing_or_invalid_time_not_stale(self) -> None:
+        self.assertFalse(OrchestratorService._is_stale_delegated_task({"id": "t1"}))
+        self.assertFalse(OrchestratorService._is_stale_delegated_task({"updatedAt": "bad-date"}))
+
+    def _build_service(self, resolver) -> OrchestratorService:
+        return OrchestratorService(
+            router=RouterService(),
+            planner=PlannerService(),
+            tools=ToolRegistry(),
+            memory=MemoryManager(),
+            slow_channel_buffer=SlowChannelBuffer(window_seconds=600, max_messages=10),
+            event_center_client=resolver,
+            llm_client=DummyApprovedSocialLlm(),
+            sleeper=DummySleeper(),
+        )
+
+    @staticmethod
+    def _event() -> UnifiedEvent:
+        return UnifiedEvent(
+            eventId="qq:message:private:p5-filter",
+            platform="qq",
+            scene="social",
+            eventType="message",
+            chatType="private",
+            chatId="3807050597",
+            sender=Sender(id="3807050597", name="km"),
+            text="在吗",
+            timestamp="2026-08-24T18:00:00+08:00",
+            rawPayload={"userId": "freeze"},
+        )
+
+    async def test_get_active_filters_stale_task(self) -> None:
+        class StaleResolver:
+            async def get_active_delegated_task(self, event):
+                return {"id": "old-task", "updatedAt": (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat()}
+
+        service = self._build_service(StaleResolver())
+        result = await service._get_active_delegated_task(self._event())
+        self.assertIsNone(result)  # 停滞任务被过滤，普通消息不卷入委托图
+
+    async def test_get_active_keeps_fresh_task(self) -> None:
+        class FreshResolver:
+            async def get_active_delegated_task(self, event):
+                return {"id": "fresh-task", "updatedAt": datetime.now(timezone.utc).isoformat()}
+
+        service = self._build_service(FreshResolver())
+        result = await service._get_active_delegated_task(self._event())
+        self.assertIsNotNone(result)
+        self.assertEqual("fresh-task", result.get("id"))
 
 
 if __name__ == "__main__":
