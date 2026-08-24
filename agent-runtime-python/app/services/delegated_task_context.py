@@ -57,6 +57,9 @@ def build_model_context(
         "currentTime": current_time.isoformat(),
         "resolvedTimeText": resolved_time_text,
         "workflowFacts": _safe_workflow_facts(previous_state.get("workflowFacts")),
+        # P-C 预留：图谱检索的记忆片段（06 文档 §7.1 graphMemories）。
+        # 当前为空结构，P-C 双闭环打通后由 MemoryGraphService 检索结果注入。
+        "graphMemories": list(previous_state.get("graphMemories") or []),
         "conversationTimeline": _normalize_messages(timeline, limit=500),
         "preTaskContext": _normalize_messages(pre_task_history, limit=30),
         "workingMemory": _safe_memory(previous_state.get("workingMemory")),

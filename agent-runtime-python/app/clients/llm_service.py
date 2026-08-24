@@ -149,6 +149,8 @@ class LlmServiceClient:
         tools: list[BaseTool],
         temperature: float = 0.1,
         model_profile: ResolvedUserModelProfile | None = None,
+        *,
+        fast: bool = False,
     ) -> dict[str, Any] | None:
         """让支持工具调用的模型直接选择 LangChain @tool。
 
@@ -158,10 +160,10 @@ class LlmServiceClient:
         if not tools:
             return None
 
-        merged_config = self._merge_runtime_config(model_profile)
-        final_temperature = temperature if model_profile is None or model_profile.temperature is None else model_profile.temperature
+        merged_config = self._merge_runtime_config(model_profile, fast=fast)
+        final_temperature = temperature if (fast or model_profile is None or model_profile.temperature is None) else model_profile.temperature
 
-        if not self.is_enabled(model_profile):
+        if not self.is_enabled(model_profile, fast=fast):
             raise RuntimeError("LLM client is not configured")
 
         if self._should_skip_native_tool_calling(merged_config):
@@ -175,6 +177,7 @@ class LlmServiceClient:
         model = self._build_chat_model(
             merged_config=merged_config,
             temperature=final_temperature,
+            fast=fast,
         )
         tool_bound_model = model.bind_tools(tools)
         try:

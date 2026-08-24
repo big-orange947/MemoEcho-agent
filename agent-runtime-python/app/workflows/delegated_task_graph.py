@@ -1434,6 +1434,7 @@ class DelegatedTaskWorkflow:
                     self.action_tools,
                     temperature=0.15,
                     model_profile=model_profile,
+                    fast=True,
                 )
             except Exception as exc:
                 review_feedback = f"LangChain 工具调用失败，已回退 JSON 规划：{type(exc).__name__}"
@@ -1447,6 +1448,7 @@ class DelegatedTaskWorkflow:
                     planning_payload,
                     temperature=0.15,
                     model_profile=model_profile,
+                    fast=True,
                 )
                 planned = self._parse_json_object(raw)
         except Exception as exc:
@@ -1638,6 +1640,7 @@ class DelegatedTaskWorkflow:
                 ),
                 temperature=0.05,
                 model_profile=model_profile,
+                fast=True,
             )
             review = self._parse_json_object(raw)
         except Exception:
@@ -2117,6 +2120,7 @@ class DelegatedTaskWorkflow:
                     user_message,
                     temperature=0.1,
                     model_profile=model_profile,
+                    fast=True,
                 )
                 parsed = self._parse_json_object(raw)
                 if parsed is not None:

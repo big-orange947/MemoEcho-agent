@@ -40,6 +40,7 @@ class ToolCallingLlmClient:
         user_message: str,
         temperature: float = 0.7,
         model_profile=None,
+        *, fast: bool = False,
     ) -> str:
         """模拟文本规划结果；参数仍须由工作流中的 LangChain @tool 校验。"""
         self.calls.append({"systemPrompt": system_prompt, "userMessage": user_message})
@@ -92,6 +93,7 @@ class NativeToolCallingLlmClient:
         tools,
         temperature: float = 0.1,
         model_profile=None,
+        *, fast: bool = False,
     ) -> dict:
         """模拟 LangChain 返回的 tool_call，不经过 JSON 文本规划。"""
         self.choose_tool_calls.append(
@@ -109,6 +111,7 @@ class NativeToolCallingLlmClient:
         user_message: str,
         temperature: float = 0.7,
         model_profile=None,
+        *, fast: bool = False,
     ) -> str:
         """只允许审查节点调用；规划阶段如果调用到这里，测试会通过记录发现。"""
         self.generate_calls.append({"systemPrompt": system_prompt, "userMessage": user_message})
@@ -150,6 +153,7 @@ class ReActHistoryObservationLlmClient:
         user_message: str,
         temperature: float = 0.7,
         model_profile=None,
+        *, fast: bool = False,
     ) -> str:
         """第一轮请求图内观察，第二轮在观察结果存在时选择发送消息。"""
         if "情景一致性审查器" in system_prompt:
@@ -242,6 +246,7 @@ class CompletionReflectionLlmClient:
         user_message: str,
         temperature: float = 0.7,
         model_profile=None,
+        *, fast: bool = False,
     ) -> str:
         """模拟三类模型调用：回复审查、完成复核、常规 ReAct 工具选择。"""
         self.calls.append({"systemPrompt": system_prompt, "userMessage": user_message})
@@ -285,6 +290,7 @@ class BrokenCompletionReflectionLlmClient:
         user_message: str,
         temperature: float = 0.7,
         model_profile=None,
+        *, fast: bool = False,
     ) -> str:
         """模拟三类调用：候选回复、审查通过、完成复核失败。"""
         self.calls.append({"systemPrompt": system_prompt, "userMessage": user_message})

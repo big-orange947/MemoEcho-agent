@@ -398,7 +398,7 @@ class DummyApprovedSocialLlm:
     def is_enabled(self, model_profile=None):
         return True
 
-    async def generate_reply(self, system_prompt, user_message, temperature=0.7, model_profile=None):
+    async def generate_reply(self, system_prompt, user_message, temperature=0.7, model_profile=None, *, fast=False):
         # 委托动作现在会在发送前执行完成复核；该测试场景仍需等待联系人最终答复。
         if "COMPLETION_REFLECTION" in system_prompt:
             return (
