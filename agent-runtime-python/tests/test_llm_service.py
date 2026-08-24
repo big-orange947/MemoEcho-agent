@@ -170,5 +170,81 @@ class LlmServiceRetryTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(2, fake_client.post_calls)
 
 
+class FastChannelTest(unittest.TestCase):
+    """P1：快速模型通道（OPENAI_FAST_MODEL）——判断/规划/审查类调用走非思考模型。"""
+
+    def test_merge_fast_config_uses_fast_channel(self) -> None:
+        client = LlmServiceClient(
+            base_url="https://main.example.com/v1",
+            api_key="main-key",
+            model="deepseek-v4-pro",
+            fast_base_url="https://fast.example.com/v1",
+            fast_api_key="fast-key",
+            fast_model="deepseek-chat",
+        )
+        merged = client._merge_runtime_config(fast=True)
+        self.assertEqual(merged["model"], "deepseek-chat")
+        self.assertEqual(merged["base_url"], "https://fast.example.com/v1")
+        self.assertEqual(merged["api_key"], "fast-key")
+
+    def test_merge_fast_ignores_user_profile(self) -> None:
+        from app.schemas.model_profiles import ResolvedUserModelProfile
+
+        client = LlmServiceClient(
+            base_url="https://main.example.com/v1",
+            api_key="main-key",
+            model="deepseek-v4-pro",
+            fast_model="deepseek-chat",
+        )
+        profile = ResolvedUserModelProfile(
+            id="p1",
+            userId="u1",
+            name="profile",
+            model="qwen3-vl-plus",
+            baseUrl="https://profile.example.com/v1",
+            apiKey="profile-key",
+        )
+        merged = client._merge_runtime_config(profile, fast=True)
+        # fast 通道是全局配置，不被用户 profile 覆盖，保证判断类调用稳定走快模型
+        self.assertEqual(merged["model"], "deepseek-chat")
+        self.assertEqual(merged["api_key"], "main-key")
+
+    def test_fast_defaults_fallback_to_main(self) -> None:
+        client = LlmServiceClient(
+            base_url="https://main.example.com/v1",
+            api_key="main-key",
+            model="deepseek-v4-pro",
+        )
+        self.assertEqual(client.fast_model, "deepseek-v4-pro")
+        self.assertEqual(client.fast_api_key, "main-key")
+        self.assertEqual(client.fast_base_url, "https://main.example.com/v1")
+
+    def test_is_enabled_fast(self) -> None:
+        client = LlmServiceClient(api_key="", model="")
+        self.assertFalse(client.is_enabled(fast=True))
+
+    def test_generate_reply_fast_uses_fast_channel(self) -> None:
+        from unittest.mock import AsyncMock
+
+        import asyncio
+
+        from langchain_core.messages import AIMessage
+
+        client = LlmServiceClient(
+            base_url="https://main.example.com/v1",
+            api_key="main-key",
+            model="deepseek-v4-pro",
+            fast_model="deepseek-chat",
+        )
+        fake_model = AsyncMock()
+        fake_model.ainvoke = AsyncMock(return_value=AIMessage(content="ok"))
+        fake_model.model_name = "deepseek-chat"
+        with patch("app.clients.llm_service.LlmServiceClient._build_chat_model", return_value=fake_model) as build:
+            result = asyncio.run(client.generate_reply("system", "user", fast=True))
+        self.assertEqual(result, "ok")
+        build.assert_called_once()
+        self.assertTrue(build.call_args.kwargs["fast"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import re
+import time
 from typing import Any
 
 import httpx
@@ -15,6 +16,32 @@ from app.schemas.model_profiles import ResolvedUserModelProfile
 
 
 logger = logging.getLogger(__name__)
+
+
+class TimedChatModel:
+    """给 LangChain ChatOpenAI 加耗时日志的薄包装，用于量化全链路 LLM 环节耗时。
+
+    仅包 ainvoke / bind_tools 两条路径；其余属性透传到底层模型。
+    """
+
+    def __init__(self, model: ChatOpenAI, label: str) -> None:
+        self._model = model
+        self._label = label
+
+    async def ainvoke(self, *args: Any, **kwargs: Any) -> Any:
+        started = time.perf_counter()
+        try:
+            return await self._model.ainvoke(*args, **kwargs)
+        finally:
+            elapsed = time.perf_counter() - started
+            model_name = getattr(self._model, "model_name", "") or ""
+            logger.info("llm_call_duration label=%s model=%s elapsed_seconds=%.2f", self._label, model_name, elapsed)
+
+    def bind_tools(self, tools: list[Any]) -> "TimedChatModel":
+        return TimedChatModel(self._model.bind_tools(tools), self._label)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._model, name)
 
 
 class LlmHttpStatusError(RuntimeError):
@@ -47,12 +74,22 @@ class LlmServiceClient:
         api_key: str | None = None,
         model: str | None = None,
         timeout_seconds: float | None = None,
+        fast_base_url: str | None = None,
+        fast_api_key: str | None = None,
+        fast_model: str | None = None,
     ) -> None:
         # 这个函数的作用是初始化一个 OpenAI 兼容协议的 LLM 客户端，便于后续切换不同模型提供方。
+        # fast 通道用于判断/规划/审查类调用（OPENAI_FAST_MODEL，如 deepseek-chat 非思考模型），
+        # 未显式配置时回退到主配置；生成文本仍走主通道（质量优先）。
         self.base_url = (base_url or os.getenv("OPENAI_BASE_URL") or "https://api.openai.com/v1").rstrip("/")
         self.api_key = api_key or os.getenv("OPENAI_API_KEY") or ""
         self.model = model or os.getenv("OPENAI_MODEL") or "gpt-4o-mini"
         self.timeout_seconds = self._resolve_timeout_seconds(timeout_seconds)
+        self.fast_base_url = (
+            fast_base_url or os.getenv("OPENAI_FAST_BASE_URL") or self.base_url or "https://api.openai.com/v1"
+        ).rstrip("/")
+        self.fast_api_key = fast_api_key or os.getenv("OPENAI_FAST_API_KEY") or self.api_key or ""
+        self.fast_model = fast_model or os.getenv("OPENAI_FAST_MODEL") or self.model or "gpt-4o-mini"
 
     @staticmethod
     def _resolve_timeout_seconds(configured_timeout: float | None) -> float:
@@ -63,9 +100,9 @@ class LlmServiceClient:
         except (TypeError, ValueError):
             return 45.0
 
-    def is_enabled(self, model_profile: ResolvedUserModelProfile | None = None) -> bool:
+    def is_enabled(self, model_profile: ResolvedUserModelProfile | None = None, *, fast: bool = False) -> bool:
         # 这个函数的作用是判断当前运行时是否具备可调用大模型的最小配置，支持后端配置覆盖环境变量。
-        merged_config = self._merge_runtime_config(model_profile)
+        merged_config = self._merge_runtime_config(model_profile, fast=fast)
         return bool(merged_config["api_key"].strip()) and bool(merged_config["model"].strip())
 
     @classmethod
@@ -79,12 +116,15 @@ class LlmServiceClient:
         user_message: str,
         temperature: float = 0.7,
         model_profile: ResolvedUserModelProfile | None = None,
+        *,
+        fast: bool = False,
     ) -> str:
         # 这个函数的作用是把系统提示词和用户消息发给大模型，并按用户配置覆盖默认模型参数。
-        merged_config = self._merge_runtime_config(model_profile)
-        final_temperature = temperature if model_profile is None or model_profile.temperature is None else model_profile.temperature
+        # fast=True 走全局快速通道（OPENAI_FAST_MODEL），用于判断/规划/审查类调用。
+        merged_config = self._merge_runtime_config(model_profile, fast=fast)
+        final_temperature = temperature if (fast or model_profile is None or model_profile.temperature is None) else model_profile.temperature
 
-        if not self.is_enabled(model_profile):
+        if not self.is_enabled(model_profile, fast=fast):
             raise RuntimeError("LLM client is not configured")
 
         # LangChain 统一负责 OpenAI 兼容模型的消息序列化和响应解析，避免不同厂商
@@ -92,6 +132,7 @@ class LlmServiceClient:
         model = self._build_chat_model(
             merged_config=merged_config,
             temperature=final_temperature,
+            fast=fast,
         )
         response = await model.ainvoke(
             [
@@ -179,6 +220,8 @@ class LlmServiceClient:
         self,
         merged_config: dict[str, Any],
         temperature: float,
+        *,
+        fast: bool = False,
     ) -> ChatOpenAI:
         """按当前用户模型配置创建 LangChain ChatOpenAI 实例。
 
@@ -196,7 +239,9 @@ class LlmServiceClient:
         }
         if merged_config["max_tokens"] is not None:
             parameters["max_tokens"] = merged_config["max_tokens"]
-        return ChatOpenAI(**parameters)
+        self._llm_call_seq = getattr(self, "_llm_call_seq", 0) + 1
+        label = f"fast-seq-{self._llm_call_seq}" if fast else f"seq-{self._llm_call_seq}"
+        return TimedChatModel(ChatOpenAI(**parameters), label)
 
     @staticmethod
     def _should_skip_native_tool_calling(merged_config: dict[str, Any]) -> bool:
@@ -363,8 +408,21 @@ class LlmServiceClient:
         compact_detail = re.sub(r"\bsk-[A-Za-z0-9_-]{8,}\b", "<api-key>", compact_detail)
         return error_code[:80], compact_detail[:300]
 
-    def _merge_runtime_config(self, model_profile: ResolvedUserModelProfile | None = None) -> dict[str, Any]:
+    def _merge_runtime_config(
+        self,
+        model_profile: ResolvedUserModelProfile | None = None,
+        *,
+        fast: bool = False,
+    ) -> dict[str, Any]:
         # 这个函数的作用是把环境变量默认模型配置与后端返回的用户模型配置合并成最终请求参数。
+        # fast 模式使用全局快速通道（不按用户 profile 覆盖），保证判断类调用稳定走快模型。
+        if fast:
+            return {
+                "base_url": self.fast_base_url,
+                "api_key": self.fast_api_key,
+                "model": self.fast_model,
+                "max_tokens": None,
+            }
         merged_base_url = self.base_url
         merged_api_key = self.api_key
         merged_model = self.model
