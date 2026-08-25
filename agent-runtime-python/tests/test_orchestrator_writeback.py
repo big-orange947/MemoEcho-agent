@@ -954,7 +954,7 @@ class OrchestratorWriteBackTest(unittest.IsolatedAsyncioTestCase):
         class WorkspaceCommandWorkflow:
             """固定路由和编译结果，使测试只关注 Orchestrator 的返回契约。"""
 
-            async def resolve_workspace_command_targets(self, command, candidates, model_profile, thread_context=None):
+            async def resolve_workspace_command_targets(self, command, candidates, model_profile, thread_context=None, memory_hints=None):
                 # 明确联系人应由本地解析器命中，这里直接返回全部授权候选。
                 return candidates
 
@@ -1082,7 +1082,7 @@ class OrchestratorWriteBackTest(unittest.IsolatedAsyncioTestCase):
                 # 明确联系人应由本地解析器命中；若意外调用模型，该测试会直接暴露属性错误。
                 self.router = DelegatedTaskWorkflow(object())
 
-            async def resolve_workspace_command_targets(self, command, candidates, model_profile, thread_context=None):
+            async def resolve_workspace_command_targets(self, command, candidates, model_profile, thread_context=None, memory_hints=None):
                 # 先复用真实联系人解析，只挑选命令明确提到的私聊目标。
                 return await self.router.resolve_workspace_command_targets(command, candidates, model_profile)
 

@@ -341,16 +341,20 @@ class DelegatedTaskWorkflow:
         candidates: list[ConversationCandidate],
         model_profile: Any = None,
         thread_context: list[dict[str, str]] | None = None,
+        memory_hints: list[dict[str, Any]] | None = None,
     ) -> list[ConversationCandidate]:
         """解析主控台自然语言命令要作用到哪些授权会话。
 
         主控台命令不能再由 Java 或正则提前拆联系人，否则容易把“km预约”这类动作词
         拼进联系人名称。这里先让模型在授权候选列表中选择目标；模型不可用或返回越界结果时，
         再用保守的本地显式提及匹配兜底。thread_context 提供线程前序消息，支持
-        “那后天呢？”这类省略联系人的追问。
+        “那后天呢？”这类省略联系人的追问。memory_hints 是长期记忆中与命令相关的
+        已知事实（如“小刘是 km 的别名”），先并入候选别名，让记忆里的称呼也能命中会话。
         """
         if not candidates:
             return []
+        if memory_hints:
+            self._apply_memory_aliases(candidates, memory_hints)
 
         # 明确提到已授权通讯录别名时，先确定性命中。
         # 这类名称不需要消耗模型调用，也避免模型偶发漏选让「km」等备注失效。
@@ -367,6 +371,8 @@ class DelegatedTaskWorkflow:
             "只能返回候选里真实存在的 chatId 和 chatType，禁止创造联系人、禁止把任务动作词当联系人。"
             "如果用户明确说群聊、群里、群内、这个群，才优先选择群聊；否则提到人名时优先私聊。"
             "threadContext 是当前对话线程的前序消息（role: user/agent）。"
+            "memoryHints 是长期记忆中与命令相关的已知事实，可用来识别候选的别名（例如「小刘」是某联系人的称呼）；"
+            "但最终目标必须来自 authorizedConversations 中真实存在的会话。"
             "命令本身没提到联系人、但 threadContext 中用户上一轮明确委托过某人时（如追问“那后天呢？”），"
             "可以依据 threadContext 推断该联系人；否则忽略 threadContext，不要凭空猜测。"
             "输出格式：{\"targets\":[{\"chatId\":\"...\",\"chatType\":\"private|group\",\"reason\":\"...\"}],\"reason\":\"...\"}。"
@@ -376,6 +382,12 @@ class DelegatedTaskWorkflow:
             "command": command,
             "authorizedConversations": [self._candidate_payload(candidate) for candidate in candidates],
         }
+        if memory_hints:
+            payload["memoryHints"] = [
+                {"fact": str(hint.get("fact") or "").strip()}
+                for hint in memory_hints
+                if str(hint.get("fact") or "").strip()
+            ]
         if thread_context:
             payload["threadContext"] = thread_context
         user_message = json.dumps(payload, ensure_ascii=False)
@@ -758,6 +770,40 @@ class DelegatedTaskWorkflow:
             if alias and (len(alias) >= 2 or alias.isdigit()):
                 aliases.add(alias)
         return aliases
+
+    @staticmethod
+    def _apply_memory_aliases(
+        candidates: list[ConversationCandidate],
+        memory_hints: list[dict[str, Any]],
+    ) -> None:
+        """把长期记忆中「别名→会话」的声明并入候选别名。
+
+        主控台命令解析目标前，图谱记忆里可能已经有用户声明过的称呼（如“小刘是
+        km 的别名”）。这里从记忆事实文本中提取带会话标识的别名，并入对应候选，
+        让后续本地匹配和模型路由都能用记忆里的称呼命中真实会话。
+        """
+        alias_by_chat_id: dict[str, set[str]] = {}
+        for hint in memory_hints or []:
+            fact = str(hint.get("fact") or "").strip()
+            if not fact:
+                continue
+            chat_ids = re.findall(r"\b\d{5,12}\b", fact)
+            aliases = re.findall(r"[「『]([^」』]+)[」』]", fact)
+            if not chat_ids or not aliases:
+                continue
+            for chat_id in chat_ids:
+                merged = alias_by_chat_id.setdefault(chat_id, set())
+                for alias in aliases:
+                    normalized = "".join(alias.split())
+                    if len(normalized) >= 2:
+                        merged.add(normalized)
+        if not alias_by_chat_id:
+            return
+        for candidate in candidates:
+            if candidate.chat_id not in alias_by_chat_id:
+                continue
+            merged = set(candidate.aliases) | alias_by_chat_id[candidate.chat_id]
+            candidate.aliases = sorted(merged)
 
     @staticmethod
     def _normalize_contact_token(value: str | None) -> str:

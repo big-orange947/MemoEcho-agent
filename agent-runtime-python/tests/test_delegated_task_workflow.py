@@ -2388,5 +2388,99 @@ class CompactPlannerTest(unittest.IsolatedAsyncioTestCase):
             await workflow.plan_workspace_command_compact("约游戏", [_km_candidate()])
 
 
+class MemoryAliasResolutionTest(unittest.IsolatedAsyncioTestCase):
+    """主控台目标解析消费长期记忆里的别名（如“小刘=km”）。"""
+
+    def test_apply_memory_aliases_merges_declared_alias(self) -> None:
+        from app.workflows.delegated_task_graph import DelegatedTaskWorkflow
+
+        candidate = _km_candidate()
+        DelegatedTaskWorkflow._apply_memory_aliases(
+            [candidate],
+            [{"fact": "用户在主控台声明：联系人「km」（平台 qq，会话类型 private，标识 3807050597）的别名/称呼是「小刘」。"}],
+        )
+        self.assertIn("小刘", candidate.aliases)
+        # 命令提到记忆别名时，本地确定性命中该候选（不依赖模型调用）。
+        workflow = DelegatedTaskWorkflow(object())
+        resolved = workflow._fallback_resolve_workspace_targets("帮我和小刘说晚安", [candidate])
+        self.assertEqual(len(resolved), 1)
+        self.assertEqual(resolved[0].chat_id, "3807050597")
+
+    async def test_resolve_targets_uses_memory_hints(self) -> None:
+        from app.workflows.delegated_task_graph import DelegatedTaskWorkflow
+
+        # LLM 不可用时走本地匹配；记忆别名应先并入候选。
+        workflow = DelegatedTaskWorkflow(object())
+        candidate = _km_candidate()
+        resolved = await workflow.resolve_workspace_command_targets(
+            "帮我和小刘说晚安",
+            [candidate],
+            model_profile=None,
+            memory_hints=[
+                {"fact": "用户在主控台声明：联系人「km」（平台 qq，会话类型 private，标识 3807050597）的别名/称呼是「小刘」。"}
+            ],
+        )
+        self.assertEqual(len(resolved), 1)
+        self.assertEqual(resolved[0].chat_id, "3807050597")
+
+    def test_memory_hints_without_chat_id_are_ignored(self) -> None:
+        from app.workflows.delegated_task_graph import DelegatedTaskWorkflow
+
+        candidate = _km_candidate()
+        DelegatedTaskWorkflow._apply_memory_aliases(
+            [candidate],
+            [{"fact": "用户喜欢小刘这个称呼。"}],  # 没有会话标识，不能并入别名
+        )
+        self.assertNotIn("小刘", candidate.aliases)
+
+
+class WorkspaceMemoryDeclarationTest(unittest.IsolatedAsyncioTestCase):
+    """主控台「记住别名」记忆指令的识别与别名提取。"""
+
+    def test_memory_declaration_detection(self) -> None:
+        from app.orchestrator.service import OrchestratorService
+
+        for command in (
+            "记住 km 叫小刘",
+            "以后叫 km 小刘",
+            "km 的别名是小刘",
+            "把 km 叫小刘",
+            "称呼 km 为小刘",
+        ):
+            self.assertTrue(
+                OrchestratorService._is_memory_declaration_command(command),
+                f"应识别为记忆声明: {command}",
+            )
+        for command in (
+            "帮我和 km 说晚安",
+            "问 km 明天几点有空",
+        ):
+            self.assertFalse(
+                OrchestratorService._is_memory_declaration_command(command),
+                f"不应识别为记忆声明: {command}",
+            )
+
+    def test_extract_declared_alias(self) -> None:
+        from app.orchestrator.service import OrchestratorService
+
+        self.assertEqual(
+            OrchestratorService._extract_declared_alias("记住 km 叫小刘", ["km"]),
+            "小刘",
+        )
+        self.assertEqual(
+            OrchestratorService._extract_declared_alias("km 的别名是小刘", ["km"]),
+            "小刘",
+        )
+        self.assertEqual(
+            OrchestratorService._extract_declared_alias("以后叫 km 小刘", ["km"]),
+            "小刘",
+        )
+        # 已有名字不能当作新别名
+        self.assertEqual(
+            OrchestratorService._extract_declared_alias("记住 km 叫 km", ["km"]),
+            "",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

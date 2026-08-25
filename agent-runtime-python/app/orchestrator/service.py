@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import unicodedata
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -369,11 +370,21 @@ class OrchestratorService:
             modelConfigured=bool(model_profile),
         )
         try:
+            # 主控台命令解析目标前先检索长期记忆：用户可能已在主控台声明过“小刘=km”
+            # 这类称呼，记忆里的别名并入候选后，命令提到别名也能命中真实联系人。
+            memory_hints: list[dict[str, Any]] = []
+            if self.memory is not None:
+                try:
+                    memory_hints = await self.memory.build_graph_memories(event, query=command)
+                except Exception as exception:
+                    logger.info("主控台记忆检索失败，按无记忆解析目标：%s", type(exception).__name__)
+                    memory_hints = []
             target_candidates = await self.delegated_task_workflow.resolve_workspace_command_targets(
                 command=command,
                 candidates=candidates,
                 model_profile=model_profile,
                 thread_context=thread_history,
+                memory_hints=memory_hints,
             )
         except Exception as exception:
             self._log_delegated_trace(
@@ -431,6 +442,64 @@ class OrchestratorService:
                 for candidate in target_candidates
             ],
         )
+        # 记忆指令：主控台告知某个联系人的新称呼（如“记住 km 叫小刘”）。
+        # 识别后写入长期记忆图谱并直接返回，不创建委托工作流；之后命令提到该称呼
+        # 就能通过记忆检索命中对应联系人。
+        declared_alias = ""
+        if len(target_candidates) == 1 and self._is_memory_declaration_command(command):
+            known_names = [candidate.chat_name for candidate in target_candidates] + list(
+                target_candidates[0].aliases
+            )
+            declared_alias = self._extract_declared_alias(command, known_names)
+            if declared_alias:
+                target_candidate = target_candidates[0]
+                remembered = await self._remember_workspace_alias(
+                    event=event,
+                    command=command,
+                    alias=declared_alias,
+                    candidate=target_candidate,
+                    execution_id=execution_id,
+                )
+                self._log_delegated_trace(
+                    "workspace_alias_remembered",
+                    execution_id=execution_id,
+                    event=event,
+                    chatId=target_candidate.chat_id,
+                    alias=declared_alias,
+                    persisted=remembered,
+                )
+                display_name = target_candidate.chat_name or target_candidate.chat_id
+                reply = (
+                    f"好的，我已记住 {display_name} 的别名是「{declared_alias}」。"
+                    "之后在主控台提到这个称呼，就会找到他。"
+                )
+                return OrchestratorResult(
+                    execution_id=execution_id,
+                    status="success",
+                    route="delegated_task",
+                    summary=f"已记住 {display_name} 的别名「{declared_alias}」",
+                    results=[
+                        AgentResult(
+                            task_id=execution_id,
+                            agent="delegated_task_router",
+                            status="success",
+                            reply_draft=reply,
+                            tool_calls=[
+                                ToolCallRecord(
+                                    tool="remember_workspace_alias",
+                                    arguments={
+                                        "chatId": target_candidate.chat_id,
+                                        "alias": declared_alias,
+                                    },
+                                )
+                            ],
+                        )
+                    ],
+                    final_reply=reply,
+                    write_back_actions=[
+                        f"workspace_alias_remembered:{target_candidate.chat_id}:{declared_alias}"
+                    ],
+                )
         # P2b：单次规划主路径——一次 fast 模型调用替代 target+plan+compile。
         # 失败（模型不可用/输出不合规）时回退到下方原有分步逻辑，不影响可用性。
         compact_plan = None
@@ -677,6 +746,91 @@ class OrchestratorService:
             if content:
                 entries.append({"role": role, "content": content})
         return entries[-8:]
+
+    @staticmethod
+    def _is_memory_declaration_command(command: str) -> bool:
+        """判断主控台命令是否是「给联系人起别名/称呼」的记忆声明。
+
+        这类命令不创建委托工作流，而是把称呼映射写入长期记忆图谱，
+        后续命令提到该称呼时通过记忆检索命中联系人。
+        """
+        normalized = re.sub(r"\s+", "", command or "")
+        if not normalized:
+            return False
+        patterns = (
+            r"(?:记住|以后|之后|今后|把|让).{0,12}?(?:叫|称|称呼|更名为)",
+            r"(?:的)?别名(?:是|为|叫)",
+            r"更名为",
+            r"称呼(?:为|是)?",
+        )
+        return any(re.search(pattern, normalized) for pattern in patterns)
+
+    @staticmethod
+    def _extract_declared_alias(command: str, known_names: list[str]) -> str:
+        """从记忆声明命令中提取用户给出的新称呼；已有名字（候选名）不算新别名。
+
+        “以后叫 km 小刘”这类说法里联系人名和别名连在一起，先把已知联系人名
+        从捕获串中移除，剩下的才是真正的新称呼。
+        """
+        normalized = re.sub(r"\s+", "", command or "")
+        if not normalized:
+            return ""
+        known = {re.sub(r"\s+", "", str(name or "")).strip() for name in known_names if str(name or "").strip()}
+        for pattern in (
+            r"(?:别名叫|别名是|别名为|称呼为|称呼是|更名为|以后叫|之后叫|就叫|记住.{0,12}?叫)([^\s，。,.！？?]{1,12})$",
+            r"(?:把|让)([^\s，。,.！？?]{1,12})(?:叫|称|称呼)",
+        ):
+            match = re.search(pattern, normalized)
+            if not match:
+                continue
+            candidate_alias = str(match.group(1) or "").strip()
+            # 逐个移除已知联系人名，避免“以后叫 km 小刘”把联系人名拼进别名。
+            for name in known:
+                candidate_alias = candidate_alias.replace(name, "")
+            candidate_alias = candidate_alias.strip()
+            if len(candidate_alias) >= 2:
+                return candidate_alias
+        return ""
+
+    async def _remember_workspace_alias(
+        self,
+        *,
+        event: UnifiedEvent,
+        command: str,
+        alias: str,
+        candidate: Any,
+        execution_id: str,
+    ) -> bool:
+        """把主控台声明的联系人称呼写入长期记忆图谱。
+
+        写入的文本包含会话标识（QQ 号）和新称呼，供后续目标解析时检索；
+        图谱不可用或写入失败时静默降级，不影响主控台其他功能。
+        """
+        graph_service = getattr(self.memory_graph_writer, "graph_service", None)
+        if graph_service is None or not graph_service.is_enabled:
+            return False
+        name = candidate.chat_name or candidate.chat_id
+        declaration = (
+            f"用户在主控台声明：联系人「{name}」（平台 qq，会话类型 {candidate.chat_type}，"
+            f"标识 {candidate.chat_id}）的别名/称呼是「{alias}」。之后主控台命令里提到「{alias}」"
+            f"都指代该联系人。"
+        )
+        try:
+            from app.memory.graph_episode_writer import MemoryGraphEpisodeWriter
+
+            group_id = MemoryGraphEpisodeWriter._group_id(event)
+            await graph_service.write_episode(
+                name=f"主控台别名声明:{group_id}",
+                episode_body=declaration,
+                source_description=f"主控台命令 executionId={execution_id}",
+                reference_time=datetime.now(timezone.utc),
+                group_id=group_id,
+            )
+            logger.info("主控台别名记忆已写入图谱：chatId=%s alias=%s", candidate.chat_id, alias)
+            return True
+        except Exception as exception:
+            logger.warning("主控台别名记忆写入失败：error=%s", type(exception).__name__)
+            return False
 
     async def _safe_resolve_workspace_command_model(
         self,
