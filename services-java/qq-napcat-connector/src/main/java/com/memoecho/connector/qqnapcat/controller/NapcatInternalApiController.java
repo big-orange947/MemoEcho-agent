@@ -16,6 +16,8 @@ import com.memoecho.connector.qqnapcat.service.NapcatMessageService;
 import com.memoecho.connector.qqnapcat.service.NapcatSystemService;
 import com.memoecho.connector.qqnapcat.service.NapcatQrLoginService;
 import jakarta.validation.Valid;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -28,6 +30,8 @@ import org.springframework.web.bind.annotation.RestController;
 @RestController
 @RequestMapping("/internal/napcat")
 public class NapcatInternalApiController {
+
+    private static final Logger log = LoggerFactory.getLogger(NapcatInternalApiController.class);
 
     private final NapcatMessageService messageService;
     private final NapcatSystemService systemService;
@@ -91,6 +95,9 @@ public class NapcatInternalApiController {
     public ResponseEntity<NapcatApiResponse<JsonNode>> sendPrivateMessage(
             @Valid @RequestBody SendPrivateMessageRequest request
     ) {
+        log.info("sendPrivateMessage received: userId={}, clientMessageId={}, correlationId={}, messageText={}",
+                request.userId(), request.clientMessageId(), request.correlationId(),
+                request.message() != null ? request.message() : String.valueOf(request.segments()));
         return ResponseEntity.ok(messageService.sendPrivateMessage(
                 request.userId(), request.toNapcatMessage(), request.clientMessageId(), request.correlationId()));
     }

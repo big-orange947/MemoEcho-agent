@@ -8,6 +8,14 @@ from langchain_core.tools import BaseTool
 from app.tools.base import ToolExecutionContext, ToolSpec
 
 
+def _is_failed_tool_result(result: Any) -> bool:
+    """判断工具结果是否表示失败，失败结果不进入幂等缓存，允许后续重试。"""
+    if not isinstance(result, dict):
+        return False
+    status = str(result.get("status") or "").strip().lower()
+    return status in {"failed", "disabled", "error", "unknown"}
+
+
 class ToolRegistry:
     def __init__(self) -> None:
         self._tools: dict[str, BaseTool] = {}
@@ -73,5 +81,8 @@ class ToolRegistry:
                 return self._completed_calls[normalized_key]
             # 幂等键由注册表消费，避免把未声明字段注入工具输入 schema。
             result = await tool.ainvoke(normalized_arguments)
-            self._completed_calls[normalized_key] = result
+            # 只缓存成功结果：失败的发送必须允许后续重试（平台临时不可用等），
+            # 否则同轮同内容的幂等键会一直复用第一次的失败，永远不会真正重发。
+            if not _is_failed_tool_result(result):
+                self._completed_calls[normalized_key] = result
             return result

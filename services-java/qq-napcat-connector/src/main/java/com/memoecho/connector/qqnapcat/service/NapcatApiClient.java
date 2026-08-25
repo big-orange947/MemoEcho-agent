@@ -4,6 +4,8 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.memoecho.connector.qqnapcat.config.NapcatApiProperties;
 import com.memoecho.connector.qqnapcat.dto.NapcatApiResponse;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpHeaders;
 import org.springframework.stereotype.Component;
 import org.springframework.web.client.RestClient;
@@ -13,6 +15,8 @@ import java.util.Map;
 
 @Component
 public class NapcatApiClient {
+
+    private static final Logger log = LoggerFactory.getLogger(NapcatApiClient.class);
 
     private final RestClient restClient;
     private final NapcatApiProperties properties;
@@ -26,6 +30,7 @@ public class NapcatApiClient {
 
     public <T> NapcatApiResponse<T> call(String action, Object payload, Class<T> dataType) {
         if (!properties.isEnabled()) {
+            log.warn("NapCat API call skipped (disabled): action={}", action);
             return new NapcatApiResponse<>("disabled", -1, null, "NapCat API is disabled.", null, null);
         }
 
@@ -38,8 +43,12 @@ public class NapcatApiClient {
                     .retrieve()
                     .body(JsonNode.class);
 
-            return parseResponse(response, dataType);
+            NapcatApiResponse<T> result = parseResponse(response, dataType);
+            log.info("NapCat call finished: action={}, status={}, retcode={}, message={}, wording={}, echo={}",
+                    action, result.status(), result.retcode(), result.message(), result.wording(), result.echo());
+            return result;
         } catch (RestClientException ex) {
+            log.error("NapCat call failed: action={}, error={}", action, ex.getMessage(), ex);
             return new NapcatApiResponse<>("failed", -1, null, ex.getMessage(), null, null);
         }
     }
