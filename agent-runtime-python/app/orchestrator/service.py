@@ -563,7 +563,11 @@ class OrchestratorService:
                         task_id=workflow_id,
                         agent="delegated_task_router",
                         status=workflow_status.lower(),
-                        structured_result={"workflow": workflow, "plan": plan.model_dump(by_alias=True)},
+                        structured_result={
+                            "workflow": workflow,
+                            # compact 路径没有 plan 变量，用 compact_plan 兜底（P2b 回归修复）。
+                            "plan": (compact_plan if compact_plan is not None else plan).model_dump(by_alias=True),
+                        },
                         reply_draft=str(workflow.get("initialProgress") or "委托工作流已创建，正在执行首个步骤"),
                         tool_calls=[
                             ToolCallRecord(

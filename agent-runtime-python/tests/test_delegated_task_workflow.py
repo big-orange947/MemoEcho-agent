@@ -2343,7 +2343,7 @@ class CompactPlannerTest(unittest.IsolatedAsyncioTestCase):
             ],
         }
 
-    async def test_compact_plan_success_uses_fast_channel(self) -> None:
+    async def test_compact_plan_success_uses_main_channel(self) -> None:
         llm = CompactPlannerLlm(self._valid_payload())
         workflow = DelegatedTaskWorkflow(llm)
         plan = await workflow.plan_workspace_command_compact(
@@ -2353,8 +2353,8 @@ class CompactPlannerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(plan.steps), 1)
         self.assertEqual(plan.steps[0].objective, "拿到 km 明天晚上的空闲时间")
         self.assertEqual(plan.steps[0].success_criteria, "km 明确给出时间")
-        # P2b 必须走 fast 通道
-        self.assertTrue(llm.calls[0]["fast"])
+        # 规划是质量敏感任务，必须走主通道（思考模型）保证契约正确，不用 fast。
+        self.assertFalse(llm.calls[0]["fast"])
         # 线程前序要传给模型
         self.assertIn("command", llm.calls[0]["userMessage"])
 

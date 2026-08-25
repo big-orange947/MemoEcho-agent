@@ -518,7 +518,8 @@ class DelegatedTaskWorkflow:
             json.dumps(payload, ensure_ascii=False),
             temperature=0.05,
             model_profile=model_profile,
-            fast=True,
+            # 规划是质量敏感任务：契约（目标/步骤/成功条件）直接决定任务语义，
+            # 用主通道思考模型保证理解正确（实测 fast 模型会把命令理解偏）。
         )
         try:
             plan = CompactWorkflowPlan.model_validate(self._parse_json_object(raw))
@@ -1459,12 +1460,12 @@ class DelegatedTaskWorkflow:
             planned = self._planned_from_langchain_tool_call(native_tool_call)
         try:
             if not planned:
+                # 生成消息内容用主通道（思考模型保证质量）；工具选择判断已由 choose_tool 走 fast。
                 raw = await self.llm_client.generate_reply(
                     system_prompt,
                     planning_payload,
                     temperature=0.15,
                     model_profile=model_profile,
-                    fast=True,
                 )
                 planned = self._parse_json_object(raw)
         except Exception as exc:
