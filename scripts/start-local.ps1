@@ -2,7 +2,10 @@
 param(
     [switch]$SkipBuild,
     [ValidateRange(10, 300)]
-    [int]$StartupTimeoutSeconds = 90
+    [int]$StartupTimeoutSeconds = 90,
+    [switch]$SkipNapCat,
+    [switch]$SkipNeo4j,
+    [string]$NapCatQq = "3969785168"
 )
 
 Set-StrictMode -Version Latest
@@ -179,9 +182,17 @@ $javaCommand = Assert-CommandAvailable -Name "java"
 $mavenCommand = Assert-CommandAvailable -Name "mvn"
 $pythonCommand = Assert-CommandAvailable -Name "python"
 
+# 本机 Java 服务实际用 JDK 24 运行（D:\Java\jdk，已验证 event-center/connector 兼容）；
+# 存在时优先使用，否则回退 PATH 中的 java（JDK 21 亦可）。
+$preferredJdk = "D:\Java\jdk\bin\java.exe"
+if (Test-Path -LiteralPath $preferredJdk) {
+    $javaCommand = $preferredJdk
+    Write-Host "使用本机 JDK：$preferredJdk"
+}
+
 $javaVersionOutput = (& $env:ComSpec /c "`"$javaCommand`" -version 2>&1") -join " "
-if ($javaVersionOutput -notmatch 'version "21(?:\.|\")') {
-    throw "当前 java 不是 JDK 21：$javaVersionOutput"
+if ($javaVersionOutput -notmatch 'version "(?:21|24)(?:\.|\")') {
+    throw "当前 java 不是 JDK 21/24：$javaVersionOutput"
 }
 
 $javaServices = @(
@@ -200,6 +211,30 @@ if (-not $SkipBuild) {
 
 $managedProcesses = [System.Collections.ArrayList]::new()
 try {
+    # ---------------------------------------------------------------- Neo4j（记忆图谱）
+    if (-not $SkipNeo4j) {
+        $neo4jListen = Get-NetTCPConnection -LocalPort 7687 -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($null -ne $neo4jListen) {
+            Write-Host "[SKIP] Neo4j 已经在运行"
+        } else {
+            $dockerCommand = Get-Command docker -ErrorAction SilentlyContinue
+            if ($null -eq $dockerCommand) {
+                Write-Warning "Neo4j 未运行且未找到 docker，请手动：docker compose -f scripts/docker-compose.neo4j.yml up -d"
+            } else {
+                Write-Host "[START] Neo4j (docker compose)"
+                & $dockerCommand.Source compose -f (Join-Path $scriptRoot "docker-compose.neo4j.yml") up -d 2>&1 | Out-Null
+                $neo4jReady = $false
+                $deadline = (Get-Date).AddSeconds(120)
+                while ((Get-Date) -lt $deadline) {
+                    Start-Sleep -Seconds 3
+                    $port = Get-NetTCPConnection -LocalPort 7687 -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
+                    if ($null -ne $port) { $neo4jReady = $true; break }
+                }
+                if ($neo4jReady) { Write-Host "[UP] Neo4j" } else { Write-Warning "Neo4j 容器启动超时，请检查 Docker Desktop" }
+            }
+        }
+    }
+
     foreach ($service in $javaServices | Where-Object { $_.name -ne "qq-connector" }) {
         $serviceDirectory = Join-Path $projectRoot "services-java/$($service.directory)"
         $jarPath = Join-Path $serviceDirectory "target/$($service.jar)"
@@ -236,6 +271,43 @@ try {
     if ($null -ne $connectorEntry) {
         [void]$managedProcesses.Add($connectorEntry)
         Save-ManagedProcesses -Processes $managedProcesses
+    }
+
+    # ---------------------------------------------------------------- NapCat（QQ 机器人，快速登录）
+    if (-not $SkipNapCat) {
+        $napcatListen = Get-NetTCPConnection -LocalPort 3011 -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($null -ne $napcatListen) {
+            Write-Host "[SKIP] NapCat 已经在运行"
+        } else {
+            $launcher = "D:\napcat\launcher-user.bat"
+            if (-not (Test-Path -LiteralPath $launcher)) {
+                Write-Warning "未找到 $launcher，请手动启动 NapCat（带 QQ 号参数可快速登录）"
+            } else {
+                Write-Host "[START] NapCat (快速登录 QQ=$NapCatQq)"
+                $napcatLog = Join-Path $env:TEMP "napcat-console.log"
+                # 传 QQ 号参数 = 快速登录（免扫码）；不传参则每次需要重新扫码。
+                Start-Process -FilePath $env:ComSpec -ArgumentList @("/c", "chcp 65001 >nul && cd /d D:\napcat && launcher-user.bat $NapCatQq > `"$napcatLog`" 2>&1") -WindowStyle Hidden
+                $napcatReady = $false
+                $deadline = (Get-Date).AddSeconds(90)
+                while ((Get-Date) -lt $deadline) {
+                    Start-Sleep -Seconds 5
+                    $port = Get-NetTCPConnection -LocalPort 3011 -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
+                    if ($null -ne $port) {
+                        try {
+                            $login = Invoke-RestMethod -Uri "http://127.0.0.1:3011/get_login_info" -TimeoutSec 3
+                            if ($null -ne $login.data.user_id) {
+                                Write-Host "[UP] NapCat 已快速登录：$($login.data.user_id) / $($login.data.nickname)"
+                                $napcatReady = $true
+                                break
+                            }
+                        } catch { }
+                    }
+                }
+                if (-not $napcatReady) {
+                    Write-Warning "NapCat 3011 已监听但快速登录未确认，可能仍需扫码（查看 $napcatLog）；本脚本会继续。"
+                }
+            }
+        }
     }
 
     Write-Host "Memo Echo 本地服务已就绪。日志目录：$logRoot"

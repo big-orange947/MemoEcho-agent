@@ -1,5 +1,7 @@
 ﻿[CmdletBinding()]
-param()
+param(
+    [switch]$SkipNapCat
+)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
@@ -46,4 +48,16 @@ foreach ($record in $records) {
 }
 
 Remove-Item -LiteralPath $pidFile -Force
-Write-Host "本脚本启动的 Memo Echo 服务已停止。MySQL 和 NapCat 未受影响。"
+
+if (-not $SkipNapCat) {
+    $qqProcesses = @(Get-Process -Name QQ -ErrorAction SilentlyContinue)
+    if ($qqProcesses.Count -gt 0) {
+        # NapCat 注入 QQ 进程运行；停止 = 结束 QQ。重启后请用 start-local.ps1（带 QQ 号参数快速登录）。
+        $qqProcesses | Stop-Process -Force
+        Write-Host "[STOP] NapCat (QQ $($qqProcesses.Count) 个进程)"
+    } else {
+        Write-Host "[SKIP] NapCat 未在运行"
+    }
+}
+
+Write-Host "本脚本启动的 Memo Echo 服务已停止；Neo4j/MySQL 未受影响。用 scripts/start-local.ps1 一键重启（NapCat 自动快速登录）。"
