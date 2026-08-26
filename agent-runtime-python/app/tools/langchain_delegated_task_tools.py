@@ -18,11 +18,14 @@ class _TaskProgressInput(BaseModel):
 
 
 class _SendQqMessageInput(_TaskProgressInput):
-    """生成下一条私聊消息时的意图参数，而非直接消息内容。"""
+    """生成下一条私聊消息的意图参数，而非直接消息内容。"""
 
     messageInstruction: Annotated[
         str,
-        Field(description="应向当前联系人表达什么，只描述意图，不泄露内部名称或任务状态"),
+        Field(
+            description="要发送给对方的最终聊天文本，直接写要说的原话（口语化、自然），"
+            "不要写指令、说明或示例，不要提及任务、Agent、工具或内部名称"
+        ),
     ]
 
 
@@ -38,7 +41,10 @@ class _CompleteDelegatedTaskInput(_TaskProgressInput):
     ]
     finalMessageInstruction: Annotated[
         str | None,
-        Field(default=None, description="仅在结束前还需发一句自然收尾消息时填写")
+        Field(
+            default=None,
+            description="仅在结束前还需发一句自然收尾消息时填写，直接写要发送的原话，不要写指令或示例"
+        ),
     ]
 
 
@@ -56,8 +62,9 @@ def _public_arguments(schema: type[BaseModel], values: dict[str, object]) -> dic
 
 @tool("send_qq_message", args_schema=_SendQqMessageInput)
 def plan_send_qq_message(**kwargs: object) -> dict[str, object]:
-    """任务仍需继续对话时，声明下一条发给当前联系人的消息意图。
+    """任务仍需继续对话时，声明下一条发给当前联系人的消息文本。
 
+    messageInstruction 必须是直接可发送的聊天原话，不是动作指令或示例。
     此工具不直接发送消息。工作流会先调用它完成 LangChain 参数校验，再交由 Java
     工具白名单执行实际发送，因此模型不能越过权限、审查和幂等链路。
     """
@@ -79,7 +86,7 @@ def plan_complete_delegated_task(**kwargs: object) -> dict[str, object]:
 
     这个工具只表达“模型主动决定结束”的意图；Python 侧不会用固定词命中来代替该判断。
     调用前必须确认任务创建后的证据足以支持 SUCCESS、REJECTED 或 BLOCKED。若结束前仍需
-    发一句自然收尾，把表达意图写入 finalMessageInstruction。
+    发一句自然收尾消息，把要发送的原话写入 finalMessageInstruction（不是指令或示例）。
     """
     return {"intent": "complete_delegated_task", "arguments": _public_arguments(_CompleteDelegatedTaskInput, kwargs)}
 

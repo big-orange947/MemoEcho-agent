@@ -1687,6 +1687,8 @@ class DelegatedTaskWorkflow:
             "你是聊天候选回复的情景一致性审查器。只输出 JSON，不要 Markdown。"
             "检查候选文本是否能由当前对话、任务和记忆支持，是否自然像本人聊天，是否泄露内部流程，"
             "是否重复已确认条件或编造未给出的事实。"
+            "候选文本必须是可直接发送的聊天原话；若它像对内部执行者的指令（例如“回复对方表示收到”"
+            "“应该说……”“例如：……”），判 REVISE 并给出直接可发送的原话。"
             "输出 verdict（APPROVE、REVISE、BLOCK）、feedback、revisedCandidateMessage。"
             "仅在候选确实缺乏依据或明显不自然时 REVISE；不要因信息不完整而替用户编造内容。"
         )
