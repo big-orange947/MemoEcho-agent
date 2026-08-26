@@ -8,6 +8,7 @@ import java.sql.Timestamp;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
 /**
@@ -69,7 +70,23 @@ public class JdbcDelegatedTaskEventClaimRepository {
                           AND claim_status = 'CLAIMED' AND claim_token = ?
                         """,
                 Timestamp.from(Instant.now()), taskId, eventId, userId, claimToken);
-        return updated == 1;
+        if (updated == 1) {
+            return true;
+        }
+        // 幂等：同一执行者（同 token）已经完成过该事件时，重复提交视为成功。
+        // 事件处理闭环与 outbox 步骤执行闭环可能先后提交同一次租约，第二次不应
+        // 被当成真正的 409 冲突（真正的冲突是 token 被另一执行者接管或租约不存在）。
+        List<Map<String, Object>> rows = jdbcTemplate.queryForList(
+                "SELECT claim_status, claim_token FROM delegated_task_event_claim "
+                        + "WHERE task_id = ? AND event_id = ? AND user_id = ? LIMIT 1",
+                taskId, eventId, userId);
+        if (rows.size() == 1
+                && "COMPLETED".equals(rows.getFirst().get("claim_status"))
+                && claimToken != null
+                && claimToken.equals(rows.getFirst().get("claim_token"))) {
+            return true;
+        }
+        return false;
     }
 
     /**

@@ -11,6 +11,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import uuid4
 
+import httpx
+
 from app.clients.connector_service import ConnectorServiceClient
 from app.clients.event_center_service import EventCenterServiceClient
 from app.clients.llm_service import LlmServiceClient
@@ -115,6 +117,8 @@ class OrchestratorService:
         # 让旧事件在真正发送前再做一次失效检查，而不是仅依赖 450ms 防抖。
         self._delegated_conversation_latest_event_ids: dict[str, str] = {}
         self._delegated_inbound_debounce_seconds = 0.45
+        # 后台记忆写入任务集合（fire-and-forget，防 GC 与崩溃日志）
+        self._alias_write_tasks: set[asyncio.Task] = set()
 
     @classmethod
     def build_default(cls) -> "OrchestratorService":
@@ -801,14 +805,41 @@ class OrchestratorService:
         candidate: Any,
         execution_id: str,
     ) -> bool:
-        """把主控台声明的联系人称呼写入长期记忆图谱。
+        """把主控台声明的联系人称呼写入长期记忆图谱（异步不阻塞命令响应）。
 
-        写入的文本包含会话标识（QQ 号）和新称呼，供后续目标解析时检索；
+        图谱首次初始化与 Episode 提取可能耗时数十秒到分钟级；这里只做可用性检查后
+        立即返回“已记住”，真实写入在后台任务执行（幂等键 execution_id 防重复）。
         图谱不可用或写入失败时静默降级，不影响主控台其他功能。
         """
         graph_service = getattr(self.memory_graph_writer, "graph_service", None)
         if graph_service is None or not graph_service.is_enabled:
             return False
+        task = asyncio.create_task(
+            self._write_workspace_alias_episode(
+                event=event,
+                command=command,
+                alias=alias,
+                candidate=candidate,
+                execution_id=execution_id,
+                graph_service=graph_service,
+            ),
+            name=f"workspace-alias-{execution_id}",
+        )
+        self._alias_write_tasks.add(task)
+        task.add_done_callback(self._finish_alias_write_task)
+        return True
+
+    async def _write_workspace_alias_episode(
+        self,
+        *,
+        event: UnifiedEvent,
+        command: str,
+        alias: str,
+        candidate: Any,
+        execution_id: str,
+        graph_service: Any,
+    ) -> None:
+        """后台执行别名声明写入；失败只记录日志，由下一条同称呼命令重新触发。"""
         name = candidate.chat_name or candidate.chat_id
         declaration = (
             f"用户在主控台声明：联系人「{name}」（平台 qq，会话类型 {candidate.chat_type}，"
@@ -827,10 +858,16 @@ class OrchestratorService:
                 group_id=group_id,
             )
             logger.info("主控台别名记忆已写入图谱：chatId=%s alias=%s", candidate.chat_id, alias)
-            return True
         except Exception as exception:
-            logger.warning("主控台别名记忆写入失败：error=%s", type(exception).__name__)
-            return False
+            logger.warning(
+                "主控台别名记忆写入失败（可重试）：chatId=%s alias=%s error=%s",
+                candidate.chat_id,
+                alias,
+                type(exception).__name__,
+            )
+
+    def _finish_alias_write_task(self, task: asyncio.Task) -> None:
+        self._alias_write_tasks.discard(task)
 
     async def _safe_resolve_workspace_command_model(
         self,
@@ -1694,6 +1731,24 @@ class OrchestratorService:
             return
         try:
             await complete(event, task_id, event_id, claim_token)
+        except httpx.HTTPStatusError as exception:
+            # 409 = 事件租约已不在 CLAIMED 状态。事件处理闭环与 outbox 步骤执行闭环
+            # 可能先后提交同一次租约：第二次提交在 Java 侧已幂等化为成功，残余 409
+            # 表示同一执行者重复完成或已被接管。平台副作用已完成，按幂等完成处理，
+            # 只保留警告，不按失败重试。
+            if exception.response is not None and exception.response.status_code == 409:
+                logger.warning(
+                    "提交委托事件租约返回 409（视为幂等完成）：taskId=%s, eventId=%s",
+                    task_id,
+                    event_id,
+                )
+                return
+            logger.error(
+                "提交委托事件租约失败：taskId=%s, eventId=%s, error=%s",
+                task_id,
+                event_id,
+                type(exception).__name__,
+            )
         except Exception as exception:
             # 平台副作用已经完成，提交失败只能保留租约等待超时，不能再次执行发送。
             logger.error(
