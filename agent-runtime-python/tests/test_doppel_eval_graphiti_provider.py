@@ -1,6 +1,8 @@
-"""Budgeted/cached Graphiti LLM client tests — all offline, fake HTTP only."""
+﻿"""Budgeted/cached Graphiti LLM client tests — all offline, fake HTTP only."""
 
 from __future__ import annotations
+
+from typing import Any
 
 import asyncio
 import json
@@ -21,6 +23,158 @@ from doppel_eval.graphiti_provider import (
 
 class _MemoryModel(BaseModel):
     memories: list[str] = []
+
+
+class ReservationBudgetTest(unittest.IsolatedAsyncioTestCase):
+    """Concurrent token-budget reservations must cap in-flight HTTP attempts."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.mkdtemp(prefix="graphiti-reservation-")
+
+    def _client(
+        self,
+        handler: _FakeHandler,
+        budget: GraphitiProviderBudget,
+        *,
+        sleep_seconds: float = 0.0,
+    ) -> BudgetedCachedGraphitiLLMClient:
+        transport = httpx.MockTransport(handler.handler)
+        http = httpx.AsyncClient(transport=transport)
+        return BudgetedCachedGraphitiLLMClient(
+            model="deepseek-v4-flash",
+            base_url="https://api.deepseek.com",
+            http_client=http,
+            budget=budget,
+            cache_dir=None,
+            max_retries=0,
+        )
+
+    def _slowed_handler(self, seconds: float) -> tuple[_FakeHandler, _FakeHandler]:
+        """Return (handler_with_delay, handler_that_counts_calls)."""
+        base = _FakeHandler()
+
+        async def _respond(request: httpx.Request) -> httpx.Response:
+            await asyncio.sleep(seconds)
+            return base.handler(request)
+
+        handler = _FakeHandler()
+        handler.handler = _respond  # type: ignore[method-assign]
+        return handler, base
+
+    def _messages(self, text: str = "我长期住在上海。" * 80) -> list[Message]:
+        return [
+            Message(role="system", content="抽取助手"),
+            Message(role="user", content=text),
+        ]
+
+    async def _run_tasks(self, client: Any, count: int) -> list[BaseException | dict]:
+        tasks = [
+            asyncio.create_task(client.generate_response(self._messages("我长期住在上海。" * 80 + f" 消息 {i}")))
+            for i in range(count)
+        ]
+        return await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def test_input_budget_limits_concurrency(self) -> None:
+        handler, base = self._slowed_handler(0.1)
+        # est input per call ~1.3k tokens; two calls fit, a third does not.
+        client = self._client(
+            handler, GraphitiProviderBudget(max_calls=100, max_input_tokens=1_700)
+        )
+        results = await self._run_tasks(client, 10)
+        blocked = sum(1 for r in results if isinstance(r, GraphitiProviderHardFailure))
+        self.assertLessEqual(len(base.calls), 2)
+        self.assertGreaterEqual(len(base.calls), 1)
+        self.assertEqual(blocked, 10 - len(base.calls))
+        await client.aclose()
+
+    async def test_output_budget_limits_concurrency(self) -> None:
+        handler, base = self._slowed_handler(0.1)
+        # max_output_tokens_per_call is 1024; only two in-flight fits.
+        client = self._client(
+            handler, GraphitiProviderBudget(max_calls=100, max_output_tokens=2_048)
+        )
+        results = await self._run_tasks(client, 10)
+        blocked = sum(1 for r in results if isinstance(r, GraphitiProviderHardFailure))
+        self.assertLessEqual(len(base.calls), 2)
+        self.assertEqual(blocked, 10 - len(base.calls))
+        await client.aclose()
+
+    async def test_total_budget_limits_concurrency(self) -> None:
+        handler, base = self._slowed_handler(0.1)
+        client = self._client(
+            handler,
+            GraphitiProviderBudget(max_calls=100, max_total_tokens=2_500),
+        )
+        results = await self._run_tasks(client, 10)
+        blocked = sum(1 for r in results if isinstance(r, GraphitiProviderHardFailure))
+        self.assertLessEqual(len(base.calls), 2)
+        self.assertEqual(blocked, 10 - len(base.calls))
+        await client.aclose()
+
+    async def test_active_reservation_visible_while_in_flight(self) -> None:
+        handler, base = self._slowed_handler(0.3)
+        client = self._client(handler, GraphitiProviderBudget(max_calls=10))
+        task = asyncio.create_task(client.generate_response(self._messages()))
+        await asyncio.sleep(0.1)  # request is now in flight
+        report = client.ledger.report()
+        self.assertEqual(report["active_reservations"], 1)
+        self.assertGreaterEqual(report["reserved_input_tokens"], 1)
+        result = await task
+        self.assertEqual(result, {"memories": ["ok"]})
+        final = client.ledger.report()
+        self.assertEqual(final["active_reservations"], 0)
+        self.assertEqual(final["reserved_total_tokens"], 0)
+        await client.aclose()
+
+    async def test_invalid_json_consumes_call_and_usage(self) -> None:
+        handler = _FakeHandler(
+            content="this is not json",
+            usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+        )
+        client = self._client(handler, GraphitiProviderBudget(max_calls=3))
+        with self.assertRaises(GraphitiProviderHardFailure):
+            await client.generate_response(self._messages())
+        report = client.ledger.report()
+        self.assertEqual(report["calls_attempted"], 1)
+        self.assertEqual(report["calls_succeeded"], 0)
+        self.assertEqual(report["provider_errors"], 1)
+        self.assertEqual(report["total_tokens"], 15)  # usage still charged
+        self.assertEqual(report["active_reservations"], 0)
+        await client.aclose()
+
+    async def test_validation_failure_charges_usage_and_counts_error(self) -> None:
+        class _Strict(BaseModel):
+            model_config = {"extra": "forbid"}
+            memories: list[str]  # required, no default
+
+        handler = _FakeHandler(
+            content='{"wrong_key": 1}',
+            usage={"prompt_tokens": 20, "completion_tokens": 4, "total_tokens": 24},
+        )
+        client = self._client(handler, GraphitiProviderBudget(max_calls=3))
+        with self.assertRaises(GraphitiProviderHardFailure) as ctx:
+            await client.generate_response(self._messages(), response_model=_Strict)
+        self.assertIn("response_validation_error", str(ctx.exception))
+        report = client.ledger.report()
+        self.assertEqual(report["validation_errors"], 1)
+        self.assertGreaterEqual(report["provider_errors"], 1)
+        self.assertEqual(report["total_tokens"], 24)
+        self.assertEqual(report["active_reservations"], 0)
+        await client.aclose()
+
+    async def test_cancelled_in_flight_call_is_conservatively_charged(self) -> None:
+        handler, base = self._slowed_handler(0.5)
+        client = self._client(handler, GraphitiProviderBudget(max_calls=3))
+        task = asyncio.create_task(client.generate_response(self._messages()))
+        await asyncio.sleep(0.1)  # HTTP attempt started
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        report = client.ledger.report()
+        self.assertEqual(report["active_reservations"], 0)
+        self.assertGreater(report["conservative_charged_tokens"], 0)
+        self.assertGreaterEqual(report["reserved_input_tokens"], 0)
+        await client.aclose()
 
 
 class _FakeHandler:

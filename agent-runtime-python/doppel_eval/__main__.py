@@ -1,4 +1,4 @@
-"""CLI: python -m doppel_eval generate|replay ...
+﻿"""CLI: python -m doppel_eval generate|replay ...
 
 Never contacts QQ; all data is synthetic and deterministic.
 """
@@ -150,6 +150,14 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         help="zero-paid add_episode call-topology probe (real Neo4j, fake LLM)",
     )
     probe.add_argument("--out", type=Path, default=None, help="report JSON output")
+
+    smoke = sub.add_parser(
+        "graphiti-smoke",
+        help="single-episode paid smoke (dry-run fake by default; double switch to go live)",
+    )
+    smoke.add_argument("--live-provider", action="store_true", help="use the real provider (requires GRAPHITI_LIVE_SMOKE_CONFIRM=YES)")
+    smoke.add_argument("--cache-dir", type=Path, default=None, help="content cache dir (default: none)")
+    smoke.add_argument("--out", type=Path, default=None, help="report JSON output")
 
     graph = sub.add_parser(
         "graph-e2e",
@@ -334,6 +342,49 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as exc:  # noqa: BLE001 - probe boundary
             print(f"[doppel_eval] graphiti probe failed: {exc}", file=sys.stderr)
             return 1
+        if args.out is not None:
+            args.out.parent.mkdir(parents=True, exist_ok=True)
+            args.out.write_text(
+                json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "graphiti-smoke":
+        from doppel_eval.graphiti_smoke import run_smoke
+
+        dm = _load_doppel()
+        if dm is None:
+            print(
+                "doppel_memory not importable. Set DOPPEL_IMPORT_PATH="
+                "D:/project/Doppel.",
+                file=sys.stderr,
+            )
+            return 3
+        uri = os.environ.get("GRAPHITI_EVAL_NEO4J_URI", "").strip()
+        user = os.environ.get("GRAPHITI_EVAL_NEO4J_USER", "").strip()
+        password = os.environ.get("GRAPHITI_EVAL_NEO4J_PASSWORD", "")
+        if not uri or not user:
+            print(
+                "graphiti-smoke requires GRAPHITI_EVAL_NEO4J_URI/USER/PASSWORD",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            report = asyncio.run(
+                run_smoke(
+                    neo4j_uri=uri,
+                    neo4j_user=user,
+                    neo4j_password=password,
+                    live_provider=args.live_provider,
+                    model=os.environ.get("DOPPEL_MODEL", "").strip(),
+                    base_url=os.environ.get("DOPPEL_OPENAI_BASE_URL", "").strip(),
+                    api_key=os.environ.get("DOPPEL_API_KEY", "").strip(),
+                    cache_dir=args.cache_dir,
+                )
+            )
+        except (ValueError, RuntimeError) as exc:
+            print(f"[doppel_eval] graphiti smoke failed: {exc}", file=sys.stderr)
+            return 2
         if args.out is not None:
             args.out.parent.mkdir(parents=True, exist_ok=True)
             args.out.write_text(

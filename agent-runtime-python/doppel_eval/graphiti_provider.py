@@ -32,6 +32,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import httpx
 
@@ -75,6 +76,16 @@ class GraphitiProviderBudget:
                 raise ValueError(f"{name} must be positive")
 
 
+@dataclass(frozen=True)
+class GraphitiCallReservation:
+    """An in-flight budget hold for one real HTTP attempt."""
+
+    reservation_id: str
+    estimated_input_tokens: int
+    reserved_output_tokens: int
+    reserved_total_tokens: int
+
+
 class GraphitiUsageLedger:
     """Thread-safe (asyncio) usage accounting; one ledger per client."""
 
@@ -88,28 +99,53 @@ class GraphitiUsageLedger:
         self.input_tokens = 0
         self.output_tokens = 0
         self.total_tokens = 0
+        self.conservative_charged_tokens = 0
+        self.validation_errors = 0
         self.stopped_reason = ""
         self._lock = asyncio.Lock()
         self._estimates: list[int] = []
+        self._reserved_input_tokens = 0
+        self._reserved_output_tokens = 0
+        self._reserved_total_tokens = 0
+        self._active_reservations: dict[str, GraphitiCallReservation] = {}
 
-    async def reserve_call(self, estimated_input_tokens: int) -> None:
-        """Atomically reserve one real HTTP attempt; raise when over budget."""
+    async def reserve_call(
+        self, estimated_input_tokens: int
+    ) -> GraphitiCallReservation:
+        """Atomically reserve one real HTTP attempt; raise when over budget.
+
+        Both *actual* usage and *in-flight reserved* amounts count against the
+        limits, so concurrent calls can never jointly overshoot the budget.
+        """
+        reservation = GraphitiCallReservation(
+            reservation_id=uuid4().hex[:16],
+            estimated_input_tokens=int(estimated_input_tokens),
+            reserved_output_tokens=self.budget.max_output_tokens_per_call,
+            reserved_total_tokens=(
+                int(estimated_input_tokens) + self.budget.max_output_tokens_per_call
+            ),
+        )
         async with self._lock:
-            projected_output = self.budget.max_output_tokens_per_call
             checks = (
                 (self.calls_attempted + 1, self.budget.max_calls, "max_calls"),
                 (
-                    self.input_tokens + estimated_input_tokens,
+                    self._reserved_input_tokens
+                    + self.input_tokens
+                    + reservation.estimated_input_tokens,
                     self.budget.max_input_tokens,
                     "max_input_tokens",
                 ),
                 (
-                    self.output_tokens + projected_output,
+                    self._reserved_output_tokens
+                    + self.output_tokens
+                    + reservation.reserved_output_tokens,
                     self.budget.max_output_tokens,
                     "max_output_tokens",
                 ),
                 (
-                    self.total_tokens + estimated_input_tokens + projected_output,
+                    self._reserved_total_tokens
+                    + self.total_tokens
+                    + reservation.reserved_total_tokens,
                     self.budget.max_total_tokens,
                     "max_total_tokens",
                 ),
@@ -121,9 +157,69 @@ class GraphitiUsageLedger:
                         f"provider budget exceeded ({name}): {projected}>{limit}"
                     )
             self.calls_attempted += 1
-            self._estimates.append(estimated_input_tokens)
+            self._estimates.append(reservation.estimated_input_tokens)
+            self._reserved_input_tokens += reservation.estimated_input_tokens
+            self._reserved_output_tokens += reservation.reserved_output_tokens
+            self._reserved_total_tokens += reservation.reserved_total_tokens
+            self._active_reservations[reservation.reservation_id] = reservation
+        return reservation
 
-    def observe_usage(self, usage: dict[str, int] | None) -> None:
+    async def settle_success(
+        self, reservation: GraphitiCallReservation, usage: dict[str, int] | None
+    ) -> None:
+        """Full success (HTTP + parse): release the reservation and add usage."""
+        async with self._lock:
+            self._release_locked(reservation)
+            self._add_usage_locked(usage)
+            self.calls_succeeded += 1
+
+    async def settle_failure(
+        self,
+        reservation: GraphitiCallReservation,
+        usage: dict[str, int] | None = None,
+        *,
+        validation: bool = False,
+    ) -> None:
+        """Failed call (HTTP error, invalid JSON, or validation failure).
+
+        The call already happened: provider usage (when present) is charged,
+        otherwise the reserved estimate is conservatively charged.
+        """
+        async with self._lock:
+            self._release_locked(reservation)
+            if usage:
+                self._add_usage_locked(usage)
+            else:
+                self.conservative_charged_tokens += (
+                    reservation.estimated_input_tokens
+                    + reservation.reserved_output_tokens
+                )
+            self.provider_errors += 1
+            if validation:
+                self.validation_errors += 1
+
+    async def release_cancelled(
+        self, reservation: GraphitiCallReservation, *, http_started: bool
+    ) -> None:
+        """Task cancellation: free the reservation only if HTTP never started."""
+        async with self._lock:
+            if not http_started:
+                self._release_locked(reservation)
+                return
+            self._release_locked(reservation)
+            self.conservative_charged_tokens += (
+                reservation.estimated_input_tokens
+                + reservation.reserved_output_tokens
+            )
+            self.provider_errors += 1
+
+    def _release_locked(self, reservation: GraphitiCallReservation) -> None:
+        self._reserved_input_tokens -= reservation.estimated_input_tokens
+        self._reserved_output_tokens -= reservation.reserved_output_tokens
+        self._reserved_total_tokens -= reservation.reserved_total_tokens
+        self._active_reservations.pop(reservation.reservation_id, None)
+
+    def _add_usage_locked(self, usage: dict[str, int] | None) -> None:
         if not usage:
             return
         self.input_tokens += int(usage.get("prompt_tokens", 0) or 0)
@@ -145,9 +241,15 @@ class GraphitiUsageLedger:
             "cache_hits": self.cache_hits,
             "cache_writes": self.cache_writes,
             "provider_errors": self.provider_errors,
+            "validation_errors": self.validation_errors,
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
             "total_tokens": self.total_tokens,
+            "reserved_input_tokens": self._reserved_input_tokens,
+            "reserved_output_tokens": self._reserved_output_tokens,
+            "reserved_total_tokens": self._reserved_total_tokens,
+            "active_reservations": len(self._active_reservations),
+            "conservative_charged_tokens": self.conservative_charged_tokens,
             "estimated_input_tokens": sum(self._estimates),
             "stopped_reason": self.stopped_reason,
             "within_budget": not self.stopped_reason,
@@ -208,6 +310,7 @@ class BudgetedCachedGraphitiLLMClient(LLMClient):
         self._max_tokens_parameter = str(max_tokens_parameter or "max_tokens")
         self._max_retries = max(int(max_retries), 0)
         self._client_version = str(client_version or CLIENT_VERSION)
+        self._last_usage: dict[str, int] | None = None
 
     # ---------------------------------------------------------------- protocol
 
@@ -269,13 +372,31 @@ class BudgetedCachedGraphitiLLMClient(LLMClient):
         estimate = _estimate_tokens(messages_payload, schema_text)
         last_error: Exception | None = None
         for attempt in range(self._max_retries + 1):
-            await self._ledger.reserve_call(estimate)
+            reservation = await self._ledger.reserve_call(estimate)
+            http_started = False
+            self._last_usage: dict[str, int] | None = None
             try:
+                http_started = True  # before the attempt; cancellation is conservative
                 result = await self._post_chat(
                     messages_payload, schema_text, effective, model_size
                 )
+                validated = self._validate(result, response_model, prompt_name)
+                await self._ledger.settle_success(reservation, self._last_usage)
+                self._write_cache(cache_key, result)
+                return validated
+            except asyncio.CancelledError:
+                await self._ledger.release_cancelled(
+                    reservation, http_started=http_started
+                )
+                raise
             except Exception as exc:  # noqa: BLE001 - classified below
-                self._ledger.provider_errors += 1
+                is_validation = (
+                    isinstance(exc, GraphitiProviderHardFailure)
+                    and str(exc).startswith("response_validation_error")
+                )
+                await self._ledger.settle_failure(
+                    reservation, self._last_usage, validation=is_validation
+                )
                 if (
                     attempt < self._max_retries
                     and isinstance(exc, GraphitiProviderHardFailure)
@@ -284,10 +405,6 @@ class BudgetedCachedGraphitiLLMClient(LLMClient):
                     last_error = exc
                     continue
                 raise
-            self._ledger.calls_succeeded += 1
-            validated = self._validate(result, response_model, prompt_name)
-            self._write_cache(cache_key, result)
-            return validated
         raise GraphitiProviderHardFailure(
             f"all retries exhausted: {last_error}"
         )
@@ -336,7 +453,12 @@ class BudgetedCachedGraphitiLLMClient(LLMClient):
             data = response.json()
         except ValueError as exc:
             raise GraphitiProviderHardFailure("invalid_json_response") from exc
-        self._ledger.observe_usage((data.get("usage") or {}) if isinstance(data, dict) else {})
+        if isinstance(data, dict) and isinstance(data.get("usage"), dict):
+            self._last_usage = {
+                str(key): int(value)
+                for key, value in data["usage"].items()
+                if isinstance(value, int) and value >= 0
+            }
         choices = (data or {}).get("choices") or []
         if not choices:
             raise GraphitiProviderHardFailure("empty_choices")

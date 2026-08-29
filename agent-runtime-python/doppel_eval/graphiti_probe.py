@@ -331,6 +331,15 @@ async def run_probe(
         "cleaned_up": True,
         "llm_client": llm_client.ledger.report(),
         "http_attempts": len(transport.bodies),
+        "measured_call_floor": 2,
+        "unmeasured_paths": [
+            "edge timestamp extraction",
+            "node/edge dedupe",
+            "contradiction invalidation",
+            "entity summaries",
+            "custom attributes",
+        ],
+        "paid_scenario_recommendation": "one episode only",
         "scenarios": scenario_reports,
         "notes": [
             "fake transport returns a minimal legal object for the injected schema",
@@ -338,11 +347,9 @@ async def run_probe(
             "requested max_tokens is what Graphiti asked for; effective is the budget cap",
             "extract_nodes requested max_tokens=None (falls back to Graphiti default 16384 -> capped)",
             "extract_edges explicitly requests 16384 -> capped to the budget cap",
-            "timestamp/dedupe prompts were not triggered: fake entities/edges were not adopted "
-            "by Graphiti (self-loop/no-name stubs), so this counts only the extraction path; "
-            "real LLM topologies may add timestamp or dedupe calls",
-            "logical_calls per episode: 2 (extract_nodes + extract_edges); use max_calls=10 "
-            "for a 3-scenario paid smoke (6 base calls + 1 retry margin)",
+            "probe proves only the two-call extraction floor; real adopted edges add "
+            "timestamp calls and later episodes may add dedupe/invalidation; no "
+            "multi-scenario paid budget can be inferred from this probe",
         ],
     }
 
