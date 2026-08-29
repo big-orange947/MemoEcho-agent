@@ -5,7 +5,11 @@ from __future__ import annotations
 import os
 import unittest
 
-from doppel_eval.graphiti_smoke import LIVE_CONFIRM_ENV, run_smoke
+from doppel_eval.graphiti_smoke import (
+    LIVE_CONFIRM_ENV,
+    _validate_provider_activation,
+    run_smoke,
+)
 
 NEO4J_URI = os.environ.get("GRAPHITI_EVAL_NEO4J_URI", "").strip()
 NEO4J_USER = os.environ.get("GRAPHITI_EVAL_NEO4J_USER", "").strip()
@@ -18,10 +22,7 @@ class LiveGuardTest(unittest.IsolatedAsyncioTestCase):
     async def test_live_without_confirm_is_rejected_before_network(self) -> None:
         os.environ.pop(LIVE_CONFIRM_ENV, None)
         with self.assertRaises(ValueError) as ctx:
-            await run_smoke(
-                neo4j_uri="bolt://127.0.0.1:7687",
-                neo4j_user="neo4j",
-                neo4j_password="x",
+            _validate_provider_activation(
                 live_provider=True,
                 model="m",
                 base_url="https://api.deepseek.com",
@@ -33,10 +34,7 @@ class LiveGuardTest(unittest.IsolatedAsyncioTestCase):
         os.environ[LIVE_CONFIRM_ENV] = "YES"
         try:
             with self.assertRaises(ValueError) as ctx:
-                await run_smoke(
-                    neo4j_uri="bolt://127.0.0.1:7687",
-                    neo4j_user="neo4j",
-                    neo4j_password="x",
+                _validate_provider_activation(
                     live_provider=True,
                     model="",
                     base_url="",
@@ -49,18 +47,14 @@ class LiveGuardTest(unittest.IsolatedAsyncioTestCase):
             os.environ.pop(LIVE_CONFIRM_ENV, None)
 
     async def test_dry_run_never_requires_credentials(self) -> None:
-        # Dry-run must not require env keys. Use an unreachable address so no
-        # authentication attempt hits the real Neo4j (would trip its fail lock).
+        # The provider guard is evaluated before any product or network setup.
         os.environ.pop(LIVE_CONFIRM_ENV, None)
-        try:
-            await run_smoke(
-                neo4j_uri="bolt://127.0.0.1:9",
-                neo4j_user="neo4j",
-                neo4j_password="x",
-                live_provider=False,
-            )
-        except Exception as exc:  # noqa: BLE001 - may fail on connection, not keys
-            self.assertNotIn("DOPPEL_API_KEY", str(exc))
+        _validate_provider_activation(
+            live_provider=False,
+            model="",
+            base_url="",
+            api_key="",
+        )
 
 
 @unittest.skipUnless(
@@ -79,10 +73,22 @@ class DryRunNeo4jTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(scenario["mode"], "dry-run-fake")
         self.assertFalse(scenario["live_provider"])
         self.assertFalse(scenario["key_persisted"])
-        self.assertIn("hard_failure", scenario)
-        self.assertIn("graph_edge_path_not_exercised", scenario)
+        self.assertEqual(scenario["hard_failure"], "")
+        self.assertFalse(scenario["graph_edge_path_not_exercised"])
+        self.assertGreaterEqual(scenario["nodes_created"], 2)
+        self.assertGreaterEqual(scenario["edges_created"], 1)
+        self.assertTrue(str(scenario["edge_valid_at"]).startswith("2025-01-01"))
+        self.assertTrue(str(scenario["edge_invalid_at"]).startswith("2025-03-31"))
+        self.assertEqual(scenario["logical_calls"], len(scenario["prompt_names"]))
+        self.assertGreaterEqual(scenario["logical_calls"], 3)
+        self.assertTrue(scenario["inside_interval_hit"])
+        self.assertFalse(scenario["outside_interval_hit"])
+        self.assertTrue(scenario["provenance_ok"])
+        self.assertTrue(scenario["store_revalidation_ok"])
+        self.assertTrue(scenario["scope_isolation_ok"])
         self.assertTrue(scenario["cleanup_performed"])
         self.assertIn("usage", scenario)
+        self.assertTrue(scenario["gate"]["ok"])
         self.assertNotIn("Bearer", report.__str__())
 
 

@@ -119,9 +119,14 @@ def _smoke_minimal(messages: list[dict[str, str]]) -> dict[str, Any]:
             "timestamps": [
                 {
                     "valid_at": "2025-01-01T00:00:00Z",
-                    "invalid_at": None,
+                    "invalid_at": "2025-03-31T23:59:59Z",
                 }
             ]
+        }
+    if "valid_at" in props and "invalid_at" in props:
+        return {
+            "valid_at": "2025-01-01T00:00:00Z",
+            "invalid_at": "2025-03-31T23:59:59Z",
         }
     return _minimal_for_schema(schema)
 
@@ -180,7 +185,14 @@ async def run_smoke(
     cache_dir: Path | None = None,
 ) -> dict[str, Any]:
     """Run the single-episode smoke; dry-run (fake transport) by default."""
-    # Inject the Doppel source path early; imports below depend on it.
+    _validate_provider_activation(
+        live_provider=live_provider,
+        model=model,
+        base_url=base_url,
+        api_key=api_key,
+    )
+
+    # Load product dependencies only after the no-cost live-provider guards pass.
     dm = _load_doppel()
     from graphiti_core import Graphiti
     from doppel_memory.graphiti_store import (
@@ -188,24 +200,6 @@ async def run_smoke(
         GraphitiSemanticIndex,
         NoOpCrossEncoder,
     )
-
-    if live_provider:
-        confirmation = os.environ.get(LIVE_CONFIRM_ENV, "").strip().upper() == "YES"
-        if not confirmation:
-            raise ValueError(
-                f"live provider requires {LIVE_CONFIRM_ENV}=YES (explicit double switch)"
-            )
-        missing = [
-            name
-            for name, value in (
-                ("DOPPEL_API_KEY", api_key),
-                ("DOPPEL_MODEL", model),
-                ("DOPPEL_OPENAI_BASE_URL", base_url),
-            )
-            if not str(value or "").strip()
-        ]
-        if missing:
-            raise ValueError(f"live provider requires: {', '.join(missing)}")
 
     if live_provider:
         http_client: httpx.AsyncClient | None = None
@@ -227,10 +221,10 @@ async def run_smoke(
         max_retries=0,
     )
 
-    dm = _load_doppel()
     scenario: dict[str, Any] = {}
     graphiti: Any = None
     index: Any = None
+    scope: Any = None
     cleanup_performed = False
     try:
         graphiti = Graphiti(
@@ -280,16 +274,24 @@ async def run_smoke(
             inside_hit = _any_hit_for(dm, inside, SMOKE_MEMORY_ID)
             outside_hit = _any_hit_for(dm, outside, SMOKE_MEMORY_ID)
 
-        # Provenance: map graph edge candidates back to the authoritative Store.
+        # Provenance: map the exact graph candidate back to the authoritative Store.
         reloaded = await client.store.get(scope, SMOKE_MEMORY_ID)
-        provenance_ok = reloaded is not None and reloaded.memory_id == SMOKE_MEMORY_ID
+        provenance_ok = (
+            inside_hit
+            and reloaded is not None
+            and reloaded.memory_id == SMOKE_MEMORY_ID
+        )
         store_revalidation_ok = _record_matches_smoke(dm, reloaded)
         isolation_reloaded = await _reload_scope(client.store, scope)
 
-        graph_edge_path = (
-            await _count_episode_edges(graphiti, indexed.episode_id)
+        graph_stats = (
+            await _read_graph_projection(
+                graphiti,
+                group_id=scope.scope_key,
+                episode_id=indexed.episode_id,
+            )
             if indexed is not None
-            else 0
+            else _empty_graph_projection()
         )
         scenario = {
             "mode": "live-provider" if transport_used == "live" else "dry-run-fake",
@@ -302,16 +304,16 @@ async def run_smoke(
             "model": llm_client.model,
             "base_url_host": _host_only(base_url) if base_url else "",
             "budget": SMOKE_BUDGET.__dict__,
-            "prompt_names": [],
-            "logical_calls": 0,
+            "prompt_names": llm_client.prompt_names,
+            "logical_calls": llm_client.logical_calls,
             "http_attempts": len(fake_bodies)
             if transport_used == "fake"
             else llm_client.ledger.calls_attempted,
             "cache_hits": llm_client.ledger.cache_hits,
-            "nodes_created": 0,
-            "edges_created": graph_edge_path,
-            "edge_valid_at": None,
-            "edge_invalid_at": None,
+            "nodes_created": graph_stats["nodes"],
+            "edges_created": graph_stats["edges"],
+            "edge_valid_at": graph_stats["valid_at"],
+            "edge_invalid_at": graph_stats["invalid_at"],
             "inside_interval_hit": inside_hit,
             "outside_interval_hit": outside_hit,
             "provenance_ok": provenance_ok,
@@ -320,24 +322,17 @@ async def run_smoke(
             "cleanup_performed": False,
             "hard_failure": index_error,
             "stopped_by_budget": not llm_client.ledger.report()["within_budget"],
-            "graph_edge_path_not_exercised": graph_edge_path == 0,
+            "graph_edge_path_not_exercised": graph_stats["edges"] == 0,
             "usage": llm_client.ledger.report(),
         }
-        if transport_used == "fake" and graph_edge_path == 0:
-            scenario["notes"] = [
-                "dry-run fake extraction was never reached: Doppel GraphitiSemanticIndex "
-                "first-index calls Graphiti 0.29 add_episode(uuid=<deterministic id>) whose "
-                "uuid path requires an existing episode node (get_by_uuid raises); the smoke "
-                "ends before graph edge adoption, honestly reported as "
-                "graph_edge_path_not_exercised=true",
-                "domain-neutral Doppel-side fix would ensure the deterministic episode slot "
-                "exists in graphiti_store.upsert before add_episode(uuid=..)",
-            ]
     finally:
         if graphiti is not None:
-            await _cleanup_smoke_scope(graphiti, scope.scope_key)
-            cleanup_performed = True
-            await graphiti.close()
+            try:
+                if scope is not None:
+                    await _cleanup_smoke_scope(graphiti, scope.scope_key)
+                    cleanup_performed = True
+            finally:
+                await graphiti.close()
         if http_client is not None:
             await http_client.aclose()
         if index is not None:
@@ -345,11 +340,36 @@ async def run_smoke(
 
     scenario["cleanup_performed"] = cleanup_performed
     scenario["usage"] = llm_client.ledger.report()
+    scenario["gate"] = _smoke_gate(scenario)
     return {
         "runner": "doppel.graphiti-smoke.v1",
         "generated_at": datetime.now(UTC).isoformat(),
         "scenario": scenario,
     }
+
+
+def _validate_provider_activation(
+    *, live_provider: bool, model: str, base_url: str, api_key: str
+) -> None:
+    """Enforce the two explicit switches before product or network setup."""
+    if not live_provider:
+        return
+    confirmation = os.environ.get(LIVE_CONFIRM_ENV, "").strip().upper() == "YES"
+    if not confirmation:
+        raise ValueError(
+            f"live provider requires {LIVE_CONFIRM_ENV}=YES (explicit double switch)"
+        )
+    missing = [
+        name
+        for name, value in (
+            ("DOPPEL_API_KEY", api_key),
+            ("DOPPEL_MODEL", model),
+            ("DOPPEL_OPENAI_BASE_URL", base_url),
+        )
+        if not str(value or "").strip()
+    ]
+    if missing:
+        raise ValueError(f"live provider requires: {', '.join(missing)}")
 
 
 def _any_hit_for(dm: Any, hits: Any, memory_id: str) -> bool:
@@ -359,7 +379,7 @@ def _any_hit_for(dm: Any, hits: Any, memory_id: str) -> bool:
         source = str(getattr(hit, "source_message_id", "") or "")
         if source and memory_id in source:
             return True
-    return bool(hits)  # a hit without provenance still signals the path ran
+    return False
 
 
 def _record_matches_smoke(dm: Any, record: Any) -> bool:
@@ -381,26 +401,72 @@ async def _reload_scope(store: Any, scope: Any) -> bool:
     return bool(foreign)
 
 
-async def _count_episode_edges(graphiti: Any, episode_id: str) -> int:
-    """Count edges whose episodes reference our smoke episode id."""
-    if not episode_id:
-        return 0
+def _empty_graph_projection() -> dict[str, Any]:
+    return {"nodes": 0, "edges": 0, "valid_at": None, "invalid_at": None}
+
+
+async def _read_graph_projection(
+    graphiti: Any, *, group_id: str, episode_id: str
+) -> dict[str, Any]:
+    """Inspect Graphiti 0.29's actual Entity/RELATES_TO projection."""
+    if not episode_id or not group_id:
+        return _empty_graph_projection()
     result = await graphiti.driver.execute_query(
-        "MATCH (e:Episodic {uuid: $episode_id})<-[:FROM_EPISODE]-(edge:EpisodicEdge) "
-        "RETURN count(edge) AS edges",
+        "OPTIONAL MATCH (entity:Entity {group_id: $group_id}) "
+        "WITH count(DISTINCT entity) AS nodes "
+        "OPTIONAL MATCH ()-[edge:RELATES_TO]->() "
+        "WHERE edge.group_id = $group_id "
+        "AND $episode_id IN coalesce(edge.episodes, []) "
+        "RETURN nodes, count(edge) AS edges, min(edge.valid_at) AS valid_at, "
+        "max(edge.invalid_at) AS invalid_at",
+        group_id=group_id,
         episode_id=episode_id,
     )
-    return _read_count(result)
-
-
-def _read_count(result: Any) -> int:
     try:
         records = list(result.records)
-        if records:
-            return int(records[0].data().get("edges") or 0)
-    except Exception:  # noqa: BLE001
-        pass
-    return 0
+        if not records:
+            return _empty_graph_projection()
+        data = records[0].data()
+        return {
+            "nodes": int(data.get("nodes") or 0),
+            "edges": int(data.get("edges") or 0),
+            "valid_at": _json_datetime(data.get("valid_at")),
+            "invalid_at": _json_datetime(data.get("invalid_at")),
+        }
+    except Exception:  # noqa: BLE001 - report an empty projection and fail the gate
+        logger.warning("failed to inspect smoke graph projection", exc_info=True)
+        return _empty_graph_projection()
+
+
+def _json_datetime(value: Any) -> str | None:
+    if value is None:
+        return None
+    native = value.to_native() if hasattr(value, "to_native") else value
+    if hasattr(native, "isoformat"):
+        return str(native.isoformat())
+    return str(native)
+
+
+def _smoke_gate(scenario: dict[str, Any]) -> dict[str, Any]:
+    checks = {
+        "no_hard_failure": not bool(scenario.get("hard_failure")),
+        "graph_nodes_created": int(scenario.get("nodes_created") or 0) >= 2,
+        "graph_edge_created": int(scenario.get("edges_created") or 0) >= 1,
+        "edge_valid_from_preserved": str(scenario.get("edge_valid_at") or "").startswith(
+            "2025-01-01"
+        ),
+        "edge_valid_to_preserved": str(scenario.get("edge_invalid_at") or "").startswith(
+            "2025-03-31"
+        ),
+        "inside_interval_hit": bool(scenario.get("inside_interval_hit")),
+        "outside_interval_rejected": not bool(scenario.get("outside_interval_hit")),
+        "provenance_ok": bool(scenario.get("provenance_ok")),
+        "store_revalidation_ok": bool(scenario.get("store_revalidation_ok")),
+        "scope_isolation_ok": bool(scenario.get("scope_isolation_ok")),
+        "cleanup_performed": bool(scenario.get("cleanup_performed")),
+        "within_budget": bool((scenario.get("usage") or {}).get("within_budget")),
+    }
+    return {"ok": all(checks.values()), "checks": checks}
 
 
 def _host_only(base_url: str) -> str:
@@ -408,31 +474,6 @@ def _host_only(base_url: str) -> str:
 
     parsed = urlsplit(str(base_url or "").strip())
     return parsed.netloc if parsed.netloc else str(base_url or "").strip()
-
-
-async def _precreate_episode(graphiti: Any, dm: Any, episode_id: str, record: Any) -> None:
-    """Create the deterministic episode node before Doppel indexes it."""
-    from graphiti_core.nodes import EpisodicNode, EpisodeType
-
-    existing = None
-    try:
-        existing = await EpisodicNode.get_by_uuid(graphiti.driver, episode_id)
-    except Exception:  # noqa: BLE001 - not found
-        pass
-    if existing is not None:
-        return
-    node = EpisodicNode(
-        uuid=episode_id,
-        name=record.memory_id,
-        group_id=record.scope.scope_key,
-        labels=[],
-        source=EpisodeType.message,
-        content=str(record.content),
-        source_description="doppel.graphiti-paid-smoke.v1",
-        created_at=record.created_at,
-        valid_at=SMOKE_OBSERVED_AT,
-    )
-    await node.save(graphiti.driver)
 
 
 async def _cleanup_smoke_scope(graphiti: Any, scope_key: str) -> None:

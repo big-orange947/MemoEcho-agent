@@ -391,7 +391,7 @@ def main(argv: list[str] | None = None) -> int:
                 json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
             )
         print(json.dumps(report, ensure_ascii=False, indent=2))
-        return 0
+        return 0 if report.get("scenario", {}).get("gate", {}).get("ok") else 1
     if args.command == "e2e":
         dm = _load_doppel()
         if dm is None:

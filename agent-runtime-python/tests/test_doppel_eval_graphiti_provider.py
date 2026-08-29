@@ -458,6 +458,19 @@ class FakeHttpTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(client._read_cache("corrupt"))
         await client.aclose()
 
+    async def test_tracks_logical_calls_and_prompt_names_across_cache_hits(self) -> None:
+        handler = _FakeHandler()
+        client = _make_client(handler, cache_dir=Path(self._tmp) / "tracking-cache")
+
+        await client.generate_response(_messages(), prompt_name="extract.first")
+        await client.generate_response(_messages(), prompt_name="extract.cached")
+
+        self.assertEqual(client.logical_calls, 2)
+        self.assertEqual(client.prompt_names, ["extract.first", "extract.cached"])
+        self.assertEqual(len(handler.calls), 1)
+        self.assertEqual(client.ledger.cache_hits, 1)
+        await client.aclose()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -311,6 +311,18 @@ class BudgetedCachedGraphitiLLMClient(LLMClient):
         self._max_retries = max(int(max_retries), 0)
         self._client_version = str(client_version or CLIENT_VERSION)
         self._last_usage: dict[str, int] | None = None
+        self._logical_calls = 0
+        self._prompt_names: list[str] = []
+
+    @property
+    def logical_calls(self) -> int:
+        """Graphiti requests observed, including requests served from cache."""
+        return self._logical_calls
+
+    @property
+    def prompt_names(self) -> list[str]:
+        """Graphiti prompt identities in call order (safe copy for reports)."""
+        return list(self._prompt_names)
 
     # ---------------------------------------------------------------- protocol
 
@@ -338,6 +350,9 @@ class BudgetedCachedGraphitiLLMClient(LLMClient):
         attribute_extraction: bool = False,
     ) -> dict[str, Any]:
         """Single budgeted call with one internal retry and disk caching."""
+        self._logical_calls += 1
+        self._prompt_names.append(str(prompt_name or "<unspecified>"))
+
         # Work on safe copies: the base pipeline mutates message content.
         working = [message.model_copy(deep=True) for message in messages]
         self._apply_attribute_extraction_preamble(working, attribute_extraction)
