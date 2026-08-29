@@ -145,6 +145,12 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         help="exit zero for quality misses; budget stops and hard failures still fail",
     )
 
+    probe = sub.add_parser(
+        "graphiti-probe",
+        help="zero-paid add_episode call-topology probe (real Neo4j, fake LLM)",
+    )
+    probe.add_argument("--out", type=Path, default=None, help="report JSON output")
+
     graph = sub.add_parser(
         "graph-e2e",
         help="run budget-free temporal Graphiti/Neo4j scenes",
@@ -303,6 +309,38 @@ def main(argv: list[str] | None = None) -> int:
             )
         print(json.dumps(report["summary"], ensure_ascii=False, indent=2))
         return 0 if report["gate"]["ok"] else 1
+    if args.command == "graphiti-probe":
+        from doppel_eval.graphiti_probe import run_probe
+
+        dm = _load_doppel()
+        if dm is None:
+            print(
+                "doppel_memory not importable. Set DOPPEL_IMPORT_PATH="
+                "D:/project/Doppel.",
+                file=sys.stderr,
+            )
+            return 3
+        uri = os.environ.get("GRAPHITI_EVAL_NEO4J_URI", "").strip()
+        user = os.environ.get("GRAPHITI_EVAL_NEO4J_USER", "").strip()
+        password = os.environ.get("GRAPHITI_EVAL_NEO4J_PASSWORD", "")
+        if not uri or not user:
+            print(
+                "graphiti-probe requires GRAPHITI_EVAL_NEO4J_URI/USER/PASSWORD",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            report = asyncio.run(run_probe(neo4j_uri=uri, neo4j_user=user, neo4j_password=password))
+        except Exception as exc:  # noqa: BLE001 - probe boundary
+            print(f"[doppel_eval] graphiti probe failed: {exc}", file=sys.stderr)
+            return 1
+        if args.out is not None:
+            args.out.parent.mkdir(parents=True, exist_ok=True)
+            args.out.write_text(
+                json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0
     if args.command == "e2e":
         dm = _load_doppel()
         if dm is None:
