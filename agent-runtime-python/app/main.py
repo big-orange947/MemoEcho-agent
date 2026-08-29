@@ -65,11 +65,17 @@ async def lifespan(_: FastAPI):
         RUNTIME_SOURCE_PATH,
     )
     warm_up_task = asyncio.create_task(_warm_up_builtin_embedding())
-    yield
-    if not warm_up_task.done():
-        warm_up_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await warm_up_task
+    if orchestrator.doppel_shadow is not None:
+        await orchestrator.doppel_shadow.open()
+    try:
+        yield
+    finally:
+        if not warm_up_task.done():
+            warm_up_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await warm_up_task
+        if orchestrator.doppel_shadow is not None:
+            await orchestrator.doppel_shadow.shutdown()
 
 
 app = FastAPI(title="Memo Echo Agent Runtime", version="0.1.0", lifespan=lifespan)

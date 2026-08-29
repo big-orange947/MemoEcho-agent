@@ -18,6 +18,7 @@ from app.clients.event_center_service import EventCenterServiceClient
 from app.clients.llm_service import LlmServiceClient
 from app.clients.schedule_service import ScheduleServiceClient
 from app.clients.task_service import TaskServiceClient
+from app.integrations.doppel import DoppelShadowWorker, build_shadow_worker
 from app.memory.manager import MemoryManager
 from app.memory.candidate_extractor import MemoryCandidateExtractor
 from app.memory.graph_episode_writer import MemoryGraphEpisodeWriter
@@ -88,6 +89,7 @@ class OrchestratorService:
         task_completion_service: ConversationTaskCompletionService | None = None,
         delegated_task_workflow: DelegatedTaskWorkflow | None = None,
         memory_graph_writer: MemoryGraphEpisodeWriter | None = None,
+        doppel_shadow: DoppelShadowWorker | None = None,
     ) -> None:
         # 这个构造函数的作用是保存运行时依赖，并一次性构建 agent 注册表。
         self.router = router
@@ -104,6 +106,7 @@ class OrchestratorService:
         self.conversation_state_service = conversation_state_service or ConversationStateService()
         self.memory_candidate_extractor = memory_candidate_extractor
         self.memory_graph_writer = memory_graph_writer
+        self.doppel_shadow = doppel_shadow
         self.task_completion_service = task_completion_service
         # 委托图复用同一个模型客户端，确保命令编译和运行态审查遵守用户选择的模型配置。
         self.delegated_task_workflow = delegated_task_workflow or DelegatedTaskWorkflow(
@@ -173,6 +176,8 @@ class OrchestratorService:
             ),
             # 记忆图谱写入默认由 MEMORY_GRAPH_ENABLED 控制；未启用时 schedule 直接跳过，零开销。
             memory_graph_writer=MemoryGraphEpisodeWriter(memory_graph_service),
+            # Doppel shadow：默认关闭（DOPPEL_SHADOW_ENABLED），开启时仅观察、绝不注入回复。
+            doppel_shadow=build_shadow_worker(),
         )
         # 生产链路使用带 SQLite Checkpointer 的固定主链路执行图，以 workflowId 为 thread key。
         service._delegated_execution_graph = build_delegated_execution_graph(
@@ -1175,6 +1180,9 @@ class OrchestratorService:
         if self.memory_graph_writer is not None:
             # 事件级记忆图谱写入异步执行（会话级节流合并）；未启用时内部直接跳过。
             self.memory_graph_writer.schedule(event)
+        if self.doppel_shadow is not None:
+            # Doppel shadow：观察标准化事件但绝不注入回复/发消息；默认关闭。
+            self.doppel_shadow.schedule(event)
         # 主控台委托已经由任务决策图确定动作，不再交给旧 Planner 二次规划。
         # 这样可以避免历史 plan 中的额外 Agent 重复生成回复或重复调用发送工具。
         if delegated_task:

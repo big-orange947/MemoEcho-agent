@@ -48,3 +48,9 @@ scripts/local-env.ps1
 agent-runtime-python/data/*.sqlite3
 agent-runtime-python/data/*.sqlite3-*
 services-java/*/data/
+
+# Doppel synthetic test data (generated)
+agent-runtime-python/data/doppel/
+
+# Doppel evaluation artifacts (working dir)
+agent-runtime-python/*.sqlite3
