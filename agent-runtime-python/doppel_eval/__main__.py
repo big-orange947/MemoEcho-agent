@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -21,6 +22,7 @@ from app.integrations.doppel.config import (
 )
 from doppel_eval.e2e import run_e2e
 from doppel_eval.generators import Tier, TierConfig, generate_dataset
+from doppel_eval.graph_e2e import run_graph_e2e
 from doppel_eval.load import run_load
 from doppel_eval.provider import ProviderBudget
 from doppel_eval.replay import _load_doppel, replay_dataset, replay_scenarios
@@ -142,6 +144,25 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="exit zero for quality misses; budget stops and hard failures still fail",
     )
+
+    graph = sub.add_parser(
+        "graph-e2e",
+        help="run budget-free temporal Graphiti/Neo4j scenes",
+    )
+    graph.add_argument(
+        "--backend",
+        choices=("contract", "neo4j"),
+        default="contract",
+        help="offline Graphiti contract (default) or live preseeded Neo4j",
+    )
+    graph.add_argument(
+        "--out", type=Path, default=None, help="report JSON output"
+    )
+    graph.add_argument(
+        "--keep-fixture",
+        action="store_true",
+        help="retain the isolated live Neo4j fixture for manual inspection",
+    )
     return parser.parse_args(argv)
 
 
@@ -246,6 +267,42 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 1
         return 0
+    if args.command == "graph-e2e":
+        dm = _load_doppel()
+        if dm is None:
+            print(
+                "doppel_memory not importable. Set DOPPEL_IMPORT_PATH="
+                "D:/project/Doppel (or install doppel-memory).",
+                file=sys.stderr,
+            )
+            return 3
+        try:
+            report = asyncio.run(
+                run_graph_e2e(
+                    dm,
+                    backend=args.backend,
+                    neo4j_uri=os.environ.get(
+                        "GRAPHITI_EVAL_NEO4J_URI", ""
+                    ).strip(),
+                    neo4j_user=os.environ.get(
+                        "GRAPHITI_EVAL_NEO4J_USER", ""
+                    ).strip(),
+                    neo4j_password=os.environ.get(
+                        "GRAPHITI_EVAL_NEO4J_PASSWORD", ""
+                    ),
+                    keep_fixture=args.keep_fixture,
+                )
+            )
+        except (RuntimeError, TypeError, ValueError) as exc:
+            print(f"[doppel_eval] graph E2E failed: {exc}", file=sys.stderr)
+            return 2
+        if args.out is not None:
+            args.out.parent.mkdir(parents=True, exist_ok=True)
+            args.out.write_text(
+                json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        print(json.dumps(report["summary"], ensure_ascii=False, indent=2))
+        return 0 if report["gate"]["ok"] else 1
     if args.command == "e2e":
         dm = _load_doppel()
         if dm is None:

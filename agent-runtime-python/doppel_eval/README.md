@@ -23,6 +23,9 @@ python -m doppel_eval replay --scenarios --allow-quality-failures  # contract sa
 
 # load: streaming throughput / idempotence / scope isolation
 python -m doppel_eval load --dataset data\doppel\load.jsonl --replay-twice --out data\doppel\load-report.json
+
+# temporal Graphiti contract: no provider, no Neo4j and no QQ
+python -m doppel_eval graph-e2e --backend contract --out data\doppel\graph-contract.json
 ```
 
 ## Evaluation modes
@@ -34,9 +37,52 @@ python -m doppel_eval load --dataset data\doppel\load.jsonl --replay-twice --out
 - **e2e**: runs the real `PersonalMemoryMiner`, deterministic consolidator and
   personal-memory query without injecting gold records. It uses only synthetic
   scenes and requires a structured-output provider.
+- **graph-e2e / contract**: writes synthetic authoritative `MemoryRecord` objects,
+  feeds Graphiti-shaped temporal candidates into Doppel, and verifies current,
+  as-of, correction, late-arrival, provenance and cross-owner behavior. It is a
+  no-network adapter/query contract, not a Neo4j performance result.
+- **graph-e2e / neo4j**: pre-seeds the same Graphiti episode/entity/edge projection
+  into a real Neo4j instance, searches with Graphiti's actual BM25 + vector + RRF
+  path, then reloads every candidate from Doppel's Store. It uses local FastEmbed
+  vectors and a deliberately disabled LLM client, so provider calls and tokens are
+  exactly zero. This mode tests projection/retrieval, not LLM graph extraction.
 
 The report marks `mode` and `label` explicitly so a contract run is never
 mistaken for an end-to-end memory-quality result.
+
+## Budget-free Graphiti / Neo4j evaluation
+
+Run the deterministic contract first; it should be suitable for routine CI:
+
+```powershell
+$env:DOPPEL_IMPORT_PATH = "D:\project\Doppel"
+python -m doppel_eval graph-e2e --backend contract `
+  --out data\doppel\graph-contract.json
+```
+
+The six cases cover permanent residence after a temporary stay, an as-of lookup
+inside that stay, late-arriving historical evidence, a cancelled plan that must
+not become a completed episode, correction validity, and cross-owner isolation.
+Matching in the contract double is generic character-bigram overlap; it contains
+no residence, work, travel, food, or benchmark-case query rules.
+
+When a dedicated Neo4j test instance is available, opt into the live path. These
+variables are intentionally separate from MemoEcho's normal `NEO4J_*` settings so
+the evaluator cannot silently write to the runtime graph:
+
+```powershell
+$env:GRAPHITI_EVAL_NEO4J_URI = "bolt://127.0.0.1:7687"
+$env:GRAPHITI_EVAL_NEO4J_USER = "neo4j"
+$env:GRAPHITI_EVAL_NEO4J_PASSWORD = "..."
+python -m doppel_eval graph-e2e --backend neo4j `
+  --out data\doppel\graph-neo4j.json
+```
+
+Each live run creates random owner scopes and removes only those exact scopes in
+`finally`. Use `--keep-fixture` only for manual inspection. Credentials are read
+from the environment and never included in the report. The live command does not
+read `OPENAI_API_KEY`/`DOPPEL_API_KEY` and its LLM client raises if anything tries
+to invoke it.
 
 ## Budgeted LLM E2E
 
