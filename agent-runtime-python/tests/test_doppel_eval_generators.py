@@ -7,7 +7,7 @@ from pathlib import Path
 
 from doppel_eval.events import EventFactory, SceneClock
 from doppel_eval.generators import Tier, TierConfig, generate_dataset
-from doppel_eval.scenarios import build_all_scenes, build_scene
+from doppel_eval.scenarios import build_all_scenes, build_e2e_scenes, build_scene
 
 
 def _validate(event: dict) -> None:
@@ -26,6 +26,18 @@ def test_all_scenes_are_registered_and_buildable() -> None:
     for scene in scenes:
         assert scene.case_id and scene.category
         assert len(scene.events) >= 2, f"{scene.case_id} has too few events"
+
+
+def test_e2e_adds_three_travel_count_scenes_without_changing_contract_set() -> None:
+    contract_ids = {scene.case_id for scene in build_all_scenes()}
+    e2e_ids = {scene.case_id for scene in build_e2e_scenes()}
+
+    assert len(contract_ids) == 11
+    assert e2e_ids - contract_ids == {
+        "travel-count-two-distinct",
+        "travel-count-repeat-same",
+        "travel-count-cancelled-plan",
+    }
 
 
 def test_scene_events_validate_against_unified_event_schema() -> None:

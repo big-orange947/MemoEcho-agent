@@ -48,7 +48,7 @@ do not consume the provider-call budget.
 ```powershell
 $env:DOPPEL_IMPORT_PATH = "D:\project\Doppel"
 $env:DOPPEL_MODEL = "deepseek-v4-flash"
-$env:DOPPEL_OPENAI_BASE_URL = "https://api.deepseek.com"
+$env:DOPPEL_OPENAI_BASE_URL = "https://api.deepseek.com/v1"
 $env:DOPPEL_SCHEMA_MODE = "json_object"
 $env:DOPPEL_MAX_TOKENS_PARAMETER = "max_tokens"
 $env:DOPPEL_THINKING = "disabled"
@@ -68,6 +68,25 @@ python -m doppel_eval e2e `
 The call-count limit is exact. Input-token preflight is deliberately conservative;
 provider-reported usage replaces estimates in the final report. A successful HTTP
 response is charged even when downstream domain validation rejects its content.
+Provider failures and unexpected processing errors are hard failures even when
+`--allow-quality-failures` is used. Evidence/subject mismatches rejected by Doppel's
+trusted boundary are reported separately as `safety_rejections`: they prove the
+guard worked, while still exposing extractor behavior for quality review.
+
+Travel-count E2E cases are intentionally excluded from the gold-record contract set:
+
+```powershell
+python -m doppel_eval e2e `
+  --cases travel-count-two-distinct,travel-count-repeat-same,travel-count-cancelled-plan `
+  --max-scenes 3 `
+  --max-calls 4 `
+  --max-output-per-call 1024 `
+  --out data\doppel\e2e-travel-count.json
+```
+
+Their query audit includes `count_status`, `count_value`,
+`distinct_event_keys`, and `count_ok`. A scene cannot pass merely because a trip
+was recalled; the distinct stable event-key count must match the expectation.
 
 ## Live shadow modes
 

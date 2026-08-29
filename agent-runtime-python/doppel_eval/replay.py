@@ -107,8 +107,13 @@ class ReplayQueryResult:
     subject_ok: bool = True
     temporal_ok: bool = True
     evidence_ok: bool = True
+    evidence_spans_multiple_hits: bool = False
     forbidden_evidence_ok: bool = True
     ambiguous_ok: bool = True
+    count_status: str = "not_requested"
+    count_value: int | None = None
+    distinct_event_keys: list[str] = field(default_factory=list)
+    count_ok: bool = True
     leakage: bool = False
     recalled_ids: list[str] = field(default_factory=list)
     latency_ms: float = 0.0
@@ -149,6 +154,8 @@ class ReplaySceneResult:
             if not query.subject_ok or not query.temporal_ok or not query.evidence_ok:
                 return False
             if not query.ambiguous_ok:
+                return False
+            if not query.count_ok:
                 return False
         return True
 
@@ -341,14 +348,30 @@ async def _run_one_query(
             for record in hit_records
         ]
         evidence_sets = [set(_record_evidence_ids(record)) for record in hit_records]
-        query_result.subject_ok = not expected_subject or any(
-            subject == expected_subject for subject in subjects
+        query_result.subject_ok = not expectation.memory_expected or (
+            not expected_subject
+            or any(subject == expected_subject for subject in subjects)
         )
-        query_result.temporal_ok = not expected_temporal or any(
-            temporal == expected_temporal for temporal in temporals
+        query_result.temporal_ok = not expectation.memory_expected or (
+            not expected_temporal
+            or any(temporal == expected_temporal for temporal in temporals)
         )
-        query_result.evidence_ok = not expected_evidence or any(
+        evidence_union = set().union(*evidence_sets) if evidence_sets else set()
+        single_record_evidence_ok = any(
             expected_evidence <= evidence for evidence in evidence_sets
+        )
+        query_result.evidence_spans_multiple_hits = bool(
+            expected_evidence
+            and expected_evidence <= evidence_union
+            and not single_record_evidence_ok
+        )
+        query_result.evidence_ok = not expectation.memory_expected or (
+            not expected_evidence
+            or single_record_evidence_ok
+            or (
+                expectation.evidence_may_span_hits
+                and expected_evidence <= evidence_union
+            )
         )
         query_result.forbidden_evidence_ok = not any(
             forbidden_evidence & evidence for evidence in evidence_sets
@@ -363,6 +386,28 @@ async def _run_one_query(
         if expectation.ambiguous is not None and check_ambiguous:
             query_result.ambiguous_ok = (
                 getattr(result, "ambiguous", False) == expectation.ambiguous
+            )
+        count = getattr(result, "count", None)
+        if count is not None:
+            query_result.count_status = str(getattr(count, "status", ""))
+            query_result.count_value = getattr(count, "value", None)
+            query_result.distinct_event_keys = list(
+                getattr(count, "distinct_event_keys", []) or []
+            )
+        if expectation.expected_count_status:
+            query_result.count_ok = (
+                query_result.count_status == expectation.expected_count_status
+            )
+        if expectation.expected_count is not None:
+            query_result.count_ok = (
+                query_result.count_ok
+                and query_result.count_value == expectation.expected_count
+            )
+        if expectation.expected_distinct_event_keys is not None:
+            query_result.count_ok = (
+                query_result.count_ok
+                and len(query_result.distinct_event_keys)
+                == expectation.expected_distinct_event_keys
             )
     except Exception as exc:  # noqa: BLE001 - audit boundary
         query_result.error = f"{type(exc).__name__}: {exc}"
@@ -514,8 +559,13 @@ async def replay_scenarios(
                         "subject_ok": q.subject_ok,
                         "temporal_ok": q.temporal_ok,
                         "evidence_ok": q.evidence_ok,
+                        "evidence_spans_multiple_hits": q.evidence_spans_multiple_hits,
                         "forbidden_evidence_ok": q.forbidden_evidence_ok,
                         "ambiguous_ok": q.ambiguous_ok,
+                        "count_status": q.count_status,
+                        "count_value": q.count_value,
+                        "distinct_event_keys": q.distinct_event_keys,
+                        "count_ok": q.count_ok,
                         "leakage": q.leakage,
                         "recalled_ids": q.recalled_ids,
                         "latency_ms": q.latency_ms,

@@ -73,6 +73,17 @@ class _FakeDoppel:
 
 
 class ReplayRunnerTest(unittest.IsolatedAsyncioTestCase):
+    async def test_negative_expectation_does_not_require_subject_hit(self) -> None:
+        report = await replay_scenarios(_FakeDoppel())
+        negative = {
+            scene["case_id"]: scene
+            for scene in report["scenarios"]
+            if scene["case_id"] in {"noise-only", "agent-output"}
+        }
+
+        self.assertTrue(negative["noise-only"]["queries"][0]["subject_ok"])
+        self.assertTrue(negative["agent-output"]["queries"][0]["subject_ok"])
+
     async def test_real_extractor_evidence_objects_are_read(self) -> None:
         record = type(
             "Record",

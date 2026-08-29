@@ -33,9 +33,13 @@ class SceneExpectation:
     query_lexical: str = ""  # keyword-style query that must recall the memory
     query_now_offset_minutes: int = 0
     expected_evidence: list[str] = field(default_factory=list)
+    evidence_may_span_hits: bool = False
     forbidden_evidence: list[str] = field(default_factory=list)
     temporal_status: str = ""  # current | planned | history | ""
     ambiguous: bool | None = None
+    expected_count_status: str = ""
+    expected_count: int | None = None
+    expected_distinct_event_keys: int | None = None
 
 
 @dataclass(frozen=True)
@@ -170,12 +174,14 @@ def _explicit_correction() -> Scene:
             claim="我住在苏州",
             claim_contains="苏州",
             source_message_ids=["m4"],
-            forbidden_claims=["杭州"],
+            forbidden_claims=["我住在杭州"],
             query="我住在哪个城市？",
             query_lexical="苏州",
             query_now_offset_minutes=120,
             expected_evidence=["m4"],
-            forbidden_evidence=["m2"],
+            # The old statement remains valid provenance for an explicit
+            # correction; it must not survive as an active current claim.
+            forbidden_evidence=[],
             temporal_status="current",
         )
     ]
@@ -209,7 +215,7 @@ def _subject_retraction() -> Scene:
             claim="我本人没有花生过敏",
             claim_contains="花生",
             source_message_ids=["m3"],
-            forbidden_claims=["过敏的是我朋友"],
+            forbidden_claims=["他花生过敏"],
             query="我对花生过敏吗？",
             query_lexical="花生",
             query_now_offset_minutes=60,
@@ -438,22 +444,24 @@ def _temporal_lifecycle() -> Scene:
         SceneExpectation(
             memory_expected=True,
             subject="owner",
-            claim="我下周去北京开会",
-            claim_contains="北京",
-            source_message_ids=["m2", "m5"],
+            claim="下周会议取消并改为线上",
+            claim_contains="线上",
+            source_message_ids=["m5"],
             forbidden_claims=[],
             query="我下周要去哪开会？",
-            query_lexical="北京",
+            query_lexical="线上",
             query_now_offset_minutes=(60 * 24 * 2) + 30,
             expected_evidence=["m5"],
-            forbidden_evidence=["m2"],
-            temporal_status="current",
+            # The cancelled plan is relevant provenance for the revision. The
+            # contract is that it no longer survives as an active plan.
+            forbidden_evidence=[],
+            temporal_status="historical",
         )
     ]
     return Scene(
         case_id="temporal-lifecycle",
         category="temporal",
-        description="计划（下周去北京）→ 显式取消并改为线上：当前值应更新，旧计划保留为历史",
+        description="计划（下周去北京）→ 显式取消并改为线上：旧计划不得继续作为活跃计划召回",
         events=events,
         expectations=expectations,
     )
@@ -479,6 +487,7 @@ def _replay_idempotence() -> Scene:
             query_lexical="年糕",
             query_now_offset_minutes=30,
             expected_evidence=["m1", "m3"],
+            evidence_may_span_hits=True,
             forbidden_evidence=[],
             temporal_status="current",
         )
@@ -490,6 +499,107 @@ def _replay_idempotence() -> Scene:
         events=events,
         expectations=expectations,
     )
+
+
+def _two_distinct_trips() -> Scene:
+    factory = EventFactory(
+        self_id=SELF_ID,
+        clock=SceneClock(Scene("", "", "").base_time),
+        case_id="travel-count-two-distinct",
+    )
+    events = [
+        factory.owner("去年国庆我去杭州旅游了五天，还逛了西湖", offset=0),
+        factory.contact("杭州秋天挺舒服的", offset=3),
+        factory.owner("今年五月我又去成都旅行了一周，吃了很多火锅", offset=10),
+    ]
+    return Scene(
+        case_id="travel-count-two-distinct",
+        category="episode_count",
+        description="两次不同时间和地点的已完成旅行应形成两个稳定 event_key，计数为 2",
+        events=events,
+        expectations=[
+            SceneExpectation(
+                memory_expected=True,
+                subject="owner",
+                claim_contains="杭州",
+                query="我一共旅行了几次？",
+                expected_count_status="exact",
+                expected_count=2,
+                expected_distinct_event_keys=2,
+            )
+        ],
+    )
+
+
+def _same_trip_repeated() -> Scene:
+    factory = EventFactory(
+        self_id=SELF_ID,
+        clock=SceneClock(Scene("", "", "").base_time),
+        case_id="travel-count-repeat-same",
+    )
+    events = [
+        factory.owner("去年国庆我去杭州旅游了五天", offset=0),
+        factory.contact("你在杭州去了哪里？", offset=3),
+        factory.owner("还是去年国庆那次杭州旅行，我去了西湖和灵隐寺", offset=8),
+    ]
+    return Scene(
+        case_id="travel-count-repeat-same",
+        category="episode_count",
+        description="同一次杭州旅行被重复描述时可绑定多条证据，但只能计数一次",
+        events=events,
+        expectations=[
+            SceneExpectation(
+                memory_expected=True,
+                subject="owner",
+                claim_contains="杭州",
+                query="我一共旅行了几次？",
+                expected_count_status="exact",
+                expected_count=1,
+                expected_distinct_event_keys=1,
+                expected_evidence=["m1", "m3"],
+            )
+        ],
+    )
+
+
+def _cancelled_trip_not_counted() -> Scene:
+    factory = EventFactory(
+        self_id=SELF_ID,
+        clock=SceneClock(Scene("", "", "").base_time),
+        case_id="travel-count-cancelled-plan",
+    )
+    events = [
+        factory.owner("我计划下个月去北京旅行四天", offset=0),
+        factory.contact("机票订好了吗？", offset=3),
+        factory.owner("北京行程已经取消了，我最后没有去成", offset=8),
+    ]
+    return Scene(
+        case_id="travel-count-cancelled-plan",
+        category="episode_count",
+        description="计划后明确取消且未成行，不得生成已完成 episode，旅行计数为 0",
+        events=events,
+        expectations=[
+            SceneExpectation(
+                memory_expected=False,
+                subject="owner",
+                claim_contains="北京",
+                query="我一共旅行了几次？",
+                expected_count_status="exact",
+                expected_count=0,
+                expected_distinct_event_keys=0,
+            )
+        ],
+    )
+
+
+def build_e2e_scenes() -> list[Scene]:
+    """Contract scenes plus LLM-only extraction/count scenes."""
+    return [
+        *build_all_scenes(),
+        _two_distinct_trips(),
+        _same_trip_repeated(),
+        _cancelled_trip_not_counted(),
+    ]
 
 
 def _kebab(name: str) -> str:

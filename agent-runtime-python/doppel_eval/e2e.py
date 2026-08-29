@@ -24,7 +24,7 @@ from doppel_eval.replay import (
     _status_value,
     _unified,
 )
-from doppel_eval.scenarios import Scene, build_all_scenes
+from doppel_eval.scenarios import Scene, build_e2e_scenes
 
 
 async def run_e2e(
@@ -82,14 +82,21 @@ async def run_e2e(
         await provider.aclose()
 
     passed = sum(1 for report in scenario_reports if report["passed"])
-    hard_failures = sum(
+    query_hard_failures = sum(
         1
         for report in scenario_reports
         for query in report["queries"]
         if query["error"] or query["leakage"] or query["forbidden_hit"]
     )
+    unexpected_processing_errors = sum(
+        report["unexpected_processing_errors"] for report in scenario_reports
+    )
+    safety_rejections = sum(
+        report["safety_rejections"] for report in scenario_reports
+    )
+    hard_failures = query_hard_failures + unexpected_processing_errors
     return {
-        "runner": "doppel.e2e.v1",
+        "runner": "doppel.e2e.v2",
         "generated_at": datetime.now(UTC).isoformat(),
         "mode": "synthetic-llm-e2e",
         "label": (
@@ -109,13 +116,17 @@ async def run_e2e(
             "completed_scenarios": len(scenario_reports),
             "passed_scenarios": passed,
             "hard_failures": hard_failures,
+            "query_hard_failures": query_hard_failures,
+            "unexpected_processing_errors": unexpected_processing_errors,
+            "safety_rejections": safety_rejections,
+            "provider_errors": ledger.provider_errors,
             "stopped_by_budget": stopped,
             "provider_calls": ledger.calls_attempted,
             "cache_hits": ledger.cache_hits,
             "total_tokens": ledger.total_tokens,
         },
         "gate": {
-            "ok": hard_failures == 0 and not stopped,
+            "ok": hard_failures == 0 and ledger.provider_errors == 0 and not stopped,
             "strict_passed": (
                 len(scenario_reports) == len(selected)
                 and all(report["passed"] for report in scenario_reports)
@@ -130,7 +141,7 @@ async def run_e2e(
 def _select_scenes(case_ids: list[str] | None, max_scenes: int) -> list[Scene]:
     if max_scenes < 1:
         raise ValueError("max_scenes must be positive")
-    scenes = build_all_scenes()
+    scenes = build_e2e_scenes()
     if case_ids:
         requested = set(case_ids)
         scenes = [scene for scene in scenes if scene.case_id in requested]
@@ -189,7 +200,7 @@ async def _run_scene(
                         "proposals": len(result.proposals),
                         "writes": _write_status_counts(result.write_results),
                         "errors": [
-                            str(getattr(error, "message", error))
+                            _serialize_processing_error(error)
                             for error in result.errors
                         ],
                     }
@@ -210,7 +221,7 @@ async def _run_scene(
                                 "scope": scope.describe(),
                                 "stage": "consolidation",
                                 "errors": [
-                                    str(getattr(error, "message", error))
+                                    _serialize_processing_error(error)
                                     for error in result.errors
                                 ],
                             }
@@ -238,8 +249,20 @@ async def _run_scene(
             await client.close()
 
     serialized_queries = [_serialize_query(query) for query in queries]
-    passed = bool(serialized_queries) and all(
-        _query_passed(query) for query in serialized_queries
+    processing_errors = [
+        error
+        for item in processing
+        for error in item.get("errors", [])
+        if isinstance(error, dict)
+    ]
+    safety_rejections = sum(
+        1 for error in processing_errors if error.get("classification") == "safety"
+    )
+    unexpected_processing_errors = len(processing_errors) - safety_rejections
+    passed = (
+        bool(serialized_queries)
+        and unexpected_processing_errors == 0
+        and all(_query_passed(query) for query in serialized_queries)
     )
     return {
         "case_id": scene.case_id,
@@ -247,9 +270,26 @@ async def _run_scene(
         "description": scene.description,
         "ingested": ingested,
         "processing": processing,
+        "safety_rejections": safety_rejections,
+        "unexpected_processing_errors": unexpected_processing_errors,
         "memories": memories,
         "passed": passed,
         "queries": serialized_queries,
+    }
+
+
+def _serialize_processing_error(error: Any) -> dict[str, str]:
+    error_type = str(getattr(error, "error_type", type(error).__name__) or "")
+    return {
+        "stage": str(getattr(error, "stage", "") or ""),
+        "error_type": error_type,
+        "message": str(getattr(error, "message", error)),
+        "processor": str(getattr(error, "processor", "") or ""),
+        "classification": (
+            "safety"
+            if error_type == "PersonalMemoryEvidenceError"
+            else "unexpected"
+        ),
     }
 
 
@@ -291,6 +331,12 @@ async def _memory_snapshots(
                         "topic_key": metadata.get("topic_key", ""),
                         "temporal_status": metadata.get("temporal_status", ""),
                         "event_key": metadata.get("event_key", ""),
+                        "revision_kind": metadata.get("revision_kind", ""),
+                        "consolidation_operation": (
+                            metadata.get("consolidation", {}).get("operation", "")
+                            if isinstance(metadata.get("consolidation"), dict)
+                            else ""
+                        ),
                         "evidence_ids": evidence_ids,
                     }
                 )
@@ -311,8 +357,13 @@ def _serialize_query(query: ReplayQueryResult) -> dict[str, Any]:
         "subject_ok": query.subject_ok,
         "temporal_ok": query.temporal_ok,
         "evidence_ok": query.evidence_ok,
+        "evidence_spans_multiple_hits": query.evidence_spans_multiple_hits,
         "forbidden_evidence_ok": query.forbidden_evidence_ok,
         "ambiguous_ok": query.ambiguous_ok,
+        "count_status": query.count_status,
+        "count_value": query.count_value,
+        "distinct_event_keys": query.distinct_event_keys,
+        "count_ok": query.count_ok,
         "leakage": query.leakage,
         "recalled_ids": query.recalled_ids,
         "latency_ms": query.latency_ms,
@@ -331,4 +382,5 @@ def _query_passed(query: dict[str, Any]) -> bool:
         and query["evidence_ok"]
         and query["forbidden_evidence_ok"]
         and query["ambiguous_ok"]
+        and query["count_ok"]
     )
