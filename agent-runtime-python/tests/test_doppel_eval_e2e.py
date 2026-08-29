@@ -9,6 +9,7 @@ from unittest.mock import patch
 from doppel_eval.e2e import run_e2e
 from doppel_eval.provider import ProviderBudget
 from doppel_eval.replay import _load_doppel
+from doppel_eval.semantic import _cosine
 
 
 class _NoMemoryProvider:
@@ -228,7 +229,23 @@ class E2ERunnerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(report["summary"]["provider_calls"], 2)
         self.assertEqual(report["usage"]["total_tokens"], 210)
         self.assertEqual(report["scenarios"][0]["processing"][0]["proposals"], 0)
+        self.assertEqual(report["runner"], "doppel.e2e.v3")
+        self.assertEqual(
+            report["retrieval"],
+            {"mode": "lexical", "embedding_model": "", "index": "none"},
+        )
         self.assertTrue(report["gate"]["strict_passed"])
+
+
+class EvaluationSemanticMathTest(unittest.TestCase):
+    def test_cosine_is_domain_neutral_vector_math(self) -> None:
+        self.assertEqual(_cosine([1.0, 0.0], [1.0, 0.0]), 1.0)
+        self.assertEqual(_cosine([1.0, 0.0], [0.0, 1.0]), 0.0)
+        self.assertEqual(_cosine([0.0, 0.0], [1.0, 1.0]), 0.0)
+
+    def test_cosine_rejects_incompatible_vectors(self) -> None:
+        with self.assertRaisesRegex(ValueError, "equal non-zero dimensions"):
+            _cosine([1.0], [1.0, 2.0])
 
 
 if __name__ == "__main__":

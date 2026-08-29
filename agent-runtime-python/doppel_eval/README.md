@@ -62,7 +62,27 @@ python -m doppel_eval e2e `
   --max-input-tokens 30000 `
   --max-output-tokens 4096 `
   --max-total-tokens 34096 `
+  --retrieval-mode lexical `
   --out data\doppel\e2e-report.json
+```
+
+E2E retrieval modes are reported separately and must not be compared as though
+they were the same system:
+
+- `lexical` is the no-vector baseline. It uses domain-neutral temporal/count
+  planning and character n-gram retrieval. It intentionally contains no food,
+  work, residence, pet, color, meeting, or scenario-specific query dictionary.
+- `hybrid` adds `BAAI/bge-small-zh-v1.5` through FastEmbed. The evaluation index
+  brute-forces each tiny temporary scene to measure semantic quality; it is not a
+  production throughput claim. The production query engine itself consumes
+  bounded index-first candidates and re-loads every record from its exact trusted
+  scope before ranking.
+
+Run both baselines explicitly:
+
+```powershell
+python -m doppel_eval e2e --retrieval-mode lexical --out data\doppel\e2e-lexical.json
+python -m doppel_eval e2e --retrieval-mode hybrid  --out data\doppel\e2e-hybrid.json
 ```
 
 The call-count limit is exact. Input-token preflight is deliberately conservative;
@@ -114,7 +134,7 @@ and disable thinking for low-cost extraction runs:
 
 ```powershell
 $env:DOPPEL_MODEL = "deepseek-v4-flash"
-$env:DOPPEL_OPENAI_BASE_URL = "https://api.deepseek.com"
+$env:DOPPEL_OPENAI_BASE_URL = "https://api.deepseek.com/v1"
 $env:DOPPEL_SCHEMA_MODE = "json_object"
 $env:DOPPEL_MAX_COMPLETION_TOKENS = "1024"
 $env:DOPPEL_MAX_TOKENS_PARAMETER = "max_tokens"

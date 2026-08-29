@@ -114,6 +114,8 @@ class ReplayQueryResult:
     count_value: int | None = None
     distinct_event_keys: list[str] = field(default_factory=list)
     count_ok: bool = True
+    complete: bool = True
+    warnings: list[str] = field(default_factory=list)
     leakage: bool = False
     recalled_ids: list[str] = field(default_factory=list)
     latency_ms: float = 0.0
@@ -298,6 +300,7 @@ async def _run_one_query(
     logical_ids: dict[str, str],
     *,
     check_ambiguous: bool = True,
+    semantic_index: Any | None = None,
 ) -> ReplayQueryResult:
     started = time.perf_counter()
     query_result = ReplayQueryResult(
@@ -314,8 +317,11 @@ async def _run_one_query(
             query_text,
             query_scopes,
             now=query_now,
+            semantic_index=semantic_index,
         )
         hits = getattr(result, "hits", []) or []
+        query_result.complete = bool(getattr(result, "complete", True))
+        query_result.warnings = list(getattr(result, "warnings", []) or [])
         hit_contents = [_hit_content(h) for h in hits]
         hit_records = [_hit_record(h) for h in hits]
         query_result.recalled_ids = [_hit_id(h) for h in hits]
@@ -566,6 +572,8 @@ async def replay_scenarios(
                         "count_value": q.count_value,
                         "distinct_event_keys": q.distinct_event_keys,
                         "count_ok": q.count_ok,
+                        "complete": q.complete,
+                        "warnings": q.warnings,
                         "leakage": q.leakage,
                         "recalled_ids": q.recalled_ids,
                         "latency_ms": q.latency_ms,

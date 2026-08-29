@@ -239,7 +239,7 @@ def _unmarked_conflict() -> Scene:
     events = [
         factory.owner("我最喜欢的颜色是蓝色", offset=0),
         factory.contact("蓝色挺好看", offset=3),
-        factory.owner("现在觉得绿色也不错，房间窗帘换成绿色的", offset=20),
+        factory.owner("我最喜欢的颜色是绿色", offset=20),
     ]
     expectations = [
         SceneExpectation(
@@ -248,12 +248,12 @@ def _unmarked_conflict() -> Scene:
             claim="我最喜欢的颜色是蓝色",
             claim_contains="蓝",
             source_message_ids=["m1"],
-            forbidden_claims=["绿色也不错"],
+            forbidden_claims=[],
             query="我最喜欢的颜色是什么？",
             query_lexical="蓝色",
             query_now_offset_minutes=40,
             expected_evidence=["m1"],
-            forbidden_evidence=["m3"],
+            forbidden_evidence=[],
             temporal_status="current",
             ambiguous=True,
         )

@@ -12,9 +12,10 @@ import logging
 import tempfile
 import time
 from collections import Counter
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 from app.integrations.doppel.bridge import bridge_payload
 from app.schemas.events import UnifiedEvent

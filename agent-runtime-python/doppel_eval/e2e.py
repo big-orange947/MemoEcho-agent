@@ -6,7 +6,7 @@ import tempfile
 from collections import defaultdict
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from app.integrations.doppel.bridge import bridge_payload
 from doppel_eval.provider import (
@@ -25,6 +25,10 @@ from doppel_eval.replay import (
     _unified,
 )
 from doppel_eval.scenarios import Scene, build_e2e_scenes
+from doppel_eval.semantic import (
+    FastEmbedEvaluationEncoder,
+    FastEmbedEvaluationSemanticIndex,
+)
 
 
 async def run_e2e(
@@ -40,6 +44,8 @@ async def run_e2e(
     cache_dir: Path | None = None,
     case_ids: list[str] | None = None,
     max_scenes: int = 10,
+    retrieval_mode: Literal["lexical", "hybrid"] = "lexical",
+    embedding_model: str = "BAAI/bge-small-zh-v1.5",
 ) -> dict[str, Any]:
     """Run bounded synthetic scenes through real extraction and deterministic merge."""
     if not model.strip():
@@ -68,12 +74,24 @@ async def run_e2e(
         dm.PersonalMemoryMinerConfig(page_size=200, max_messages=500),
     )
     consolidator = dm.DeterministicMemoryConsolidator()
+    semantic_encoder = (
+        FastEmbedEvaluationEncoder(embedding_model)
+        if retrieval_mode == "hybrid"
+        else None
+    )
     selected = _select_scenes(case_ids, max_scenes)
     scenario_reports: list[dict[str, Any]] = []
     stopped = False
     try:
         for scene in selected:
-            report = await _run_scene(dm, scene, miner, consolidator, ledger)
+            report = await _run_scene(
+                dm,
+                scene,
+                miner,
+                consolidator,
+                ledger,
+                semantic_encoder=semantic_encoder,
+            )
             scenario_reports.append(report)
             if ledger.stopped_reason:
                 stopped = True
@@ -96,7 +114,7 @@ async def run_e2e(
     )
     hard_failures = query_hard_failures + unexpected_processing_errors
     return {
-        "runner": "doppel.e2e.v2",
+        "runner": "doppel.e2e.v3",
         "generated_at": datetime.now(UTC).isoformat(),
         "mode": "synthetic-llm-e2e",
         "label": (
@@ -109,6 +127,15 @@ async def run_e2e(
             "schema_mode": schema_mode,
             "thinking": thinking,
             "api_key_persisted": False,
+        },
+        "retrieval": {
+            "mode": retrieval_mode,
+            "embedding_model": embedding_model if semantic_encoder is not None else "",
+            "index": (
+                "evaluation-only brute-force semantic quality oracle"
+                if semantic_encoder is not None
+                else "none"
+            ),
         },
         "usage": ledger.report(),
         "summary": {
@@ -157,10 +184,17 @@ async def _run_scene(
     miner: Any,
     consolidator: Any,
     ledger: ProviderUsageLedger,
+    *,
+    semantic_encoder: FastEmbedEvaluationEncoder | None,
 ) -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix="doppel-e2e-") as tmp:
         client = dm.DoppelClient(
             backend="sqlite", database=str(Path(tmp) / "e2e.sqlite3")
+        )
+        semantic_index = (
+            FastEmbedEvaluationSemanticIndex(dm, client.store, semantic_encoder)
+            if semantic_encoder is not None
+            else None
         )
         ingested = 0
         processing: list[dict[str, Any]] = []
@@ -242,6 +276,7 @@ async def _run_scene(
                             "natural",
                             logical_ids,
                             check_ambiguous=True,
+                            semantic_index=semantic_index,
                         )
                     )
                 memories = await _memory_snapshots(dm, client, query_scopes.values())
@@ -364,6 +399,8 @@ def _serialize_query(query: ReplayQueryResult) -> dict[str, Any]:
         "count_value": query.count_value,
         "distinct_event_keys": query.distinct_event_keys,
         "count_ok": query.count_ok,
+        "complete": query.complete,
+        "warnings": query.warnings,
         "leakage": query.leakage,
         "recalled_ids": query.recalled_ids,
         "latency_ms": query.latency_ms,

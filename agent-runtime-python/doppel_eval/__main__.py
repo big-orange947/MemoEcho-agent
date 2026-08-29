@@ -123,6 +123,17 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     e2e.add_argument("--max-total-tokens", type=int, default=90_240)
     e2e.add_argument("--max-output-per-call", type=int, default=1_024)
     e2e.add_argument(
+        "--retrieval-mode",
+        choices=("lexical", "hybrid"),
+        default="lexical",
+        help="lexical baseline or domain-neutral local embedding hybrid",
+    )
+    e2e.add_argument(
+        "--embedding-model",
+        default="BAAI/bge-small-zh-v1.5",
+        help="FastEmbed model used only by --retrieval-mode hybrid",
+    )
+    e2e.add_argument(
         "--cache-dir", type=Path, default=Path("data/doppel/e2e-cache")
     )
     e2e.add_argument("--out", type=Path, default=None, help="report JSON output")
@@ -267,6 +278,8 @@ def main(argv: list[str] | None = None) -> int:
                         item.strip() for item in args.cases.split(",") if item.strip()
                     ],
                     max_scenes=args.max_scenes,
+                    retrieval_mode=args.retrieval_mode,
+                    embedding_model=args.embedding_model,
                 )
             )
         except (TypeError, ValueError) as exc:
