@@ -115,12 +115,28 @@ $env:GRAPHITI_LIVE_EVOLUTION_CONFIRM = "YES"
 
 python -m doppel_eval graphiti-evolution `
   --cache-dir data\doppel\graphiti-evolution-cache `
+  --answers `
+  --answer-cache-dir data\doppel\graphiti-answer-cache `
   --out data\doppel\graphiti-evolution-live.json
 ```
 
 For PowerShell, convert the secure value only in the current process before the
 command and clear all provider/confirmation variables afterward. Do not put a
 real key in a script, `.env`, report, or command-line argument.
+
+With `--answers`, the report keeps three layers separate:
+
+- raw Graphiti candidates and Doppel-ranked hits: top-1 accuracy, MRR,
+  precision/recall at 1/3/5, forbidden hits, and mean candidate count;
+- the normal Doppel temporal/provenance/scope gates;
+- a host-level structured answerer that receives only the top three evidence
+  records, must cite supplied memory IDs, and must abstain when the graph returns
+  candidates that do not answer an unknown personal attribute.
+
+Answer generation remains outside Doppel's public API. The evaluator uses a generic
+evidence-only instruction and case-level gold assertions; it does not add residence,
+travel, employment, health, or other domain rules to retrieval. Passing this small
+synthetic suite is a regression baseline, not a claim of broad answer quality.
 
 ## Budgeted LLM E2E
 

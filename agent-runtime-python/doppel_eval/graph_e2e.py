@@ -521,6 +521,16 @@ async def _run_queries(
                 "expected_ids": sorted(expected),
                 "graph_candidate_ids": graph_ids,
                 "query_hit_ids": query_ids,
+                "ranked_query_hits": [
+                    {
+                        "memory_id": item.record.memory_id,
+                        "score": item.score,
+                        "lexical_score": item.lexical_score,
+                        "semantic_score": item.semantic_score,
+                        "reasons": item.reasons,
+                    }
+                    for item in result.hits
+                ],
                 "forbidden_graph_hits": sorted(forbidden_graph),
                 "forbidden_query_hits": sorted(forbidden_query),
                 "temporal_expectation_ok": temporal_ok,

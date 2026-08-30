@@ -191,6 +191,17 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         "--out", type=Path, default=None, help="report JSON output"
     )
     evolution.add_argument(
+        "--answers",
+        action="store_true",
+        help="also run host-level evidence-only answer and abstention evaluation",
+    )
+    evolution.add_argument(
+        "--answer-cache-dir",
+        type=Path,
+        default=Path("data/doppel/graphiti-answer-cache"),
+        help="content-addressed cache for answer generation",
+    )
+    evolution.add_argument(
         "--keep-fixture",
         action="store_true",
         help="retain the two isolated Graphiti scopes for manual inspection",
@@ -365,6 +376,8 @@ def main(argv: list[str] | None = None) -> int:
                     ).strip(),
                     api_key=os.environ.get("DOPPEL_API_KEY", "").strip(),
                     cache_dir=args.cache_dir,
+                    evaluate_answers=args.answers,
+                    answer_cache_dir=args.answer_cache_dir,
                     keep_fixture=args.keep_fixture,
                 )
             )
