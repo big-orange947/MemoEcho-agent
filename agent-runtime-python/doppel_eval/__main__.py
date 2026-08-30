@@ -177,6 +177,24 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="retain the isolated live Neo4j fixture for manual inspection",
     )
+    evolution = sub.add_parser(
+        "graphiti-evolution",
+        help="real-provider multi-episode temporal evolution evaluation",
+    )
+    evolution.add_argument(
+        "--cache-dir",
+        type=Path,
+        default=Path("data/doppel/graphiti-evolution-cache"),
+        help="content-addressed provider cache",
+    )
+    evolution.add_argument(
+        "--out", type=Path, default=None, help="report JSON output"
+    )
+    evolution.add_argument(
+        "--keep-fixture",
+        action="store_true",
+        help="retain the two isolated Graphiti scopes for manual inspection",
+    )
     return parser.parse_args(argv)
 
 
@@ -316,6 +334,54 @@ def main(argv: list[str] | None = None) -> int:
                 json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
             )
         print(json.dumps(report["summary"], ensure_ascii=False, indent=2))
+        return 0 if report["gate"]["ok"] else 1
+    if args.command == "graphiti-evolution":
+        from doppel_eval.graphiti_evolution import run_graphiti_evolution
+
+        dm = _load_doppel()
+        if dm is None:
+            print(
+                "doppel_memory not importable. Set DOPPEL_IMPORT_PATH="
+                "D:/project/Doppel.",
+                file=sys.stderr,
+            )
+            return 3
+        try:
+            report = asyncio.run(
+                run_graphiti_evolution(
+                    dm,
+                    neo4j_uri=os.environ.get(
+                        "GRAPHITI_EVAL_NEO4J_URI", ""
+                    ).strip(),
+                    neo4j_user=os.environ.get(
+                        "GRAPHITI_EVAL_NEO4J_USER", ""
+                    ).strip(),
+                    neo4j_password=os.environ.get(
+                        "GRAPHITI_EVAL_NEO4J_PASSWORD", ""
+                    ),
+                    model=os.environ.get("DOPPEL_MODEL", "").strip(),
+                    base_url=os.environ.get(
+                        "DOPPEL_OPENAI_BASE_URL", ""
+                    ).strip(),
+                    api_key=os.environ.get("DOPPEL_API_KEY", "").strip(),
+                    cache_dir=args.cache_dir,
+                    keep_fixture=args.keep_fixture,
+                )
+            )
+        except (RuntimeError, TypeError, ValueError) as exc:
+            print(f"[doppel_eval] graphiti evolution failed: {exc}", file=sys.stderr)
+            return 2
+        if args.out is not None:
+            args.out.parent.mkdir(parents=True, exist_ok=True)
+            args.out.write_text(
+                json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        print(json.dumps(report["summary"], ensure_ascii=False, indent=2))
+        if not report["gate"]["ok"]:
+            print(
+                "[doppel_eval] graphiti evolution gate FAILED; see JSON report",
+                file=sys.stderr,
+            )
         return 0 if report["gate"]["ok"] else 1
     if args.command == "graphiti-probe":
         from doppel_eval.graphiti_probe import run_probe

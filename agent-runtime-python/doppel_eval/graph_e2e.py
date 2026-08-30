@@ -14,7 +14,6 @@ from types import SimpleNamespace
 from typing import Any, Literal
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
-
 GraphBackend = Literal["contract", "neo4j"]
 
 
@@ -161,6 +160,15 @@ def _queries() -> list[GraphQueryFixture]:
             assertion="a cancellation is retained as a fact, not a completed episode",
         ),
         GraphQueryFixture(
+            case_id="correction-preserves-old-time-value",
+            owner="owner-a",
+            query="2025年5月15日我在星河公司的职位是什么？",
+            now=_at("2026-06-15T12:00:00+00:00"),
+            expected_ids=("role-designer-old",),
+            forbidden_ids=("role-product-current",),
+            assertion="the old value remains available inside its validity interval",
+        ),
+        GraphQueryFixture(
             case_id="correction-invalidates-old-value",
             owner="owner-a",
             query="2025年6月15日我在星河公司的职位是什么？",
@@ -262,7 +270,7 @@ async def run_graph_e2e(
     neo4j_password: str = "",
     keep_fixture: bool = False,
 ) -> dict[str, Any]:
-    """Run six temporal/isolation cases without an LLM or real chat account."""
+    """Run seven temporal/isolation cases without an LLM or real chat account."""
     if backend not in {"contract", "neo4j"}:
         raise ValueError("graph backend must be contract or neo4j")
     if backend == "neo4j" and not (
@@ -527,10 +535,10 @@ async def _run_queries(
 async def _build_live_graphiti(
     *, neo4j_uri: str, neo4j_user: str, neo4j_password: str
 ) -> Any:
+    from doppel_memory.graphiti_store import FastEmbedderClient, NoOpCrossEncoder
     from graphiti_core import Graphiti
     from graphiti_core.llm_client.client import LLMClient
     from graphiti_core.llm_client.config import LLMConfig
-    from doppel_memory.graphiti_store import FastEmbedderClient, NoOpCrossEncoder
 
     class NoNetworkLLM(LLMClient):
         def __init__(self) -> None:

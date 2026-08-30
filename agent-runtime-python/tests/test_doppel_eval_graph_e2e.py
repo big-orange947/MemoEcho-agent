@@ -19,8 +19,8 @@ class GraphE2ERunnerTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(report["runner"], "doppel.graph-e2e.v1")
         self.assertEqual(report["mode"], "contract-no-network")
-        self.assertEqual(report["summary"]["scenarios"], 6)
-        self.assertEqual(report["summary"]["passed_scenarios"], 6)
+        self.assertEqual(report["summary"]["scenarios"], 7)
+        self.assertEqual(report["summary"]["passed_scenarios"], 7)
         self.assertEqual(report["summary"]["scope_leakage_failures"], 0)
         self.assertEqual(report["usage"]["llm_calls"], 0)
         self.assertEqual(report["usage"]["provider_tokens"], 0)

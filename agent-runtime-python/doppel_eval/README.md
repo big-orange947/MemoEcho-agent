@@ -60,9 +60,10 @@ python -m doppel_eval graph-e2e --backend contract `
   --out data\doppel\graph-contract.json
 ```
 
-The six cases cover permanent residence after a temporary stay, an as-of lookup
+The seven cases cover permanent residence after a temporary stay, an as-of lookup
 inside that stay, late-arriving historical evidence, a cancelled plan that must
-not become a completed episode, correction validity, and cross-owner isolation.
+not become a completed episode, correction validity both before and after the
+change, and cross-owner isolation.
 Matching in the contract double is generic character-bigram overlap; it contains
 no residence, work, travel, food, or benchmark-case query rules.
 
@@ -83,6 +84,43 @@ Each live run creates random owner scopes and removes only those exact scopes in
 from the environment and never included in the report. The live command does not
 read `OPENAI_API_KEY`/`DOPPEL_API_KEY` and its LLM client raises if anything tries
 to invoke it.
+
+## Real multi-episode Graphiti evolution
+
+After both no-provider graph modes pass, the evolution command indexes the same
+seven authoritative memories sequentially through Graphiti's real LLM extraction
+path. It then runs the temporal queries, follows every graph edge back to its
+source Episode and Doppel `memory_id`, reloads the record from the exact Store
+scope, checks raw subject identifiers are absent from Neo4j, and removes only the
+two fixed evaluation scopes.
+
+This is intentionally different from conflict classification and answer
+generation: it measures graph extraction/evolution plus Doppel's temporal
+candidate contract. Consolidator `CONFLICT` decisions and final natural-language
+answers have their own quality suites.
+
+The live command requires an explicit double switch. The API key is accepted only
+through the environment. Provider responses are content-addressed and reusable;
+the hard ceiling is 60 calls and 700,000 total tokens, with no automatic retry.
+
+```powershell
+$env:DOPPEL_IMPORT_PATH = "D:\project\Doppel"
+$env:GRAPHITI_EVAL_NEO4J_URI = "bolt://127.0.0.1:7687"
+$env:GRAPHITI_EVAL_NEO4J_USER = "neo4j"
+$env:GRAPHITI_EVAL_NEO4J_PASSWORD = "..."
+$env:DOPPEL_MODEL = "deepseek-v4-flash"
+$env:DOPPEL_OPENAI_BASE_URL = "https://api.deepseek.com"
+$env:DOPPEL_API_KEY = "..." # set interactively; never commit this value
+$env:GRAPHITI_LIVE_EVOLUTION_CONFIRM = "YES"
+
+python -m doppel_eval graphiti-evolution `
+  --cache-dir data\doppel\graphiti-evolution-cache `
+  --out data\doppel\graphiti-evolution-live.json
+```
+
+For PowerShell, convert the secure value only in the current process before the
+command and clear all provider/confirmation variables afterward. Do not put a
+real key in a script, `.env`, report, or command-line argument.
 
 ## Budgeted LLM E2E
 
