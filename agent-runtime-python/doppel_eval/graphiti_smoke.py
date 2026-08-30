@@ -13,6 +13,7 @@ passed on the CLI (avoids shell history).
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -191,6 +192,7 @@ async def run_smoke(
         base_url=base_url,
         api_key=api_key,
     )
+    await _preflight_neo4j(neo4j_uri)
 
     # Load product dependencies only after the no-cost live-provider guards pass.
     dm = _load_doppel()
@@ -370,6 +372,28 @@ def _validate_provider_activation(
     ]
     if missing:
         raise ValueError(f"live provider requires: {', '.join(missing)}")
+
+
+async def _preflight_neo4j(uri: str, *, timeout_seconds: float = 5.0) -> None:
+    """Fail fast before Graphiti's Neo4j driver starts transaction retries."""
+    from urllib.parse import urlsplit
+
+    parsed = urlsplit(str(uri or "").strip())
+    host = parsed.hostname
+    port = parsed.port or 7687
+    if not host:
+        raise ValueError("Neo4j URI must include a hostname")
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port), timeout=timeout_seconds
+        )
+    except (TimeoutError, OSError) as exc:
+        raise RuntimeError(
+            f"Neo4j preflight failed: {host}:{port} is not reachable"
+        ) from exc
+    del reader
+    writer.close()
+    await writer.wait_closed()
 
 
 def _any_hit_for(dm: Any, hits: Any, memory_id: str) -> bool:

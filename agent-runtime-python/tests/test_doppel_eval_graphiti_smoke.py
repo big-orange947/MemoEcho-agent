@@ -7,6 +7,7 @@ import unittest
 
 from doppel_eval.graphiti_smoke import (
     LIVE_CONFIRM_ENV,
+    _preflight_neo4j,
     _validate_provider_activation,
     run_smoke,
 )
@@ -55,6 +56,12 @@ class LiveGuardTest(unittest.IsolatedAsyncioTestCase):
             base_url="",
             api_key="",
         )
+
+    async def test_neo4j_preflight_fails_without_driver_retry_loop(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "Neo4j preflight failed"):
+            await _preflight_neo4j(
+                "bolt://127.0.0.1:9", timeout_seconds=0.1
+            )
 
 
 @unittest.skipUnless(
