@@ -1,0 +1,182 @@
+# =============================================================================
+# db.py - SQLite 存储层
+# -----------------------------------------------------------------------------
+# 为什么用 SQLite 而不是 MySQL:
+#   - 单人本地使用,单文件零运维,备份=拷文件;
+#   - Python 标准库 sqlite3 直接可用,不引入 ORM 复杂度;
+#   - LangGraph 的 checkpoint 也存 SQLite(由框架管理,见 agent/graph.py)。
+#
+# 表结构一览(业务数据只有 5 张表,对比 v1 的十几张状态表):
+#   conversations  会话(一个 QQ 私聊/群/桌面线程 = 一行)
+#   messages       消息历史(双方的聊天记录,agent 上下文来源)
+#   goals          目标(可选: 把命令变成"带目标的对话",由 LLM 自主推进)
+#   configs        键值配置(用户设置/模型绑定等)
+#   events         事件日志(审计与排障)
+#
+# 连接约定: 本模块只负责"建表 + 提供连接";具体的增删改查放在 services/ 下,
+# 每个 service 模块专注一张表,方便按流程阅读。
+# =============================================================================
+
+from __future__ import annotations
+
+import sqlite3
+import threading
+from pathlib import Path
+
+from .config import get_settings
+
+# 线程本地连接: 每个线程(含 FastAPI 线程池里的工作线程)持有自己的连接,
+# 避免"跨线程使用 SQLite 连接"报错。
+# 注意: 业务层全部走同步 sqlite3,线程本地化后天然线程安全。
+_local = threading.local()
+
+# 全局连接注册表(线程id -> 连接),供 close_connections 统一清理。
+_lock = threading.Lock()
+_all_connections: dict[int, sqlite3.Connection] = {}
+
+
+def _connect() -> sqlite3.Connection:
+    """创建(或复用)当前线程的数据库连接,并开启必要的 PRAGMA。"""
+    conn = getattr(_local, "connection", None)
+    if conn is not None:
+        return conn
+
+    settings = get_settings()
+    # 确保数据目录存在,否则 sqlite3.connect 会直接报错
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    db_path: Path = settings.data_dir / "memo-echo.db"
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row  # 查询结果按列名访问: row["id"]
+    # WAL 模式: 读写不互相阻塞,适合"agent 写 + 桌面端读"并发场景
+    conn.execute("PRAGMA journal_mode=WAL")
+    # 外键约束默认关闭,显式打开保证引用完整性
+    conn.execute("PRAGMA foreign_keys=ON")
+    # 并发写(agent 与桌面端同时落库)时等待而非立刻报 locked
+    conn.execute("PRAGMA busy_timeout=5000")
+
+    _local.connection = conn
+    # 登记到全局注册表(进程退出时统一关闭)
+    with _lock:
+        _all_connections[threading.get_ident()] = conn
+    return conn
+
+
+def get_connection() -> sqlite3.Connection:
+    """对外暴露当前线程的连接(供 services 层使用)。"""
+    return _connect()
+
+
+def close_connections() -> None:
+    """关闭所有线程的数据库连接(应用退出时调用)。"""
+    with _lock:
+        conns = list(_all_connections.values())
+        _all_connections.clear()
+    for conn in conns:
+        try:
+            conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def init_db() -> None:
+    """建表。应用启动时调用一次;表已存在则跳过(IF NOT EXISTS)。"""
+    conn = _connect()
+    conn.executescript(
+        """
+        -- ============================================================
+        -- conversations: 会话主表
+        -- platform: qq / desktop(桌面端线程)
+        -- external_id: QQ 号/群号,或桌面线程的本地 ID
+        -- chat_type: private(私聊) / group(群) / thread(桌面)
+        -- persona: 该会话绑定的"人设"描述(可选)
+        -- ============================================================
+        CREATE TABLE IF NOT EXISTS conversations (
+            id          TEXT PRIMARY KEY,           -- 内部稳定 ID(uuid)
+            platform    TEXT NOT NULL,              -- qq / desktop
+            chat_type   TEXT NOT NULL,              -- private / group / thread
+            external_id TEXT NOT NULL,              -- 平台侧 ID
+            title       TEXT DEFAULT '',            -- 会话标题(桌面端展示)
+            persona     TEXT DEFAULT '',            -- 人设/行为约束
+            model_name  TEXT DEFAULT '',            -- 会话级模型绑定(空=全局)
+            created_at  TEXT NOT NULL,
+            updated_at  TEXT NOT NULL,
+            UNIQUE (platform, chat_type, external_id)  -- 同一会话只存一行
+        );
+
+        -- ============================================================
+        -- messages: 消息历史(agent 上下文的唯一来源)
+        -- role: user(对方/主人) / assistant(agent 自己)
+        -- source: inbound(收到的) / outbound(发出的) / system
+        -- goal_id: 可选,标记这条消息属于哪个目标(用于进度展示)
+        -- ============================================================
+        CREATE TABLE IF NOT EXISTS messages (
+            id         TEXT PRIMARY KEY,
+            conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+            role       TEXT NOT NULL,               -- user / assistant
+            source     TEXT NOT NULL,               -- inbound / outbound / system
+            content    TEXT NOT NULL,               -- 纯文本内容
+            raw_json   TEXT DEFAULT '',             -- 原始平台载荷(排查用)
+            goal_id    TEXT DEFAULT '',             -- 关联目标(可空)
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_messages_conv_time
+            ON messages (conversation_id, created_at);
+
+        -- ============================================================
+        -- goals: 目标(可选)。把命令(如"问km几点上课转告小号")挂到会话上,
+        -- agent 自主推进,完成/放弃由 LLM 决定,不再有步骤契约。
+        -- status: active / done / abandoned
+        -- progress: LLM 维护的一句话进度(桌面端进度卡展示)
+        -- ============================================================
+        CREATE TABLE IF NOT EXISTS goals (
+            id              TEXT PRIMARY KEY,
+            conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+            objective       TEXT NOT NULL,          -- 目标原文
+            status          TEXT DEFAULT 'active',
+            progress        TEXT DEFAULT '',        -- 一句话进度摘要
+            created_at      TEXT NOT NULL,
+            updated_at      TEXT NOT NULL,
+            completed_at    TEXT DEFAULT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_goals_conv ON goals (conversation_id);
+
+        -- ============================================================
+        -- configs: 键值配置(用户设置/模型 profile 等)
+        -- ============================================================
+        CREATE TABLE IF NOT EXISTS configs (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        -- ============================================================
+        -- events: 事件日志(入站消息/命令/定时器都记一笔,便于复现与排障)
+        -- ============================================================
+        CREATE TABLE IF NOT EXISTS events (
+            id         TEXT PRIMARY KEY,
+            event_type TEXT NOT NULL,               -- message / command / timer / system
+            payload    TEXT DEFAULT '',             -- JSON 快照
+            created_at TEXT NOT NULL
+        );
+
+        -- ============================================================
+        -- scheduled_events: 定时唤醒(agent 的"等待"工具登记在这里)
+        -- agent 说"等 10 分钟再催"时: 写一行 due_at=now+600,status=pending;
+        -- 后台 Scheduler 每 1 秒轮询,到期的标记 fired 并发 timer 事件,
+        -- 该会话从 checkpoint 恢复继续跑图 —— "时间驱动"能力就靠这张表。
+        -- 重启不丢: 服务重启后 pending 记录依然有效。
+        -- ============================================================
+        CREATE TABLE IF NOT EXISTS scheduled_events (
+            id              TEXT PRIMARY KEY,
+            conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+            due_at          TEXT NOT NULL,           -- 到期时间(UTC ISO)
+            note            TEXT DEFAULT '',         -- 唤醒提示(如"等小号回复10分钟")
+            status          TEXT DEFAULT 'pending',  -- pending / fired / cancelled
+            created_at      TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_scheduled_due
+            ON scheduled_events (status, due_at);
+        """
+    )
+    conn.commit()

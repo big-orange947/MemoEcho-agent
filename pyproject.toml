@@ -1,0 +1,58 @@
+# =============================================================================
+# Memo Echo v2 - 全 Python 重写版
+# -----------------------------------------------------------------------------
+# 设计目标:
+#   1. 从"任务执行器"回归"对话助手": 不再有 workflow/step/dispatch 状态机,
+#      只有"会话 + 目标(可选)",由 LangGraph 单图驱动 LLM 自主推进。
+#   2. 全部 Python,能交给 LangChain/LangGraph 的部分全部交给框架。
+#   3. 单进程 asyncio 承载: QQ 桥(NapCat) + 桌面端 API + 代理执行。
+#   4. 单一存储: SQLite(业务数据) + LangGraph SqliteSaver(checkpoint 恢复点)。
+#
+# 为什么这样设计(供理解):
+#   - LangGraph 的 checkpoint 天然解决"事件驱动恢复": 任何新消息进来,
+#     从 checkpoint 恢复会话状态再次跑图,不再需要 dispatch/lease/requeue。
+#   - 工具用 LangChain @tool,LLM 用 bind_tools 自主选择,不预设步骤。
+# =============================================================================
+
+[project]
+name = "memo-echo"
+version = "2.0.0"
+description = "Memo Echo v2 - Python + LangGraph 对话助手"
+requires-python = ">=3.12"
+dependencies = [
+    # ---- Web 框架: 桌面端 API + SSE 推送 ----
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+
+    # ---- 代理框架: LangGraph 单图 + checkpoint ----
+    "langgraph>=0.2.60",
+    "langgraph-checkpoint-sqlite>=2.0.0",
+    "aiosqlite>=0.20",  # AsyncSqliteSaver 的异步 SQLite 驱动(图在 asyncio 中执行)
+    "langchain-core>=0.3.40",
+
+    # ---- LLM 接入: OpenAI 兼容协议(DeepSeek/通义等) ----
+    "langchain-openai>=0.2.14",
+
+    # ---- 配置与数据 ----
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "pyyaml>=6.0",
+
+    # ---- 网络: QQ 桥(NapCat OneBot HTTP/WS) ----
+    "httpx>=0.27",
+    "websockets>=13.0",
+]
+
+[project.scripts]
+memo-echo = "app.main:cli"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"

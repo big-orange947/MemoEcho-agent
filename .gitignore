@@ -45,6 +45,9 @@ desktop.ini
 *.temp
 .runtime/
 scripts/local-env.ps1
-agent-runtime-python/data/*.sqlite3
-agent-runtime-python/data/*.sqlite3-*
-services-java/*/data/
+
+# v2 runtime data: SQLite 业务库、LangGraph checkpoint、媒体缓存
+# （数据可不入库；如需备份请单独拷 data/ 目录）
+data/
+*.sqlite3
+*.sqlite3-*
