@@ -94,6 +94,19 @@ class Settings(BaseSettings):
     # 上游用 GET /api/reports/subscribe 挂起等待新消息,避免空转轮询。
     notify_poll_seconds: int = 25
 
+    # ---------------------------------------------------------------- 上报出口
+    # 上报消息的投递渠道(逗号分隔):
+    #   db —— 只入队,等上游来 claim(默认;"什么都不做"的安全选项)
+    #   qq —— 额外转发到 alert_forward_target 指定的会话(本机自闭环,不依赖上游)
+    # 注意: 启用 qq 后,**本地就是队列的消费者** —— 上游不会再看到这些记录
+    # (否则同一件事会被报两遍)。要交给上游就把这里改回 db。
+    alert_sinks: str = "db"
+    # qq 出口的转发目标: "private:123456" / "group:789012" / "123456"(默认私聊)
+    alert_forward_target: str = ""
+    # 单会话每小时最多主动上报多少条(normal/digest;urgent 与请示不受限)。
+    # 防话痨群刷屏;超限的**暂缓**而不是丢弃,下一轮继续送。
+    alert_max_per_hour: int = 10
+
     model_config = SettingsConfigDict(
         # 允许从 .env 文件读取(与 local-env.ps1 二选一,二选一即可)
         env_file=".env",

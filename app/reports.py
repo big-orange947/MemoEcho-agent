@@ -244,6 +244,43 @@ def ack(record_id: str, *, claimed_by: str = "") -> bool:
     return _finish(record_id, STATUS_ACKED, claimed_by=claimed_by)
 
 
+def release(record_id: str, *, reason: str = "") -> bool:
+    """把已认领的记录放回 pending(本地 sink 暂缓投递时用)。
+
+    与 drop 的区别: drop 是"决定了不报",release 是"现在不报、等会儿再报"。
+    租约到期也会自动回到 pending,但限流是**有意为之的等待** ——
+    主动释放能让它下一轮就重新被考虑,而不是干等满租约。
+    """
+    conn = get_connection()
+    row = conn.execute("SELECT * FROM report_queue WHERE id=?", (record_id,)).fetchone()
+    if row is None:
+        return False
+    payload = dict(_decode(dict(row)).get("payload") or {})
+    if reason:
+        payload["deferred_reason"] = reason
+    conn.execute(
+        "UPDATE report_queue SET status=?, claimed_by='', lease_expires_at='', payload=?, updated_at=?"
+        " WHERE id=?",
+        (STATUS_PENDING, json.dumps(payload, ensure_ascii=False), _now(), record_id),
+    )
+    conn.commit()
+    return True
+
+
+def count_delivered_since(conversation_id: str, since: str) -> int:
+    """统计某会话自 since 起已投递(ack)的上报条数 —— 限流判定的依据。
+
+    为什么按 acked_at 而不是 created_at: 要限的是"这段时间打扰了号主几次",
+    投递时刻才反映打扰。
+    """
+    row = get_connection().execute(
+        "SELECT COUNT(*) AS n FROM report_queue WHERE conversation_id=? AND status=?"
+        " AND acked_at >= ?",
+        (conversation_id, STATUS_ACKED, since),
+    ).fetchone()
+    return int(row["n"] or 0) if row is not None else 0
+
+
 def drop(record_id: str, *, claimed_by: str = "", reason: str = "") -> bool:
     """放弃这条上报(上游判断不重要,不值得打扰人)。"""
     return _finish(record_id, STATUS_DROPPED, claimed_by=claimed_by, reason=reason)

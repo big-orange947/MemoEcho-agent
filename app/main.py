@@ -32,6 +32,7 @@ from langchain_openai import ChatOpenAI
 from . import memory as memory_layer
 from . import recorder
 from . import reports as reports_service
+from . import sinks as sinks_service
 from .api import dispatch as dispatch_api
 from .api import reports as reports_api
 from .api import routes as api_routes
@@ -104,21 +105,31 @@ def create_app() -> FastAPI:
     reports_reviewer = reports_service.build_default_reviewer(llm_factory)
 
     # 4c. 上报队列后台 worker
-    #     每隔一段时间做三件事(都在 app/reports.py 里,这里只负责定时触发):
+    #     每隔一段时间做四件事(前三件在 app/reports.py、第四件在 app/sinks.py,
+    #     这里只负责定时触发):
     #       ① 复核候选并把它们提升为可消费状态(攒够批或超时);
     #       ② 回收过期租约(上游认领后崩了 → 消息回队列,不丢);
-    #       ③ 清理已处理的历史记录(队列不无限增长)。
+    #       ③ 清理已处理的历史记录(队列不无限增长);
+    #       ④ 把待投递的记录送到配置的出口(qq 转发;未配置时什么也不做)。
     async def reports_worker() -> None:
         while True:
             try:
                 await asyncio.sleep(REPORTS_WORKER_INTERVAL)
                 await reports_service.flush_candidates(reviewer=reports_reviewer)
                 reports_service.reap_expired()
+                await sinks_service.deliver_pending(send=alert_forward_sender)
                 reports_service.purge_resolved()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - 后台任务不能因单次异常退出
                 print(f"[reports] worker 异常: {type(exc).__name__}: {exc}")
+
+    # 4d. 上报出口的投递函数(把通知发到指定的 QQ 会话)
+    #     走 outbox 统一投递: 先落库(这条通知也进目标会话的历史),再发送 ——
+    #     与"agent 回复"走同一条路径,不另开一套发送逻辑。
+    async def alert_forward_sender(conversation_id: str, text: str) -> bool:
+        result = await outbox.deliver(conversation_id, text, source="alert")
+        return bool(result.get("ok"))
 
     # 5. 发送器: 把 agent 的回复路由到正确渠道
     async def sender(conversation_id: str, text: str, source: str) -> dict[str, Any] | None:
