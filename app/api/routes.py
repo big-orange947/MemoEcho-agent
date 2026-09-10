@@ -19,10 +19,12 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException
 
-from ..agent.graph import AgentGraph
+from ..agent.graph import ConversationBusyError
+from ..agent.runtime import get_graph
 from ..config import get_settings
-from ..events import Event, get_bus
+from ..events import Event, EventKind, EventSource, get_bus
 from ..services import conversations as conversations_service
+from ..services import eventlog
 from ..services import goals as goals_service
 
 router = APIRouter(prefix="/api")
@@ -64,25 +66,38 @@ async def post_message(conversation_id: str, body: dict[str, Any]) -> dict[str, 
 
     请求体: {"text": "..."}
     返回: {"conversation_id": ..., "event_id": ...}(回复经 SSE 推送,不在此等待)
+
+    异常: 会话拥堵时返回 429(排队事件超限),稍后重试即可。
     """
     text = str(body.get("text") or "").strip()
     if not text:
         raise HTTPException(status_code=400, detail="text is required")
 
-    # 组装事件(platform=desktop, chat_type=thread)
+    # 会话拥堵预检: 已达排队上限就直接回 429,让调用方稍后重试 ——
+    # 比"事件被静默丢弃、用户看不到回复"要好得多。
+    graph = get_graph()
+    if graph is not None and graph.is_busy(conversation_id):
+        raise HTTPException(
+            status_code=429,
+            detail="会话繁忙,请稍后重试",
+            headers={"Retry-After": "5"},
+        )
+
+    # 组装事件(platform=desktop, chat_type=thread)。
     # 注意: 桌面端消息直接携带 conversation_id(API 路径里的 ID),
     # 避免 graph.run_event 走 ensure_conversation 另建一个随机 uuid 的新会话。
-    event = Event(
-        event_type="message",
+    event = Event.from_text(
+        text,
+        source=EventSource.DESKTOP,
+        kind=EventKind.MESSAGE,
         platform="desktop",
         chat_type="thread",
         external_id=conversation_id,
         conversation_id=conversation_id,
-        text=text,
         sender_id="desktop-user",
     )
 
-    # 发布到事件总线(AgentGraph 已注册为处理器)
+    # 发布到事件总线(审计处理器 + agent 处理器已注册)
     await get_bus().publish(event)
 
     return {"conversation_id": conversation_id, "event_id": event.event_id}
@@ -98,6 +113,10 @@ def create_goal(conversation_id: str, body: dict[str, Any]) -> dict[str, Any]:
     objective = str(body.get("objective") or "").strip()
     if not objective:
         raise HTTPException(status_code=400, detail="objective is required")
+
+    # 保底: goals 表对 conversations 有外键约束,
+    # 若该会话还没落库(桌面端首次操作就是挂目标),直接插入会失败。
+    conversations_service.ensure_conversation_by_id(conversation_id)
     return goals_service.create_goal(conversation_id, objective)
 
 
@@ -105,3 +124,29 @@ def create_goal(conversation_id: str, body: dict[str, Any]) -> dict[str, Any]:
 def list_goals(conversation_id: str) -> list[dict[str, Any]]:
     """返回会话的目标列表(进度卡数据)。"""
     return goals_service.list_goals(conversation_id)
+
+
+# ---------------------------------------------------------------------------
+# 事件审计(排障用)
+# ---------------------------------------------------------------------------
+@router.get("/events", dependencies=[Depends(_check_token)])
+def list_events(
+    conversation_id: str = "",
+    kind: str = "",
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    """查询事件审计日志(时间倒序)。
+
+    用途: 排查"消息到底收到没有/解析成什么了/为什么没回"。
+    参数:
+      conversation_id: 只看某会话(可选)
+      kind:            只看某类事件(可选,如 notice/request/message)
+      limit:           返回条数(默认 100)
+    """
+    return eventlog.list_events(conversation_id, limit=limit, kind=kind)
+
+
+@router.get("/events/stats", dependencies=[Depends(_check_token)])
+def event_stats() -> dict[str, int]:
+    """按事件类别统计条数(快速看系统都在处理什么)。"""
+    return eventlog.count_by_kind()

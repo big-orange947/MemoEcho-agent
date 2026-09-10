@@ -18,7 +18,7 @@
 
 from __future__ import annotations
 
-import uuid
+import asyncio
 from typing import Any, Awaitable, Callable
 
 import aiosqlite
@@ -40,6 +40,24 @@ from .nodes import act, finalize, ingest, reflect, retrieve, reason
 LlmFactory = Callable[[bool], BaseChatModel]      # fast: bool -> model
 Sender = Callable[[str, str, str], Awaitable[None]]  # (conversation_id, text, source)
 
+# 单个会话允许同时"在跑 + 排队"的事件数上限。
+# 多个入口(QQ 消息 / 主 agent 调度 / 定时唤醒)可能同时打到同一会话,
+# 超过上限说明该会话已经拥堵,此时应快速拒绝(返回 busy)而不是无限堆积 ——
+# 队列里排着的每一条都要跑一次 LLM,堆太多只会让回复越来越旧。
+MAX_INFLIGHT_PER_CONVERSATION = 5
+
+
+class ConversationBusyError(RuntimeError):
+    """会话繁忙: 排队事件数超过上限,本次事件未被处理。
+
+    调用方(API 层)应据此返回 429,让上游稍后重试,而不是静静丢弃。
+    """
+
+    def __init__(self, conversation_id: str, limit: int) -> None:
+        super().__init__(f"会话 {conversation_id} 繁忙(排队上限 {limit})")
+        self.conversation_id = conversation_id
+        self.limit = limit
+
 
 class AgentGraph:
     """封装一张已编译的 LangGraph 图 + 一个会话入口。"""
@@ -59,6 +77,16 @@ class AgentGraph:
         # checkpoint 连接相关状态(首次 run_event 时才创建,见 _ensure_checkpointer)
         self._saver_ready = False
         self._checkpoint_conn = None
+        # checkpoint 初始化锁: 多个会话首次并发进来时,保证只初始化一次
+        # (否则会创建多个 SQLite 连接并重复编译图)
+        self._saver_lock = asyncio.Lock()
+
+        # ---- 会话级串行化(见 run_event 注释) ----
+        # _conversation_locks: 每个会话一把锁,保证同一会话的事件按顺序执行;
+        # _inflight: 每个会话"在跑 + 排队"的事件计数,用于限流。
+        # 两个字典都按需创建、空闲时回收(见 _release_conversation)。
+        self._conversation_locks: dict[str, asyncio.Lock] = {}
+        self._inflight: dict[str, int] = {}
 
         # 编译图(编译后才能执行)。先不挂 checkpoint,见 _build_with 注释
         self.graph = self._build_with(checkpointer=None)
@@ -124,19 +152,30 @@ class AgentGraph:
 
     # ------------------------------------------------------------------ 生命周期
     async def _ensure_checkpointer(self) -> None:
-        """首次运行时创建 AsyncSqliteSaver 连接,并重新编译图(只执行一次)。"""
+        """首次运行时创建 AsyncSqliteSaver 连接,并重新编译图(只执行一次)。
+
+        并发安全: 用 _saver_lock 做双重检查 —— 多个会话首次同时进来时,
+        只有第一个真正执行初始化,其余等到锁后直接返回。
+        (若不加锁,会创建多个连接、重复编译图,连接还会泄漏。)
+        """
+        # 快路径: 已就绪直接返回(绝大多数调用走这里,不加锁开销)
         if self._saver_ready:
             return
 
-        # 此时必然运行在真实事件循环中(被 run_event 调用),可以安全 await
-        conn = await aiosqlite.connect(str(get_settings().data_dir / "checkpoints.db"))
-        saver = AsyncSqliteSaver(conn=conn)
-        await saver.setup()  # 建 checkpoint 表(幂等)
-        self._checkpoint_conn = conn
+        async with self._saver_lock:
+            # 慢路径二次检查: 等锁期间可能已被其它协程初始化完成
+            if self._saver_ready:
+                return
 
-        # 带着 saver 重新编译图(节点结构不变,只是挂上 checkpoint)
-        self.graph = self._build_with(checkpointer=saver)
-        self._saver_ready = True
+            # 此时必然运行在真实事件循环中(被 run_event 调用),可以安全 await
+            conn = await aiosqlite.connect(str(get_settings().data_dir / "checkpoints.db"))
+            saver = AsyncSqliteSaver(conn=conn)
+            await saver.setup()  # 建 checkpoint 表(幂等)
+            self._checkpoint_conn = conn
+
+            # 带着 saver 重新编译图(节点结构不变,只是挂上 checkpoint)
+            self.graph = self._build_with(checkpointer=saver)
+            self._saver_ready = True
 
     async def close(self) -> None:
         """释放 checkpoint 连接(应用退出时调用)。"""
@@ -162,19 +201,29 @@ class AgentGraph:
         """处理一个归一化事件,返回最终回复文本(可能为 None)。
 
         事件形态(与 events.Event 对齐):
-          {platform, chat_type, external_id, text, sender_id, is_self, event_id, ...}
+          {kind, source, platform, chat_type, external_id, text, sender_id, is_self, ...}
 
         流程:
-          1. 定位会话(查库/新建),得到 conversation_id;
-          2. 用 conversation_id 作 thread_id 恢复 checkpoint;
-          3. 预置 state: conversation_id + event + 空工作记忆;
-          4. 跑图,取最终回复。
-        """
-        # ---- 0. 确保 checkpoint 就绪 ----
-        # 首次事件到来时创建 AsyncSqliteSaver 并重新编译图(见 _ensure_checkpointer)
-        await self._ensure_checkpointer()
+          1. 确保 checkpoint 就绪(首次调用时惰性创建);
+          2. 定位会话(查库/新建),得到 conversation_id;
+          3. **会话级排队**: 同一会话的事件串行执行(见下方说明);
+          4. 预置 state → 跑图 → 取最终回复。
 
+        为什么要会话级串行化:
+          同一会话的所有事件都写同一份 LangGraph checkpoint(thread_id =
+          conversation_id)。若两条事件并发执行,checkpoint 会被交错写入,
+          导致上下文错乱、回复互相覆盖。加入主 agent 调度后,QQ 消息、
+          调度指令、定时唤醒三种入口完全可能同时打到同一会话,因此必须排队。
+
+        为什么要限流(MAX_INFLIGHT_PER_CONVERSATION):
+          队列里每条事件都要跑一次 LLM(数秒~数十秒)。若不设上限,
+          拥堵会话会无限堆积,回复越来越滞后且看不到尽头。
+          超过上限直接抛 ConversationBusyError,让 API 层返回 429。
+
+        异常: ConversationBusyError(会话繁忙,事件未被处理)。
+        """
         # ---- 1. 定位会话 ----
+        # 先定位会话(同步 DB 操作,很快),因为限流计数需要会话 ID。
         # 桌面端消息已携带会话 ID: 直接复用,并保底确保该行存在
         # (否则 messages 外键约束会拒绝写入);
         # QQ 消息按三元组查/建。
@@ -186,9 +235,39 @@ class AgentGraph:
         if event.get("conversation_id"):
             conversations_service.ensure_conversation_by_id(conversation_id)
 
-        # ---- 2. 构造初始 state ----
-        # LangGraph 会以 thread_id 从 checkpoint 恢复 messages 等历史,
-        # 我们只需提供"本次新增的"字段。
+        # ---- 2. 入队(计数 + 限流) ----
+        # 注意: _inflight 在等待锁**之前**自增,所以它统计的是
+        # "正在跑 + 排队中"的总数,这正是限流想要的口径。
+        # 以下三行之间没有 await,在事件循环中是原子的,不会被并发打断。
+        inflight = self._inflight.get(conversation_id, 0)
+        if inflight >= MAX_INFLIGHT_PER_CONVERSATION:
+            raise ConversationBusyError(conversation_id, MAX_INFLIGHT_PER_CONVERSATION)
+        self._inflight[conversation_id] = inflight + 1
+
+        lock = self._conversation_locks.get(conversation_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._conversation_locks[conversation_id] = lock
+
+        try:
+            async with lock:
+                # ---- 3. 确保 checkpoint 就绪 ----
+                # 放在锁内(且在计数之后): 一是并发初始化由 _saver_lock 保护,
+                # 二是计数已经反映了真实排队情况 —— 若放在计数之前 await,
+                # 首次初始化期间 is_busy() 会看不到排队中的任务。
+                await self._ensure_checkpointer()
+                # ---- 4. 跑图(同一会话内串行) ----
+                return await self._run_graph(event, conversation_id)
+        finally:
+            self._release_conversation(conversation_id)
+
+    # ------------------------------------------------------------------ 内部执行
+    async def _run_graph(self, event: dict[str, Any], conversation_id: str) -> str | None:
+        """真正跑一次图(调用方已持有该会话的锁)。
+
+        构造初始 state: LangGraph 会以 thread_id 从 checkpoint 恢复
+        messages 等历史,这里只提供"本次新增的"字段。
+        """
         initial: dict[str, Any] = {
             "conversation_id": conversation_id,
             "event": event,
@@ -199,7 +278,6 @@ class AgentGraph:
             "output_text": "",
         }
 
-        # ---- 3. 跑图 ----
         result = await self.graph.ainvoke(
             initial,
             config={"configurable": {"thread_id": conversation_id}},
@@ -212,3 +290,33 @@ class AgentGraph:
             if text:
                 return text
         return None
+
+    def _release_conversation(self, conversation_id: str) -> None:
+        """出队: 递减计数;该会话彻底空闲时回收锁与计数器。
+
+        回收时机说明:
+          _inflight 在"等待锁之前"就自增,因此当它降到 0 时,
+          必然没有其它任务在跑或排队 —— 此刻移除锁是安全的
+          (若随后有新任务到来,会重新创建一把新锁,不会与旧锁上的等待者错配)。
+        """
+        remaining = self._inflight.get(conversation_id, 0) - 1
+        if remaining > 0:
+            self._inflight[conversation_id] = remaining
+            return
+
+        # 彻底空闲: 清理两个字典,避免会话数增长后内存只增不减
+        self._inflight.pop(conversation_id, None)
+        self._conversation_locks.pop(conversation_id, None)
+
+    # ------------------------------------------------------------------ 状态查询
+    def busy_conversations(self) -> dict[str, int]:
+        """返回当前有事件在跑/排队的会话及数量(供状态页与排障)。"""
+        return dict(self._inflight)
+
+    def is_busy(self, conversation_id: str) -> bool:
+        """判断某会话是否已达排队上限(API 层据此提前返回 429)。
+
+        说明: 这只是"预检",真正的上限判定在 run_event 里(权威)。
+        预检的意义是让调用方立刻拿到 429,而不是等事件被静默丢弃。
+        """
+        return self._inflight.get(conversation_id, 0) >= MAX_INFLIGHT_PER_CONVERSATION

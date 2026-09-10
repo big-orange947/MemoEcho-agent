@@ -43,6 +43,14 @@ dependencies = [
     "websockets>=13.0",
 ]
 
+[project.optional-dependencies]
+# 开发依赖: uv pip install -e ".[dev]"
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.6",
+]
+
 [project.scripts]
 memo-echo = "app.main:cli"
 
@@ -56,3 +64,15 @@ packages = ["app"]
 [tool.ruff]
 line-length = 120
 target-version = "py312"
+
+# ---------------------------------------------------------------------------
+# pytest 配置
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# asyncio_mode=auto: 异步测试函数不用每条都写 @pytest.mark.asyncio
+asyncio_mode = "auto"
+# 过滤第三方库的弃用告警(如 FastAPI 的 on_event),保持输出干净
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]

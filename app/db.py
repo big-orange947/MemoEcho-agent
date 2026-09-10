@@ -80,7 +80,11 @@ def close_connections() -> None:
 
 
 def init_db() -> None:
-    """建表。应用启动时调用一次;表已存在则跳过(IF NOT EXISTS)。"""
+    """建表。应用启动时调用一次;表已存在则跳过(IF NOT EXISTS)。
+
+    建表后执行一次轻量迁移(_migrate),为老库补齐后续版本新增的列 ——
+    避免开发期删库重建,也保证已有数据不丢。
+    """
     conn = _connect()
     conn.executescript(
         """
@@ -151,14 +155,27 @@ def init_db() -> None:
         );
 
         -- ============================================================
-        -- events: 事件日志(入站消息/命令/定时器都记一笔,便于复现与排障)
+        -- events: 事件审计日志
+        -- 每一条进入系统的事件都记一笔(不论是否需要回应)。
+        -- 用途:
+        --   1. 排障 —— "那条消息到底收到没有/解析成什么了";
+        --   2. 复盘 —— 撤回、好友申请这类"仅记录"事件也留痕;
+        --   3. 幂等排查 —— 重复推送时能看到同 event_id 出现几次。
+        -- should_respond: 1=进入了 agent 流程, 0=仅记录
+        -- summary: 人类可读的一句话描述(免去解析 payload 才能看懂)
         -- ============================================================
         CREATE TABLE IF NOT EXISTS events (
-            id         TEXT PRIMARY KEY,
-            event_type TEXT NOT NULL,               -- message / command / timer / system
-            payload    TEXT DEFAULT '',             -- JSON 快照
-            created_at TEXT NOT NULL
+            id              TEXT PRIMARY KEY,       -- 事件 ID(与 Event.event_id 一致)
+            event_type      TEXT NOT NULL,          -- 事件类别: message/notice/request/instruction/timer…
+            source          TEXT DEFAULT '',        -- 来源: qq/desktop/agent/scheduler
+            should_respond  INTEGER DEFAULT 1,      -- 是否进入 agent 流程(0/1)
+            conversation_id TEXT DEFAULT '',        -- 关联会话(可空)
+            summary         TEXT DEFAULT '',        -- 一句话描述(人类可读)
+            payload         TEXT DEFAULT '',        -- 原始载荷 JSON 快照
+            created_at      TEXT NOT NULL
         );
+        -- 注意: events 表的索引在 _migrate() 里创建 ——
+        -- 老库的 events 表可能还没有 conversation_id 列,先建索引会报错。
 
         -- ============================================================
         -- scheduled_events: 定时唤醒(agent 的"等待"工具登记在这里)
@@ -179,4 +196,48 @@ def init_db() -> None:
             ON scheduled_events (status, due_at);
         """
     )
+    conn.commit()
+
+    # 建表后补齐老库缺失的列(新增列对已有表不会自动生效)
+    _migrate(conn)
+
+
+# 迁移表: {表名: [(列名, 列定义), ...]}
+# 说明: 只用"缺什么补什么"的方式 —— SQLite 的 ADD COLUMN 是廉价操作。
+# 如果将来需要改列类型/删列,再引入正式的版本化迁移。
+_MIGRATIONS: dict[str, list[tuple[str, str]]] = {
+    # events 表在 v2 消息模型重构时扩充了审计字段
+    "events": [
+        ("source", "TEXT DEFAULT ''"),
+        ("should_respond", "INTEGER DEFAULT 1"),
+        ("conversation_id", "TEXT DEFAULT ''"),
+        ("summary", "TEXT DEFAULT ''"),
+    ],
+}
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """为已有表补齐缺失列(幂等: 已存在则跳过)。"""
+    for table, columns in _MIGRATIONS.items():
+        # PRAGMA table_info 返回该表所有列;老库可能没有这张表(新库刚建好则有)
+        existing = {
+            row[1]  # 第 1 列是列名
+            for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        if not existing:
+            continue  # 表不存在(理论上不会,建表语句在上面)
+
+        for column, definition in columns:
+            if column in existing:
+                continue
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+    # events 的索引放在补列之后创建(见建表处注释)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_events_conv_time ON events (conversation_id, created_at)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_events_type_time ON events (event_type, created_at)"
+    )
+
     conn.commit()

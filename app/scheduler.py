@@ -19,7 +19,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 
-from .events import Event, get_bus
+from .events import Event, EventKind, EventSource, get_bus
 from .services import schedules as schedules_service
 
 # 轮询间隔(秒)。1 秒的粒度对"催一下"场景完全够用
@@ -87,17 +87,23 @@ class Scheduler:
             asyncio.create_task(self._publish_timer(record))
 
     async def _publish_timer(self, record: dict[str, Any]) -> None:
-        """把一条到期记录转成 timer 事件发布(后台任务)。"""
+        """把一条到期记录转成 timer 事件发布(后台任务)。
+
+        timer 事件的关键点: should_respond=True —— 唤醒的目的就是让 agent
+        继续干活(否则 agent 只会记一条审计就结束,等待就白设了)。
+        但 kind=timer 会让 ingest 不把它写进对话历史(它不是"人说的话")。
+        """
         try:
             await get_bus().publish(
-                Event(
-                    event_type="timer",
+                Event.from_text(
+                    record["note"] or "定时唤醒",
+                    source=EventSource.SCHEDULER,
+                    kind=EventKind.TIMER,
                     platform="desktop",
                     chat_type="thread",
                     external_id=record["conversation_id"],
                     conversation_id=record["conversation_id"],
-                    # 以会话内"系统提示"的方式注入: 告诉 agent 为什么被唤醒
-                    text=record["note"] or "定时唤醒",
+                    should_respond=True,
                 )
             )
         except Exception as exc:  # noqa: BLE001 - 单个事件失败不能影响调度循环
