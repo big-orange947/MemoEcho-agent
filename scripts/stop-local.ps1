@@ -10,16 +10,25 @@
 
     与旧版不同: v2 只有一个进程,不需要按依赖顺序停止。
 
+    NapCat 的安全默认:
+      NapCat 是注入到 QQ 进程里运行的,所以"停止 NapCat" = **结束 QQ**。
+      结束 QQ 会打断你正在用的聊天窗口,因此**默认不动 QQ**;
+      只有显式指定 -StopNapCat 才会结束 QQ 进程。
+
 .PARAMETER SkipNapCat
-    不停止 NapCat(只想重启 v2 时用)。
+    兼容旧参数: 保留 NapCat 运行(等价于默认行为)。
+
+.PARAMETER StopNapCat
+    显式要求结束 NapCat(即结束所有 QQ 进程)。请确认没有正在进行的聊天。
 
 .EXAMPLE
-    .\scripts\stop-local.ps1
-    .\scripts\stop-local.ps1 -SkipNapCat
+    .\scripts\stop-local.ps1              # 只停 v2,保留 QQ
+    .\scripts\stop-local.ps1 -StopNapCat  # 连 QQ 一起结束
 #>
 [CmdletBinding()]
 param(
-    [switch]$SkipNapCat
+    [switch]$SkipNapCat,
+    [switch]$StopNapCat
 )
 
 Set-StrictMode -Version Latest
@@ -100,18 +109,22 @@ if ($listening) {
 }
 
 # ---------------------------------------------------------------------------
-# 停止 NapCat(注入了 QQ 进程,停止即结束 QQ)
+# 停止 NapCat(默认不动!)
 # ---------------------------------------------------------------------------
-if ($SkipNapCat) {
-    Write-Host "[SKIP] 已指定 -SkipNapCat,保留 NapCat 运行。"
+# NapCat 注入在 QQ 进程里,停止它 = 结束 QQ,会打断用户正在用的聊天。
+# 因此默认保留 QQ,只有显式 -StopNapCat 才结束。
+if ($SkipNapCat -or -not $StopNapCat) {
+    $qqCount = @(Get-Process -Name QQ -ErrorAction SilentlyContinue).Count
+    Write-Host "[SKIP] 保留 NapCat/QQ 运行(共 $qqCount 个 QQ 进程)。如需结束请加 -StopNapCat。"
     exit 0
 }
 
 $qqProcesses = @(Get-Process -Name QQ -ErrorAction SilentlyContinue)
 if ($qqProcesses.Count -gt 0) {
-    # NapCat 注入 QQ 进程运行;停止 = 结束 QQ。重启请用 start-local.ps1(带 QQ 号快速登录)。
+    # NapCat 注入 QQ 进程运行;停止 = 结束 QQ。
+    # 重启请用 start-local.ps1(带 QQ 号快速登录)。
     $qqProcesses | Stop-Process -Force
-    Write-Host "[STOP] NapCat (QQ $($qqProcesses.Count) 个进程)"
+    Write-Host "[STOP] NapCat / QQ ($($qqProcesses.Count) 个进程)"
 } else {
     Write-Host "[SKIP] NapCat 未在运行"
 }

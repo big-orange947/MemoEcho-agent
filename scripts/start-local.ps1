@@ -174,14 +174,51 @@ if (-not (Test-Path -LiteralPath $launcher)) {
     exit 0
 }
 
-$qqRunning = @(Get-Process -Name QQ -ErrorAction SilentlyContinue).Count -gt 0
-if ($qqRunning) {
-    Write-Step "检测到 QQ 已在运行(可能 NapCat 已注入),跳过启动。"
+# 判断 NapCat 是否真的在工作: 不能只看"QQ 进程存不存在" ——
+# QQ 可能是普通方式启动的(没有注入 NapCat),那样 3011 不会响应,
+# 此时必须提示用户重启 QQ 加载 NapCat,否则消息根本进不来。
+function Test-NapCatReady {
+    try {
+        $resp = Invoke-RestMethod -Uri "http://127.0.0.1:3011/get_login_info" -Method Post `
+            -Body "{}" -ContentType "application/json" -TimeoutSec 3
+        return ($resp.retcode -eq 0)
+    } catch {
+        return $false
+    }
+}
+
+if (Test-NapCatReady) {
+    Write-Step "NapCat 已就绪(OneBot 接口可用),无需重启。"
 } else {
+    $qqProcesses = @(Get-Process -Name QQ -ErrorAction SilentlyContinue)
+    if ($qqProcesses.Count -gt 0) {
+        # QQ 在运行但 NapCat 接口不可用 → QQ 是普通模式启动的,需要重启才能注入 NapCat
+        Write-Warning "检测到 QQ 正在运行,但 NapCat 未注入(3011 无响应)。"
+        Write-Warning "NapCat 必须由注入方式启动。请手动执行(会重启 QQ):"
+        Write-Warning "  1) .\scripts\stop-local.ps1 -StopNapCat"
+        Write-Warning "  2) 重新运行本脚本,或直接执行 $launcher $NapCatQq"
+        Write-Step "v2 已就绪;桌面端与 API 可用,QQ 通道待 NapCat 就绪。"
+        exit 0
+    }
+
     Write-Step "启动 NapCat(QQ $NapCatQq,快速登录)..."
     Start-Process -FilePath $launcher -ArgumentList $NapCatQq `
         -WorkingDirectory $napCatDir -WindowStyle Hidden
-    Write-Step "     已拉起,登录与注入需要几秒到几十秒。"
+
+    # 轮询等待 NapCat 注入完成(QQ 启动 + 登录 + 注入需要时间)
+    Write-Step "     已拉起,等待 OneBot 接口就绪(最多 45 秒)..."
+    $napDeadline = (Get-Date).AddSeconds(45)
+    while ((Get-Date) -lt $napDeadline) {
+        if (Test-NapCatReady) {
+            Write-Step "     [UP] NapCat 就绪"
+            break
+        }
+        Start-Sleep -Milliseconds 1500
+    }
+    if (-not (Test-NapCatReady)) {
+        Write-Warning "NapCat 在 45 秒内未就绪(可能需要扫码登录,或 QQ 版本不兼容)。"
+        Write-Warning "可稍后运行 .\scripts\status-local.ps1 复查。"
+    }
 }
 
 # 配置检查: 确认 NapCat 事件确实会推给 v2
