@@ -29,10 +29,11 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from langchain_openai import ChatOpenAI
 
+from .api import dispatch as dispatch_api
 from .api import routes as api_routes
 from .api import sse as sse_api
 from .agent.graph import AgentGraph, ConversationBusyError
-from .agent.runtime import set_graph
+from .agent.runtime import set_graph, set_sender
 from .bridge import onebot
 from .bridge.napcat import NapcatBridge
 from .config import get_settings
@@ -40,6 +41,7 @@ from .db import close_connections, init_db
 from .events import Event, EventKind, EventSource, get_bus, reset_bus
 from .scheduler import get_scheduler
 from .services import conversations as conversations_service
+from .services import dispatches as dispatch_service
 from .services import eventlog
 from .services import goals as goals_service
 from .tools import contacts as contacts_tools
@@ -96,8 +98,9 @@ def create_app() -> FastAPI:
 
     # 6. AgentGraph(注入依赖)
     graph = AgentGraph(llm_factory=llm_factory, tools=tools, sender=sender)
-    # 登记到全局访问点: API 路由等模块通过 get_graph() 取用(如忙碌预检)
+    # 登记到全局访问点: API 路由/outbox 等模块通过 get_graph()/get_sender() 取用
     set_graph(graph)
+    set_sender(sender)
 
     # ------------------------------------------------------------------ 事件处理器
     # ① 审计处理器: 所有事件都记一笔(含不需要回应的通知/请求/自发回显)。
@@ -121,8 +124,17 @@ def create_app() -> FastAPI:
 
         # 跑图(内部会持久化消息/更新目标/调用发送器)。
         # 事件转成可序列化字典 —— 它会进 LangGraph State 并被 checkpoint 序列化。
+        # task_id(调度任务)在事件 context 里: 执行完要回写任务状态与产物。
+        task_id = str((event.context or {}).get("task_id") or "")
         try:
-            await graph.run_event(event.to_payload())
+            if task_id:
+                dispatch_service.mark_running(task_id)
+            reply = await graph.run_event(event.to_payload())
+            if task_id:
+                dispatch_service.mark_done(
+                    task_id,
+                    {"reply": reply or "", "conversation_id": event.conversation_id},
+                )
         except ConversationBusyError as exc:
             # 会话拥堵: 丢弃本次事件并留痕(不重试 —— 重试只会让队列更长)。
             # 用户端表现为"这条消息没回",审计表里能查到原因。
@@ -138,6 +150,14 @@ def create_app() -> FastAPI:
                 ),
                 conversation_id=exc.conversation_id,
             )
+            if task_id:
+                dispatch_service.mark_busy(task_id)
+        except Exception as exc:  # noqa: BLE001 - 单次执行失败不该让事件总线崩掉
+            # 非拥堵类失败(如模型超时、工具异常): 记录日志 + 回写任务状态。
+            # 事件本身不回滚 —— ingest 可能已经落库了入站消息,保留现场更利于排查。
+            print(f"[agent] 事件处理失败 {event.event_id}: {type(exc).__name__}: {exc}")
+            if task_id:
+                dispatch_service.mark_failed(task_id, f"{type(exc).__name__}: {exc}")
 
         # 桌面端进度卡: 推送目标状态变化(如有)
         if event.conversation_id:
@@ -159,6 +179,7 @@ def create_app() -> FastAPI:
     app = FastAPI(title="Memo Echo v2")
     app.include_router(api_routes.router)
     app.include_router(sse_api.router)
+    app.include_router(dispatch_api.router)   # 外部调度入口(主 agent 派活)
 
     # 定时唤醒调度器: 启动后台任务(每秒轮询 scheduled_events,到点发 timer 事件)
     scheduler = get_scheduler()

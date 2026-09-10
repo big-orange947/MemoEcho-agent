@@ -194,6 +194,37 @@ def init_db() -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_scheduled_due
             ON scheduled_events (status, due_at);
+
+        -- ============================================================
+        -- dispatches: 外部调度任务(主 agent / 其他系统派发进来的活儿)
+        -- 场景: 主 agent 让本服务"把这条消息发到某会话"或"围绕这个指令推进"。
+        -- 设计要点:
+        --   · idempotency_key: 调用方给的幂等键 —— 重复投递不重复执行;
+        --   · status: accepted → running → done/failed/expired/busy;
+        --   · result: 结构化产物(发出了哪条消息、回复文本、错误原因);
+        --   · caller + context: 全量留痕,可追溯"谁让发的这条消息"。
+        -- ============================================================
+        CREATE TABLE IF NOT EXISTS dispatches (
+            task_id         TEXT PRIMARY KEY,
+            caller          TEXT DEFAULT '',        -- 调用方标识(审计用)
+            kind            TEXT NOT NULL,          -- handle_message / send_message / task / note
+            conversation_id TEXT DEFAULT '',        -- 目标会话(可能由三元组解析而来)
+            payload         TEXT DEFAULT '',        -- 原始请求 JSON 快照
+            status          TEXT DEFAULT 'accepted',-- accepted/running/done/failed/expired/busy
+            result          TEXT DEFAULT '',        -- 结果 JSON(产物或错误)
+            error           TEXT DEFAULT '',        -- 失败原因(人类可读)
+            idempotency_key TEXT DEFAULT '',        -- 幂等键(去重用)
+            deadline        TEXT DEFAULT '',        -- 期望完成时间(UTC ISO)
+            result_mode     TEXT DEFAULT 'none',    -- poll / callback / none
+            callback_url    TEXT DEFAULT '',        -- result_mode=callback 时的回调地址
+            created_at      TEXT NOT NULL,
+            updated_at      TEXT NOT NULL
+        );
+        -- 幂等键去重(部分唯一索引: 空字符串不参与,允许多条无键任务)
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_dispatches_idem
+            ON dispatches (idempotency_key) WHERE idempotency_key != '';
+        CREATE INDEX IF NOT EXISTS idx_dispatches_status
+            ON dispatches (status, created_at);
         """
     )
     conn.commit()
