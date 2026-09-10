@@ -1,56 +1,86 @@
 # =============================================================================
-# tools/messaging.py - 消息发送工具
+# tools/messaging.py - 消息发送工具(给"其他人"发消息)
 # -----------------------------------------------------------------------------
-# 让 LLM 可以"主动给其他人发消息"(比如转告小号、催问别人)。
-# 注意: 回复"当前会话"不需要这个工具 —— finalize 节点统一发送,
-# 避免 LLM 自己调发送工具造成重复/错乱(这是 v1 踩过的坑)。
+# 用途: 让 LLM 主动给别人发消息 —— 这是"转告/帮问"类任务的核心能力
+#       (如"问小号今晚几点上课,然后转告 km")。
 #
-# 工具通过依赖注入拿到"发送器"(main.py 注入 QQ 桥/桌面端实现),
-# 这样本模块不直接依赖 NapCat,方便测试和替换渠道。
+# 与 finalize 的分工:
+#   · 回复**当前会话** → 由 finalize 节点统一发送,LLM 不用也不该自己调工具
+#     (v1 踩过坑: 模型自己发导致重复/错乱);
+#   · 发给**其他联系人** → 必须用本工具,因为 finalize 只认当前会话。
+#
+# 为什么是 async 工具:
+#   发送是异步 IO。LangGraph 执行同步节点时会把它丢进线程池 ——
+#   线程池里没有事件循环,任何"猜事件循环"的写法(如 get_running_loop)
+#   都会失败。所以工具本身定义为 async,由 act 节点用 ainvoke 调用。
+#
+# 为什么用注入而不是直接 import NapCat:
+#   保持工具层与渠道解耦: 测试时可注入假发送器;
+#   将来加微信等渠道也不用改这个文件。
 # =============================================================================
 
 from __future__ import annotations
 
-from typing import Any, Callable, Coroutine
+from typing import Any, Awaitable, Callable
 
 from langchain_core.tools import tool
 
-# 发送器类型: (platform, chat_type, external_id, text) -> None
-# 由 main.py 注入,内部路由到 QQ 桥或桌面端
-MessageSender = Callable[[str, str, str, str], Coroutine[Any, Any, None]]
+# 发送器契约: (platform, chat_type, external_id, text) -> 是否成功
+#   platform   qq / desktop
+#   chat_type  private / group
+#   external_id 对方 QQ 号 / 群号
+# 由 main.py 在组装时注入(见 init_sender)。
+# 返回 bool 而不是抛异常: 发送失败要给 LLM 一个可理解的反馈,
+# 让它能决定"告诉用户发不出去"而不是盲目重试。
+ContactSender = Callable[[str, str, str, str], Awaitable[bool]]
 
-# 全局发送器(在 create_message_tools 里注入)
-_sender: MessageSender | None = None
+_sender: ContactSender | None = None
 
 
-def init_sender(sender: MessageSender) -> None:
-    """注入消息发送器(应用启动时调用一次)。"""
+def init_sender(sender: ContactSender) -> None:
+    """注入联系人发送器(应用启动时调用一次)。
+
+    注意: 必须在 create_app 组装阶段调用 —— 早期版本漏了这一步,
+    导致工具永远返回"发送器未初始化",转告类任务全部失效。
+    """
     global _sender
     _sender = sender
 
 
 @tool
-def send_qq_message(chat_id: str, text: str) -> str:
-    """向指定 QQ 联系人发送一条私聊消息。
+async def send_qq_message(chat_id: str, text: str, chat_type: str = "private") -> str:
+    """向指定的 QQ 联系人(或群)发送一条消息。
 
-    chat_id: 对方 QQ 号(字符串形式)
-    text:    要发送的消息内容
-    返回: 发送结果描述,成功或失败原因。
+    这是"帮别人传话/帮问事情"的唯一方式 —— 当目标不是当前对话里的人时,
+    必须用本工具发出去。
+
+    chat_id:   对方 QQ 号,或群号
+    text:      要发送的消息内容(直接写要说的话,不要带"转告他说"这类转述语)
+    chat_type: "private"(私聊,默认)或 "group"(群聊)
+    返回:      发送结果描述(成功或失败原因)。
     """
     if _sender is None:
-        return "错误: 消息发送器未初始化"
-    try:
-        # 这里走 asyncio 事件循环执行异步发送器
-        import asyncio
+        return "错误: 消息发送器未初始化(服务配置问题,请联系管理员)"
 
-        asyncio.get_running_loop().create_task(
-            _sender("qq", "private", chat_id, text)
-        )
-        return f"已向 {chat_id} 发送消息"
-    except Exception as exc:  # noqa: BLE001
+    text = (text or "").strip()
+    if not text:
+        return "错误: 消息内容为空,未发送"
+
+    chat_type = chat_type if chat_type in ("private", "group") else "private"
+
+    try:
+        ok = await _sender("qq", chat_type, str(chat_id), text)
+    except Exception as exc:  # noqa: BLE001 - 异常要变成模型可读的反馈
         return f"发送失败: {type(exc).__name__}: {exc}"
+
+    if ok:
+        target = "群" if chat_type == "group" else "联系人"
+        return f"已发送给{target} {chat_id}"
+
+    # 失败原因由发送器记录日志;这里给模型一个明确信号,让它决定是否重试或告知用户
+    return f"发送失败: 无法送达 {chat_id}(请检查对方是否好友、机器人是否在线)"
 
 
 def create_message_tools() -> list[Any]:
-    """返回消息类工具列表(当前只有一个)。"""
+    """返回消息类工具列表。"""
     return [send_qq_message]

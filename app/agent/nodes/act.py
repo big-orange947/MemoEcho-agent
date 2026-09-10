@@ -18,7 +18,12 @@ from typing import Any
 from langchain_core.messages import AIMessage, ToolMessage
 
 
-def run(state: dict[str, Any], tools_by_name: dict[str, Any]) -> dict[str, Any]:
+# 为什么是 async 节点 + ainvoke:
+#   工具里有异步 IO(如给联系人发消息)。同步节点会被 LangGraph 丢进线程池,
+#   线程池里没有事件循环,异步工具根本跑不起来 ——
+#   早期版本正是这样导致"发消息"工具永远失败。用 async 节点 + ainvoke 解决。
+#   注意: 同步工具也能被 ainvoke 调用(LangChain 会自行处理),改法对所有工具安全。
+async def run(state: dict[str, Any], tools_by_name: dict[str, Any]) -> dict[str, Any]:
     """执行状态中最新 AIMessage 的所有工具调用。"""
     # 取最近一条 AIMessage;如果它没有 tool_calls,说明是纯回复,无需执行。
     latest = None
@@ -45,10 +50,10 @@ def run(state: dict[str, Any], tools_by_name: dict[str, Any]) -> dict[str, Any]:
             result_text = f"错误: 工具 {tool_name} 不存在"
         else:
             try:
-                # 调用 LangChain 工具(同步),并把会话 config 传进去,
-                # 让需要上下文(如 thread_id)的工具能拿到。结果可能是
-                # 字符串,也可能是结构化对象。
-                result = tool.invoke(tool_args, tool_config)
+                # ainvoke 同时支持同步与异步工具:
+                #   异步工具直接 await;同步工具由 LangChain 在线程里执行。
+                # config 传给需要上下文的工具(如 wait 取 thread_id)。
+                result = await tool.ainvoke(tool_args, tool_config)
                 result_text = result if isinstance(result, str) else str(result)
             except Exception as exc:  # noqa: BLE001 - 工具异常要反馈给模型而不是中断
                 result_text = f"工具执行出错: {type(exc).__name__}: {exc}"

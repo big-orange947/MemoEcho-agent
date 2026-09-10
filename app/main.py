@@ -39,6 +39,7 @@ from .bridge.napcat import NapcatBridge
 from .config import get_settings
 from .db import close_connections, init_db
 from .events import Event, EventKind, EventSource, get_bus, reset_bus
+from . import outbox
 from .scheduler import get_scheduler
 from .services import conversations as conversations_service
 from .services import dispatches as dispatch_service
@@ -95,6 +96,30 @@ def create_app() -> FastAPI:
         else:
             # 桌面端: 走 SSE 推给前端
             await sse_api.push("reply", {"conversation_id": conversation_id, "text": text})
+
+    # 5b. 联系人发送器: 供"给其他人发消息"的工具使用(messaging 工具)
+    #     与 sender 的区别:
+    #       sender            —— 发给**当前会话**(finalize 用)
+    #       contact_sender    —— 发给**指定的其他人**(LLM 主动传话用)
+    #
+    #     关键设计: 发给别人时,也在**那个人的会话**里落一条出站记录。
+    #     这样对方回复时,上下文才对得上 ——
+    #     否则"问小号"发出去后,小号的回复会进入一个没有任何上下文的空会话,
+    #     agent 根本不知道这是在回答我们问的问题。
+    async def contact_sender(platform: str, chat_type: str, external_id: str, text: str) -> bool:
+        try:
+            # 定位(或创建)目标联系人/群的会话
+            conversation_id = conversations_service.ensure_conversation(
+                platform, chat_type, external_id
+            )
+            # 走 outbox 统一投递: 先落库(记进该会话历史),再发送
+            result = await outbox.deliver(conversation_id, text, source="outbound")
+            return bool(result.get("ok"))
+        except Exception as exc:  # noqa: BLE001 - 工具层拿到的应是 False,不是异常
+            print(f"[sender] 给 {platform}/{chat_type}/{external_id} 发送失败: {type(exc).__name__}: {exc}")
+            return False
+
+    messaging_tools.init_sender(contact_sender)
 
     # 6. AgentGraph(注入依赖)
     graph = AgentGraph(llm_factory=llm_factory, tools=tools, sender=sender)

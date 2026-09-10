@@ -108,8 +108,10 @@ class AgentGraph:
             llm = self.llm_factory(fast=False).bind_tools(self.tools)
             return reason.run(state, llm, self.tools)
 
-        def _act(state: dict[str, Any]) -> dict[str, Any]:
-            return act.run(state, self.tools_by_name)
+        async def _act(state: dict[str, Any]) -> dict[str, Any]:
+            # act 是异步节点: 工具可能做异步 IO(如给联系人发消息),
+            # 同步节点会被丢进线程池而拿不到事件循环。
+            return await act.run(state, self.tools_by_name)
 
         def _reflect(state: dict[str, Any]) -> dict[str, Any]:
             # 目标评估用 fast 通道(轻量模型,省成本)
