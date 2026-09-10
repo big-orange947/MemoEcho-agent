@@ -1,4 +1,23 @@
-﻿[CmdletBinding()]
+﻿<#
+.SYNOPSIS
+    停止 Memo Echo v2(以及可选的 NapCat)。
+
+.DESCRIPTION
+    只停止本脚本启动的进程:
+      - 通过 .runtime/local-processes.json 找到记录;
+      - **核对进程身份**(PID + 进程名 + 启动时间)后才结束进程 ——
+        避免 PID 被复用后误杀其它程序(这一点在旧版脚本里踩过坑)。
+
+    与旧版不同: v2 只有一个进程,不需要按依赖顺序停止。
+
+.PARAMETER SkipNapCat
+    不停止 NapCat(只想重启 v2 时用)。
+
+.EXAMPLE
+    .\scripts\stop-local.ps1
+    .\scripts\stop-local.ps1 -SkipNapCat
+#>
+[CmdletBinding()]
 param(
     [switch]$SkipNapCat
 )
@@ -16,7 +35,7 @@ function Test-ProcessIdentity {
         [Parameter(Mandatory = $true)]$Record
     )
 
-    <# 同时核对 PID、进程名和启动时间，防止陈旧 PID 文件误杀后来复用同一 PID 的其他程序。 #>
+    <# 同时核对 PID、进程名和启动时间,防止陈旧 PID 文件误杀后来复用同一 PID 的程序。 #>
     if ($Process.ProcessName -ne [string]$Record.processName) {
         return $false
     }
@@ -25,39 +44,74 @@ function Test-ProcessIdentity {
     return [Math]::Abs(($actual - $expected).TotalSeconds) -lt 2
 }
 
+# ---------------------------------------------------------------------------
+# 停止 v2(按 PID 文件)
+# ---------------------------------------------------------------------------
+# 说明: Windows 上 venv 的 python.exe 是转发器,真实服务进程是它的子进程
+# (见 start-local.ps1 注释)。因此记录里可能同时有"服务进程"与"启动器进程",
+# 这里两个都清理,避免留下占用 8000 端口的孤儿进程。
 if (-not (Test-Path -LiteralPath $pidFile)) {
-    Write-Host "没有找到本脚本管理的运行进程。"
+    Write-Host "[SKIP] 没有找到本脚本管理的运行记录(PID 文件不存在)。"
+} else {
+    [array]$records = @(Get-Content -LiteralPath $pidFile -Raw -Encoding utf8 | ConvertFrom-Json)
+    foreach ($record in $records) {
+        # (1) 服务进程: 先停它(释放端口),再处理启动器
+        $serverProcess = Get-Process -Id ([int]$record.processId) -ErrorAction SilentlyContinue
+        if ($null -eq $serverProcess) {
+            Write-Host "[SKIP] $($record.name) 服务进程已退出"
+        } elseif (-not (Test-ProcessIdentity -Process $serverProcess -Record $record)) {
+            Write-Warning "跳过 PID $($record.processId): 进程身份与记录不一致(可能已被复用)。"
+        } else {
+            Stop-Process -Id $serverProcess.Id -Force
+            Write-Host "[STOP] $($record.name) 服务进程 (PID=$($serverProcess.Id))"
+        }
+
+        # (2) 启动器(venv python 转发器): 若仍在则一并结束
+        #     注意: 服务进程被杀后转发器通常也会退出,存在竞态 —— 用 try 兜住
+        $launcherPid = 0
+        if ($null -ne $record.PSObject.Properties["launcherPid"]) {
+            $launcherPid = [int]$record.launcherPid
+        }
+        if ($launcherPid -gt 0) {
+            $launcherProcess = Get-Process -Id $launcherPid -ErrorAction SilentlyContinue
+            if ($null -ne $launcherProcess) {
+                try {
+                    Stop-Process -Id $launcherPid -Force -ErrorAction Stop
+                    Write-Host "[STOP] $($record.name) 启动器 (PID=$launcherPid)"
+                } catch {
+                    # 进程在检查与停止之间自行退出(正常竞态),无需处理
+                    Write-Host "[SKIP] $($record.name) 启动器已自行退出"
+                }
+            }
+        }
+    }
+    Remove-Item -LiteralPath $pidFile -Force
+}
+
+# 等待端口释放(给 OS 一点时间回收),再做兜底检查
+Start-Sleep -Milliseconds 500
+
+# 兜底: PID 文件丢了但端口仍被占用时,提示用户(不自动杀,避免误伤)
+$listening = Get-NetTCPConnection -LocalPort 8000 -State Listen -ErrorAction SilentlyContinue
+if ($listening) {
+    $owner = Get-Process -Id $listening.OwningProcess -ErrorAction SilentlyContinue
+    Write-Warning "端口 8000 仍被占用: $($owner.ProcessName) PID=$($listening.OwningProcess)。"
+    Write-Warning "若确认是残留的 v2 进程,可手动执行: Stop-Process -Id $($listening.OwningProcess) -Force"
+}
+
+# ---------------------------------------------------------------------------
+# 停止 NapCat(注入了 QQ 进程,停止即结束 QQ)
+# ---------------------------------------------------------------------------
+if ($SkipNapCat) {
+    Write-Host "[SKIP] 已指定 -SkipNapCat,保留 NapCat 运行。"
     exit 0
 }
 
-[array]$records = @(Get-Content -LiteralPath $pidFile -Raw -Encoding utf8 | ConvertFrom-Json)
-# 按启动顺序的逆序停止，让最上游的 Connector 先退出，减少关闭期间的新事件进入。
-[array]::Reverse($records)
-foreach ($record in $records) {
-    $process = Get-Process -Id ([int]$record.processId) -ErrorAction SilentlyContinue
-    if ($null -eq $process) {
-        Write-Host "[SKIP] $($record.name) 已退出"
-        continue
-    }
-    if (-not (Test-ProcessIdentity -Process $process -Record $record)) {
-        Write-Warning "跳过 PID $($record.processId)：进程身份与记录不一致。"
-        continue
-    }
-    Stop-Process -Id $process.Id -Force
-    Write-Host "[STOP] $($record.name)"
+$qqProcesses = @(Get-Process -Name QQ -ErrorAction SilentlyContinue)
+if ($qqProcesses.Count -gt 0) {
+    # NapCat 注入 QQ 进程运行;停止 = 结束 QQ。重启请用 start-local.ps1(带 QQ 号快速登录)。
+    $qqProcesses | Stop-Process -Force
+    Write-Host "[STOP] NapCat (QQ $($qqProcesses.Count) 个进程)"
+} else {
+    Write-Host "[SKIP] NapCat 未在运行"
 }
-
-Remove-Item -LiteralPath $pidFile -Force
-
-if (-not $SkipNapCat) {
-    $qqProcesses = @(Get-Process -Name QQ -ErrorAction SilentlyContinue)
-    if ($qqProcesses.Count -gt 0) {
-        # NapCat 注入 QQ 进程运行；停止 = 结束 QQ。重启后请用 start-local.ps1（带 QQ 号参数快速登录）。
-        $qqProcesses | Stop-Process -Force
-        Write-Host "[STOP] NapCat (QQ $($qqProcesses.Count) 个进程)"
-    } else {
-        Write-Host "[SKIP] NapCat 未在运行"
-    }
-}
-
-Write-Host "本脚本启动的 Memo Echo 服务已停止；Neo4j/MySQL 未受影响。用 scripts/start-local.ps1 一键重启（NapCat 自动快速登录）。"
