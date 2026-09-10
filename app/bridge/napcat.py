@@ -72,11 +72,15 @@ class NapcatBridge:
         return {"ok": False, "error": str(reason)}
 
     # ------------------------------------------------------------------ 发消息
-    async def send_private_message(self, user_id: str, message: str | list[dict[str, Any]]) -> bool:
+    async def send_private_message(self, user_id: str, message: str | list[dict[str, Any]]) -> dict[str, Any]:
         """发送私聊消息。
 
         message: 纯文本,或 OneBot 消息段数组(发 @/图片等富媒体时用)。
-        返回: 是否发送成功。
+        返回: {"ok": bool, "platform_message_id": str, "error": str}
+          platform_message_id 用来识别"这条消息被平台回显"(见 app/repositories)。
+
+        注意: 早期版本这里只返回 bool,调用方没法知道平台消息 ID ——
+        结果自己发的消息被平台回显时会被当成新消息再记一遍，历史里出现两条一样的。
         """
         result = await self.call(
             "send_private_msg",
@@ -84,13 +88,17 @@ class NapcatBridge:
         )
         if not result["ok"]:
             print(f"[napcat] 私聊发送失败(user={user_id}): {result['error']}")
-        return result["ok"]
+        return {
+            "ok": bool(result["ok"]),
+            "platform_message_id": str((result.get("data") or {}).get("message_id") or ""),
+            "error": "" if result["ok"] else str(result.get("error") or ""),
+        }
 
-    async def send_group_message(self, group_id: str, message: str | list[dict[str, Any]]) -> bool:
+    async def send_group_message(self, group_id: str, message: str | list[dict[str, Any]]) -> dict[str, Any]:
         """发送群聊消息。
 
         message: 纯文本,或 OneBot 消息段数组。
-        返回: 是否发送成功。
+        返回: {"ok": bool, "platform_message_id": str, "error": str}
         """
         result = await self.call(
             "send_group_msg",
@@ -98,7 +106,11 @@ class NapcatBridge:
         )
         if not result["ok"]:
             print(f"[napcat] 群聊发送失败(group={group_id}): {result['error']}")
-        return result["ok"]
+        return {
+            "ok": bool(result["ok"]),
+            "platform_message_id": str((result.get("data") or {}).get("message_id") or ""),
+            "error": "" if result["ok"] else str(result.get("error") or ""),
+        }
 
     # ------------------------------------------------------------------ 查询
     async def get_login_info(self) -> dict[str, Any] | None:

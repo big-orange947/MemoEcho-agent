@@ -122,6 +122,7 @@ def init_db() -> None:
         -- role: user(对方/主人) / assistant(agent 自己)
         -- source: inbound(收到的) / outbound(发出的) / system
         -- goal_id: 可选,标记这条消息属于哪个目标(用于进度展示)
+        -- platform_message_id: 平台侧消息 ID(出站回显去重用,见 services/conversations)
         -- ============================================================
         CREATE TABLE IF NOT EXISTS messages (
             id         TEXT PRIMARY KEY,
@@ -131,10 +132,13 @@ def init_db() -> None:
             content    TEXT NOT NULL,               -- 纯文本内容
             raw_json   TEXT DEFAULT '',             -- 原始平台载荷(排查用)
             goal_id    TEXT DEFAULT '',             -- 关联目标(可空)
+            platform_message_id TEXT DEFAULT '',    -- 平台消息 ID(去重键)
             created_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_messages_conv_time
             ON messages (conversation_id, created_at);
+        -- 注意: platform_message_id 的索引在 _migrate() 里创建 ——
+        -- 老库的 messages 表可能还没有这一列,先建索引会报错(events 表踩过同样的坑)。
 
         -- ============================================================
         -- goals: 目标(可选)。把命令(如"问km几点上课转告小号")挂到会话上,
@@ -283,6 +287,23 @@ def init_db() -> None:
             pending_count   INTEGER DEFAULT 0,       -- 待处理条数(攒批计数)
             metadata        TEXT DEFAULT ''          -- 预留: 窗口起止等
         );
+        -- ============================================================
+        -- goal_conversations: 目标涉及的会话(一次任务可能横跨几个会话)
+        -- 场景: 号主说"帮我问 km 今晚几点上课,然后转告小号"——
+        --       目标挂在**下指令的会话**上,但 agent 会主动去联系 km。
+        --       km 的回复落在 km 的会话里,若不做关联,那条回复根本进不了
+        --       agent 的视野(该会话既没开自动回复、也没有目标),任务就此卡死。
+        -- 本表记录"这个目标牵涉了哪些会话",让对方的回复能唤醒任务继续推进。
+        -- 目标完成/放弃后,关联自动失效(查询按 goals.status='active' 过滤)。
+        -- ============================================================
+        CREATE TABLE IF NOT EXISTS goal_conversations (
+            goal_id         TEXT NOT NULL REFERENCES goals(id) ON DELETE CASCADE,
+            conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+            created_at      TEXT NOT NULL,
+            PRIMARY KEY (goal_id, conversation_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_goal_conversations_conv
+            ON goal_conversations (conversation_id);
         """
     )
     conn.commit()
@@ -313,6 +334,10 @@ _MIGRATIONS: dict[str, list[tuple[str, str]]] = {
         ("digest_max_messages", "INTEGER DEFAULT 20"),
         ("allowed_tools", "TEXT DEFAULT ''"),
     ],
+    # messages 表增加平台消息 ID(出站回显去重)
+    "messages": [
+        ("platform_message_id", "TEXT DEFAULT ''"),
+    ],
 }
 
 
@@ -338,6 +363,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_events_type_time ON events (event_type, created_at)"
+    )
+    # messages 的平台消息 ID 索引同样要等补列之后(老库先建会报"无此列")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_messages_platform_id"
+        " ON messages (conversation_id, platform_message_id)"
     )
 
     conn.commit()

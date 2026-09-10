@@ -67,8 +67,23 @@ async def deliver(conversation_id: str, text: str, *, source: str = "outbound") 
     if sender is None:
         return {"ok": False, "message_id": message_id, "reason": "发送器未初始化"}
     try:
-        await sender(conversation_id, text, source)
+        outcome = await sender(conversation_id, text, source)
     except Exception as exc:  # noqa: BLE001 - 发送失败要反馈给调用方,而不是抛出去打断流程
         return {"ok": False, "message_id": message_id, "reason": f"发送失败: {type(exc).__name__}: {exc}"}
+
+    # ---- 3. 回填平台消息 ID ----
+    # 有了它,平台把这条消息回显回来时才能认出来是"自己发的",不再重复入库。
+    # (发送结果里没有 ID 也不影响流程 —— 只是那条回显会被当成新消息记一次)
+    platform_message_id = ""
+    if isinstance(outcome, dict):
+        platform_message_id = str(outcome.get("platform_message_id") or "")
+        if not outcome.get("ok", True):
+            return {
+                "ok": False,
+                "message_id": message_id,
+                "reason": str(outcome.get("error") or "发送失败"),
+            }
+    if platform_message_id:
+        conversations_service.set_platform_message_id(message_id, platform_message_id)
 
     return {"ok": True, "message_id": message_id, "reason": ""}

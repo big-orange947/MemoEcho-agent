@@ -157,19 +157,24 @@ def create_app() -> FastAPI:
                 print(f"[reports] worker 异常: {type(exc).__name__}: {exc}")
 
     # 5. 发送器: 把 agent 的回复路由到正确渠道
-    async def sender(conversation_id: str, text: str, source: str) -> None:
+    async def sender(conversation_id: str, text: str, source: str) -> dict[str, Any] | None:
+        """把回复发到会话所属渠道。
+
+        返回值: 平台发送结果(含 platform_message_id),桌面端返回 None。
+        为什么要把结果传出来: 调用方(outbox / finalize)据此回填平台消息 ID,
+        这样平台把这条消息回显回来时能被识别成"自己发的",不重复入库。
+        """
         conv = conversations_service.get_conversation(conversation_id)
         if not conv:
-            return
+            return None
         if conv["platform"] == "qq":
             # QQ 会话: 私聊/群聊分别发送
             if conv["chat_type"] == "group":
-                await napcat.send_group_message(conv["external_id"], text)
-            else:
-                await napcat.send_private_message(conv["external_id"], text)
-        else:
-            # 桌面端: 走 SSE 推给前端
-            await sse_api.push("reply", {"conversation_id": conversation_id, "text": text})
+                return await napcat.send_group_message(conv["external_id"], text)
+            return await napcat.send_private_message(conv["external_id"], text)
+        # 桌面端: 走 SSE 推给前端
+        await sse_api.push("reply", {"conversation_id": conversation_id, "text": text})
+        return None
 
     # 5b. 联系人发送器: 供"给其他人发消息"的工具使用(messaging 工具)
     #     与 sender 的区别:
@@ -180,12 +185,26 @@ def create_app() -> FastAPI:
     #     这样对方回复时,上下文才对得上 ——
     #     否则"问小号"发出去后,小号的回复会进入一个没有任何上下文的空会话,
     #     agent 根本不知道这是在回答我们问的问题。
-    async def contact_sender(platform: str, chat_type: str, external_id: str, text: str) -> bool:
+    async def contact_sender(
+        platform: str,
+        chat_type: str,
+        external_id: str,
+        text: str,
+        origin_conversation_id: str = "",
+    ) -> bool:
         try:
             # 定位(或创建)目标联系人/群的会话
             conversation_id = conversations_service.ensure_conversation(
                 platform, chat_type, external_id
             )
+            # 任务延伸: 若这次外联是某个目标驱动的,把被联系的会话也登记到该目标上。
+            # 为什么必须做: 对方的回复落在**这个**会话里,若不登记,
+            # 那条回复既没有目标撑腰、会话也没开自动回复,会被直接丢掉 ——
+            # "帮我问 km 然后转告小号"这类任务就永远等不到回音。
+            if origin_conversation_id:
+                goal = goals_service.get_active_goal_involving(origin_conversation_id)
+                if goal:
+                    goals_service.link_conversation(str(goal.get("id") or ""), conversation_id)
             # 走 outbox 统一投递: 先落库(记进该会话历史),再发送
             result = await outbox.deliver(conversation_id, text, source="outbound")
             return bool(result.get("ok"))
@@ -268,7 +287,10 @@ def create_app() -> FastAPI:
         conversation = (
             conversations_service.get_conversation(conversation_id) or {} if conversation_id else {}
         )
-        has_active_goal = bool(goals_service.get_active_goal(conversation_id)) if conversation_id else False
+        # 用 involving 版本: 除了"目标挂在本会话",还包括"agent 为了完成某个任务
+        # 主动联系过本会话"—— 对方的回复因此能继续推进任务(见 services/goals)。
+        active_goal = goals_service.get_active_goal_involving(conversation_id) if conversation_id else None
+        has_active_goal = bool(active_goal)
 
         decision, reason = policy_service.decide(event, conversation, has_active_goal=has_active_goal)
         if decision == policy_service.DECISION_IGNORE:

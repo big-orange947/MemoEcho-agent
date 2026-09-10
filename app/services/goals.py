@@ -58,6 +58,57 @@ def get_active_goal(conversation_id: str) -> dict[str, Any] | None:
     return dict(row) if row is not None else None
 
 
+# ---------------------------------------------------------------------------
+# 目标涉及的会话(跨会话任务)
+# ---------------------------------------------------------------------------
+def link_conversation(goal_id: str, conversation_id: str) -> None:
+    """把某个会话登记为"该目标牵涉到的会话"。
+
+    为什么需要: 一次任务常常横跨多个会话 ——
+      号主说"帮我问 km 今晚几点上课,然后转告小号":
+      目标挂在**下指令的会话**上,但 agent 会主动去联系 km。
+      km 的回复落在 km 的会话里;若不登记,那条回复既没有目标撑腰、
+      该会话也没开自动回复,就会被直接丢弃,任务永远卡在"等回话"。
+
+    幂等: 同一 (goal, conversation) 只登记一次。
+    """
+    if not goal_id or not conversation_id:
+        return
+    conn = get_connection()
+    conn.execute(
+        "INSERT OR IGNORE INTO goal_conversations (goal_id, conversation_id, created_at)"
+        " VALUES (?, ?, ?)",
+        (goal_id, conversation_id, _now()),
+    )
+    conn.commit()
+
+
+def list_goal_conversations(goal_id: str) -> list[str]:
+    """列出某个目标牵涉的所有会话 ID。"""
+    rows = get_connection().execute(
+        "SELECT conversation_id FROM goal_conversations WHERE goal_id=?",
+        (goal_id,),
+    ).fetchall()
+    return [str(row["conversation_id"]) for row in rows]
+
+
+def get_active_goal_involving(conversation_id: str) -> dict[str, Any] | None:
+    """读取"牵涉到该会话"的 active 目标(自己挂的,或任务外联涉及到的)。
+
+    与 get_active_goal 的区别: 后者只看目标是否**挂在本会话**;
+    本函数还会认领"agent 为了完成某个目标而主动联系了本会话"的情况 ——
+    对方的回复因此能够唤醒任务继续推进(配合 policy.decide 的任务授权判定)。
+    """
+    row = get_connection().execute(
+        "SELECT g.* FROM goals g"
+        " LEFT JOIN goal_conversations gc ON gc.goal_id = g.id"
+        " WHERE g.status='active' AND (g.conversation_id = ? OR gc.conversation_id = ?)"
+        " ORDER BY g.created_at DESC LIMIT 1",
+        (conversation_id, conversation_id),
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
 def get_goal(goal_id: str) -> dict[str, Any] | None:
     """按 ID 读取目标(桌面端进度卡用)。"""
     row = get_connection().execute("SELECT * FROM goals WHERE id=?", (goal_id,)).fetchone()
@@ -77,6 +128,9 @@ def update_goal_status(goal_id: str, status: str, progress: str = "") -> None:
     """更新目标状态与进度摘要(由 reflect/finalize 节点调用)。
 
     status 取值: active / done / abandoned
+
+    结项时顺带清理跨会话登记: 目标结束了,它牵涉的会话就不该再被
+    "任务授权"放行(否则那些会话会一直保持可对话状态,越过值守策略)。
     """
     conn = get_connection()
     now = _now()
@@ -86,4 +140,6 @@ def update_goal_status(goal_id: str, status: str, progress: str = "") -> None:
         " WHERE id=?",
         (status, progress, now, completed_at, goal_id),
     )
+    if status in ("done", "abandoned") and goal_id:
+        conn.execute("DELETE FROM goal_conversations WHERE goal_id=?", (goal_id,))
     conn.commit()

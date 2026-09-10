@@ -176,8 +176,8 @@ def add_message(conversation_id: str, message: dict[str, Any]) -> str:
     conn = get_connection()
     conn.execute(
         "INSERT OR IGNORE INTO messages"
-        " (id, conversation_id, role, source, content, raw_json, goal_id, created_at)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        " (id, conversation_id, role, source, content, raw_json, goal_id, platform_message_id, created_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             msg_id,
             conversation_id,
@@ -186,12 +186,29 @@ def add_message(conversation_id: str, message: dict[str, Any]) -> str:
             message.get("content", ""),
             message.get("raw_json", ""),
             message.get("goal_id", ""),
+            message.get("platform_message_id", ""),
             created_at,
         ),
     )
     conn.commit()
     touch_conversation(conversation_id)
     return msg_id
+
+
+def set_platform_message_id(message_id: str, platform_message_id: str) -> None:
+    """回填一条消息的平台 ID(发送成功后调用)。
+
+    为什么要回填而不是发送前写好: 平台消息 ID 由**对方**在发送成功时才返回,
+    我们落库在发送之前(发送失败也要留痕),所以只能发完再补。
+    """
+    if not platform_message_id:
+        return
+    conn = get_connection()
+    conn.execute(
+        "UPDATE messages SET platform_message_id=? WHERE id=?",
+        (str(platform_message_id), message_id),
+    )
+    conn.commit()
 
 
 def message_exists(conversation_id: str, message_id: str) -> bool:
@@ -201,6 +218,26 @@ def message_exists(conversation_id: str, message_id: str) -> bool:
         (conversation_id, message_id),
     ).fetchone()
     return row is not None
+
+
+def platform_message_seen(conversation_id: str, platform_message_id: str) -> bool:
+    """该平台消息 ID 是否已经记录过(用于识别"自己发的消息被平台回显")。
+
+    典型场景: 我们通过接口发出一条消息并记了 platform_message_id;
+    平台随后把这条消息以 message_sent 回显一份 —— 若不识别,同一条消息
+    会在会话历史里出现两次(上下文里重复、审计里也重复)。
+
+    注意区分: 号主**在手机上手动**发的消息同样以 message_sent 形式到达,
+    但它没有对应的已知平台 ID,所以照常入库 —— 那正是我们要看的。
+    """
+    if not platform_message_id:
+        return False
+    row = get_connection().execute(
+        "SELECT 1 FROM messages WHERE conversation_id=? AND platform_message_id=?",
+        (conversation_id, str(platform_message_id)),
+    ).fetchone()
+    return row is not None
+
 
 
 def list_messages(conversation_id: str, limit: int = 50) -> list[dict[str, Any]]:

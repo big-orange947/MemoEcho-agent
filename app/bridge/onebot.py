@@ -244,6 +244,7 @@ def _build_message_event(
         sender_id=user_id,
         sender_name=str(sender.get("card") or sender.get("nickname") or ""),
         is_self=is_self,
+        platform_message_id=str(body.get("message_id") or ""),
         raw=body,
     )
 

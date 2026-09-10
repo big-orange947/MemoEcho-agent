@@ -74,8 +74,9 @@ async def run(
 
     # ---------------------------------------------------------------- 1. 落库回复
     # 与 ingest 一致的消息形态;role=assistant 表示这是我们说的话。
+    message_id = ""
     if conversation_id:
-        conversations_service.add_message(
+        message_id = conversations_service.add_message(
             conversation_id,
             {
                 "id": None,  # 由 service 自动生成
@@ -106,7 +107,12 @@ async def run(
     # ---------------------------------------------------------------- 3. 发送回复
     # 只有有内容才发送;wait 决策(output_text 为空)则静默等待下一次事件。
     if output_text and conversation_id:
-        await sender(conversation_id, output_text, "reply")
+        outcome = await sender(conversation_id, output_text, "reply")
+        # 回填平台消息 ID: 平台会把这条消息回显一份,有了 ID 才能认出是"自己发的"、
+        # 不重复入库(见 app/recorder.py 的回显去重)
+        platform_id = str((outcome or {}).get("platform_message_id") or "") if isinstance(outcome, dict) else ""
+        if platform_id and message_id:
+            conversations_service.set_platform_message_id(message_id, platform_id)
 
     # ---------------------------------------------------------------- 4. 裁剪历史
     return _trim_update(state)

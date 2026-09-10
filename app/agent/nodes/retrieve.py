@@ -42,7 +42,10 @@ async def run(state: dict[str, Any]) -> dict[str, Any]:
 
     # ---------------------------------------------------------------- 3. 当前目标
     # 取会话上最近一个 active 目标(没有则为 None,即纯闲聊)。
-    goal = goals_service.get_active_goal(conversation_id)
+    # 用 involving 版本: 目标也可能挂在**别的会话**上,而本会话是任务外联的一环
+    # (如"帮问 km"—— 目标在号主那边,km 这边只是被问到的一方)。
+    # 不认这种情况,agent 在 km 的会话里就不知道自己为何而来。
+    goal = goals_service.get_active_goal_involving(conversation_id)
 
     # ---------------------------------------------------------------- 4. 长期记忆
     # 检索与"本次输入"相关的长期记忆,格式化成可拼进 prompt 的文本块。

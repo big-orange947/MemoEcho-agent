@@ -76,7 +76,8 @@ async def record(conversation_id: str, event: dict[str, Any], *, goal_id: str = 
     """把一条事件作为消息写进会话历史(幂等,不推理、不调模型)。
 
     返回: {"recorded": bool, "duplicate": bool, "message_id": str, "reason": str}
-      recorded=False 的常见原因: kind 不可记录(通知/请求类)、文本为空。
+      recorded=False 的常见原因: kind 不可记录(通知/请求类)、文本为空、
+      或这是我们自己刚发出的消息被平台回显(见下)。
     """
     kind = str(event.get("kind") or "message")
     if kind not in RECORDABLE_KINDS:
@@ -84,6 +85,20 @@ async def record(conversation_id: str, event: dict[str, Any], *, goal_id: str = 
 
     if not conversation_id:
         return {"recorded": False, "duplicate": False, "message_id": "", "reason": "缺少会话 ID"}
+
+    # 自己发出的消息被平台回显时跳过 —— 我们在发送时已经记过一次了
+    # (平台 ID 由发送结果回填)。不跳过的话，同一条消息会在会话历史里出现两遍，
+    # 上下文里重复、审计里也重复。
+    # 注意这不影响"号主在手机上手动发的消息"：那种没有已知平台 ID，照常入库。
+    if is_own_echo(event):
+        platform_id = str(event.get("platform_message_id") or "")
+        if conversations_service.platform_message_seen(conversation_id, platform_id):
+            return {
+                "recorded": False,
+                "duplicate": True,
+                "message_id": "",
+                "reason": "自己发出的消息回显(已记录)",
+            }
 
     message = build_message(event, goal_id=goal_id)
     message_id = str(message["id"])
@@ -97,3 +112,13 @@ async def record(conversation_id: str, event: dict[str, Any], *, goal_id: str = 
 
     conversations_service.add_message(conversation_id, message)
     return {"recorded": True, "duplicate": False, "message_id": message_id, "reason": ""}
+
+
+def is_own_echo(event: dict[str, Any]) -> bool:
+    """这条事件是不是"我们自己发出的消息被平台回显"。
+
+    判定依据是 kind=message_sent(机器人自发回显)—— 与号主手机手动发的
+    消息走的是同一个通道,所以调用方还要再查平台消息 ID 才能确定是不是自己发的
+    (见 conversations.platform_message_seen)。
+    """
+    return str(event.get("kind") or "") == "message_sent"

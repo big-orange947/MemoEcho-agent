@@ -99,6 +99,10 @@ class Event:
     sender_id: str = ""           # 发送者 ID(对方 QQ 号 / 桌面用户 / 调用方)
     sender_name: str = ""         # 发送者显示名(群名片或昵称,可空)
     is_self: bool = False         # 是否机器人自己发出的(回显,通常忽略)
+    # 平台侧消息 ID(QQ 的 message_id)。
+    # 用途: 识别"我们发出去的消息被平台回显"—— 发送时记下这个 ID,
+    # 回显再次到达时就能跳过,避免同一条消息在历史里出现两遍。
+    platform_message_id: str = ""
     raw: dict[str, Any] = field(default_factory=dict)  # 原始载荷(排障用)
 
     # ------------------------------------------------------------ 指令扩展
@@ -168,6 +172,7 @@ class Event:
             "sender_id": self.sender_id,
             "sender_name": self.sender_name,
             "is_self": self.is_self,
+            "platform_message_id": self.platform_message_id,
             "command": self.command,
             "context": self.context,
             "created_at": self.created_at,

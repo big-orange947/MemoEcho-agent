@@ -28,14 +28,16 @@ from langchain_core.tools import tool
 
 from ..services.policy import HIGH_RISK_TAG
 
-# 发送器契约: (platform, chat_type, external_id, text) -> 是否成功
+# 发送器契约: (platform, chat_type, external_id, text, origin_conversation_id) -> 是否成功
 #   platform   qq / desktop
 #   chat_type  private / group
 #   external_id 对方 QQ 号 / 群号
+#   origin_conversation_id 发起本次外联的会话(用于把任务"延伸"到被联系的会话,
+#                          见 services/goals.link_conversation;直接调用时可留空)
 # 由 main.py 在组装时注入(见 init_sender)。
 # 返回 bool 而不是抛异常: 发送失败要给 LLM 一个可理解的反馈,
 # 让它能决定"告诉用户发不出去"而不是盲目重试。
-ContactSender = Callable[[str, str, str, str], Awaitable[bool]]
+ContactSender = Callable[[str, str, str, str, str], Awaitable[bool]]
 
 _sender: ContactSender | None = None
 
@@ -87,7 +89,9 @@ async def send_qq_message(
     chat_type = chat_type if chat_type in ("private", "group") else "private"
 
     try:
-        ok = await _sender("qq", chat_type, str(chat_id), text)
+        # 把"当前会话"一并交给发送器: 它据此把这个目标延伸到被联系的会话
+        # (对方的回复才能唤醒任务继续推进,见 services/goals.link_conversation)
+        ok = await _sender("qq", chat_type, str(chat_id), text, conversation_id)
     except Exception as exc:  # noqa: BLE001 - 异常要变成模型可读的反馈
         return f"发送失败: {type(exc).__name__}: {exc}"
 
