@@ -69,7 +69,7 @@ async def run(
     # ---------------------------------------------------------------- 1. 落库回复
     # 与 ingest 一致的消息形态;role=assistant 表示这是我们说的话。
     if conversation_id:
-        conversations_service.add_message(
+        message_id = conversations_service.add_message(
             conversation_id,
             {
                 "id": None,  # 由 service 自动生成
@@ -80,6 +80,11 @@ async def run(
                 "goal_id": "",
             },
         )
+        # 机器人说的话也写入长期记忆:
+        #   · Doppel 会把 actor 标为 agent,事实权威低于号主/联系人 ——
+        #     模型引用时能区分"这是我说过的话"而不是当成客观事实;
+        #   · 不写的话,下次对话 agent 不记得自己承诺过什么。
+        await _remember_outbound(conversation_id, output_text, message_id)
 
     # ---------------------------------------------------------------- 2. 更新目标
     decision = state.get("decision") or {}
@@ -103,3 +108,22 @@ async def run(
         await sender(conversation_id, output_text, "reply")
 
     return {}
+
+
+async def _remember_outbound(conversation_id: str, text: str, message_id: str) -> None:
+    """把机器人发出的这条回复写入长期记忆(best-effort)。
+
+    失败静默: memory 模块内部已吞掉异常 —— 记忆写不进去,不该影响这次回复。
+    """
+    from ... import memory
+
+    conversation = conversations_service.get_conversation(conversation_id) or {}
+    if not conversation:
+        return
+    await memory.remember_message(
+        conversation,
+        role="assistant",
+        content=text,
+        message_id=message_id,
+        source="outbound",
+    )

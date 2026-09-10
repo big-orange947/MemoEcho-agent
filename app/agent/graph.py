@@ -126,7 +126,15 @@ class AgentGraph:
 
         # ---- 连边(固定顺序) ----
         builder.add_edge(START, "ingest")
-        builder.add_edge("ingest", "retrieve")
+
+        # ingest 之后先做幂等判断: 重复消息直接结束,不进推理。
+        # 这一步是"防重复回复"的关键 —— 平台重推同一条消息时,
+        # 若不短路,agent 会重新推理并再发一次回复。
+        builder.add_conditional_edges(
+            "ingest",
+            self._route_after_ingest,
+            {"retrieve": "retrieve", "end": END},
+        )
         builder.add_edge("retrieve", "reason")
 
         # ---- 条件边: reason 之后看有没有 tool_calls ----
@@ -185,6 +193,16 @@ class AgentGraph:
         self._saver_ready = False
 
     # ------------------------------------------------------------------ 路由
+    @staticmethod
+    def _route_after_ingest(state: dict[str, Any]) -> str:
+        """幂等判断: 重复消息直接结束,否则继续检索+推理。
+
+        ingest 已把"是否重复"写进 state.duplicate:
+          · True  → 回 "end"(到 END,不产生任何回复)
+          · False → 回 "retrieve"(正常流程)
+        """
+        return "end" if state.get("duplicate") else "retrieve"
+
     @staticmethod
     def _route_after_reason(state: dict[str, Any]) -> str:
         """看最近一条 AIMessage: 有 tool_calls 就去 act,否则去 reflect。"""
@@ -282,6 +300,14 @@ class AgentGraph:
             initial,
             config={"configurable": {"thread_id": conversation_id}},
         )
+
+        # 幂等短路: ingest 判定消息重复时图会直接结束。
+        # 此时**不能**去读 messages 里的 AI 文本 —— 那是 checkpoint 恢复出来的
+        # 历史回复(上一次处理留下的),读出来会被误当成"本次的回复"再发一遍,
+        # 相当于绕过了幂等保护。所以这里显式返回 None。
+        if result.get("duplicate"):
+            return None
+
         # 最终回复 = 结果消息里最后一条 AI 文本(与 finalize 提取逻辑一致)
         for message in reversed(result.get("messages") or []):
             if getattr(message, "type", "") != "ai":

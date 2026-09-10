@@ -67,6 +67,23 @@ class Settings(BaseSettings):
     # 桌面端 API 的本地访问令牌(留空=本机免鉴权)
     api_token: str = ""
 
+    # ---------------------------------------------------------------- 记忆(Doppel)
+    # 是否启用长期记忆。关掉则完全不走记忆链路(Doppel 未安装时也自动降级)。
+    doppel_enabled: bool = True
+    # 存储后端(sqlite / in_memory;Doppel 的 postgres 需要额外依赖)
+    doppel_backend: str = "sqlite"
+    # 记忆数据库文件名(放在 data_dir 下,与业务库分离,便于单独备份/重建)
+    doppel_db_name: str = "doppel.sqlite3"
+    # 号主标识(scope 的 user_id)—— **多租户隔离的关键**:
+    # 一台实例服务多个号主时,这个值不同则记忆完全隔离。
+    owner_user_id: str = ""
+    # 机器人标识(scope 的 agent_id)—— 多机器人场景下隔离用;留空则回退到 bot_qq。
+    # 说明: 与 bot_qq 分开是刻意的 —— bot_qq 是"登录的号",
+    # agent_id 是"记忆归属的身份",将来一个号跑多个 agent 时能区分。
+    agent_id: str = ""
+    # 每次检索注入的长期记忆条数上限(控制 prompt 体积)
+    memory_recall_limit: int = 6
+
     model_config = SettingsConfigDict(
         # 允许从 .env 文件读取(与 local-env.ps1 二选一,二选一即可)
         env_file=".env",

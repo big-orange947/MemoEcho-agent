@@ -27,6 +27,12 @@ class AgentState(TypedDict, total=False):
     # 每个会话有独立线程(thread_id),LangGraph 按它存 checkpoint。
     conversation_id: str
 
+    # ------------------------------------------------------------ 幂等短路
+    # ingest 判定"这条消息已经处理过"时置为 True;
+    # 条件边据此直接从 ingest 走到 END(不推理、不回复)——
+    # 避免平台重推导致重复回复(实测出现过两条一样的回复)。
+    duplicate: bool
+
     # ------------------------------------------------------------ 当前事件
     # 本次触发的事件(可能来自 QQ 或桌面端)。节点用它判断"这次进来的是什么"。
     event: dict[str, Any]

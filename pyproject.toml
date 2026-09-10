@@ -43,6 +43,12 @@ dependencies = [
     "websockets>=13.0",
 ]
 
+# 长期记忆(Doppel)通过本地源码安装,不写在 dependencies 里 ——
+# 它尚未发布到 PyPI(uv 解析依赖会直接失败),而且迭代较快,
+# 本地可编辑安装反而更方便升级:
+#     uv pip install -e D:\project\Doppel
+# 未安装时记忆功能会自动降级关闭(见 app/memory.py 的降级策略)。
+
 [project.optional-dependencies]
 # 开发依赖: uv pip install -e ".[dev]"
 dev = [

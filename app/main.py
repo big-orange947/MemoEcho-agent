@@ -26,9 +26,9 @@ from typing import Any
 
 import uvicorn
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
 from langchain_openai import ChatOpenAI
 
+from . import memory as memory_layer
 from .api import dispatch as dispatch_api
 from .api import routes as api_routes
 from .api import sse as sse_api
@@ -231,6 +231,8 @@ def create_app() -> FastAPI:
         await scheduler.stop()
         await napcat.close()
         await graph.close()
+        # 关闭记忆客户端(Doppel 的 SQLite 连接)
+        await memory_layer.close_client()
         close_connections()
 
     return app

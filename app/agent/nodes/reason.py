@@ -39,6 +39,9 @@ def _build_messages(state: dict[str, Any], tools_desc: str) -> list[BaseMessage]
     # 定时唤醒提示: 之前 wait 工具登记的等待到期了,告诉模型为什么继续
     if working.get("wakeup_reason"):
         system += f"\n\n(系统消息: 定时唤醒 —— {working['wakeup_reason']}。请继续推进当前任务。)"
+    # 长期记忆(Doppel 检索结果): 带说话人与时间,模型据此判断可信度与时效
+    if working.get("memory_block"):
+        system += f"\n\n{working['memory_block']}"
 
     messages: list[BaseMessage] = [SystemMessage(content=system)]
 

@@ -118,6 +118,64 @@ class TestGraphFlow:
         assert len(graph.sent) == 1
 
     @pytest.mark.asyncio
+    async def test_duplicate_message_short_circuits(self, graph_env):
+        """重推同一条消息: 不重复回复(幂等短路)。
+
+        回归背景: 早期实现只在 ingest 跳过"重复落库",图仍会继续跑,
+        导致 agent 重新推理并再发一次回复 —— 用户收到两条一样的消息。
+        """
+        graph, _ = graph_env
+
+        event = {
+            "conversation_id": "conv-dup",
+            "kind": "message",
+            "platform": "desktop",
+            "chat_type": "thread",
+            "external_id": "conv-dup",
+            "event_id": "fixed-msg-id-001",   # 固定 ID: 模拟平台重推
+            "text": "重复的消息",
+            "is_self": False,
+        }
+
+        first = await graph.run_event(dict(event))
+        second = await graph.run_event(dict(event))
+
+        # 第一次正常回复;第二次应被短路(返回 None,无回复)
+        assert first == "好的，我知道了"
+        assert second is None, f"重复消息被重复处理了: {second}"
+
+        # 消息表里: 1 条入站 + 1 条出站(没有第二条回复)
+        from app.services import conversations as convs
+
+        msgs = convs.list_messages("conv-dup")
+        assert [m["role"] for m in msgs] == ["user", "assistant"]
+        # 发送器也只被调用一次
+        assert len(graph.sent) == 1
+
+    @pytest.mark.asyncio
+    async def test_instruction_not_short_circuited(self, graph_env):
+        """调度指令即便 ID 重复也应重新执行(调用方明确要求)。"""
+        graph, _ = graph_env
+
+        event = {
+            "conversation_id": "conv-instr",
+            "kind": "instruction",
+            "platform": "agent",
+            "chat_type": "thread",
+            "external_id": "conv-instr",
+            "event_id": "instruction-001",
+            "text": "做点什么",
+            "command": "做点什么",
+            "is_self": False,
+        }
+
+        first = await graph.run_event(dict(event))
+        second = await graph.run_event(dict(event))
+
+        assert first is not None
+        assert second is not None, "指令类事件不应被幂等短路"
+
+    @pytest.mark.asyncio
     async def test_timer_event_not_in_history(self, graph_env):
         """timer 事件不写入对话历史(它不是"人说的话")。"""
         graph, _ = graph_env
