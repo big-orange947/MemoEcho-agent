@@ -42,6 +42,10 @@ def _build_messages(state: dict[str, Any], tools_desc: str) -> list[BaseMessage]
     # 长期记忆(Doppel 检索结果): 带说话人与时间,模型据此判断可信度与时效
     if working.get("memory_block"):
         system += f"\n\n{working['memory_block']}"
+    # 补全的早前对话(checkpoint 之外的消息 —— 如监视期记录的内容):
+    # 没有这段,模型会在"先监视后接管"的会话里表现得像失忆。
+    if working.get("history_block"):
+        system += f"\n\n{working['history_block']}"
 
     messages: list[BaseMessage] = [SystemMessage(content=system)]
 

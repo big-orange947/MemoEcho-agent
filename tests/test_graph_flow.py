@@ -176,6 +176,78 @@ class TestGraphFlow:
         assert second is not None, "指令类事件不应被幂等短路"
 
     @pytest.mark.asyncio
+    async def test_multi_turn_context_is_carried(self, graph_env):
+        """多轮对话: 第二轮必须看到第一轮的内容(靠 checkpoint 恢复)。
+
+        这是"能聊天"与"每句都当陌生人"的分水岭 —— 一旦这里断了,
+        用户会觉得 agent 失忆(问过的又问、自我介绍要说三遍)。
+        """
+        graph, fake_cls = graph_env
+
+        await graph.run_event(
+            {
+                "conversation_id": "conv-multi",
+                "kind": "message",
+                "platform": "desktop",
+                "chat_type": "thread",
+                "external_id": "conv-multi",
+                "text": "我叫小明,晚上八点有课",
+                "is_self": False,
+            }
+        )
+        await graph.run_event(
+            {
+                "conversation_id": "conv-multi",
+                "kind": "message",
+                "platform": "desktop",
+                "chat_type": "thread",
+                "external_id": "conv-multi",
+                "text": "我叫什么?几点有课?",
+                "is_self": False,
+            }
+        )
+
+        # 第二次调用模型时,提示词里应同时有第一轮的"用户说了什么"和"我回了什么"
+        prompt = "\n".join(str(m.content) for m in fake_cls.seen_messages[-1])
+        assert "我叫小明,晚上八点有课" in prompt, f"第二轮看不到第一轮的用户消息:\n{prompt}"
+        assert "好的，我知道了" in prompt, f"第二轮看不到自己上一轮的回复:\n{prompt}"
+
+    @pytest.mark.asyncio
+    async def test_conversations_do_not_share_context(self, graph_env):
+        """会话隔离: A 会话说的话绝不出现在 B 会话的提示词里。
+
+        串台的后果比失忆更严重 —— 在一个人面前说出另一个人说过的私事。
+        """
+        graph, fake_cls = graph_env
+
+        await graph.run_event(
+            {
+                "conversation_id": "conv-secret-a",
+                "kind": "message",
+                "platform": "desktop",
+                "chat_type": "thread",
+                "external_id": "conv-secret-a",
+                "text": "A 的私事:银行卡密码是123456",
+                "is_self": False,
+            }
+        )
+        await graph.run_event(
+            {
+                "conversation_id": "conv-secret-b",
+                "kind": "message",
+                "platform": "desktop",
+                "chat_type": "thread",
+                "external_id": "conv-secret-b",
+                "text": "你是谁",
+                "is_self": False,
+            }
+        )
+
+        prompt = "\n".join(str(m.content) for m in fake_cls.seen_messages[-1])
+        assert "银行卡密码" not in prompt, f"会话之间串台了:\n{prompt}"
+        assert "你是谁" in prompt
+
+    @pytest.mark.asyncio
     async def test_timer_event_not_in_history(self, graph_env):
         """timer 事件不写入对话历史(它不是"人说的话")。"""
         graph, _ = graph_env
