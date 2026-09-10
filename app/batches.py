@@ -457,6 +457,19 @@ def load_progress(conversation_id: str) -> dict[str, Any]:
     return dict(row) if row is not None else {}
 
 
+def list_progress(limit: int = 50) -> list[dict[str, Any]]:
+    """列出各会话的攒批进度(按最近运行时间倒序)。
+
+    用途: 状态页/排障 —— "哪些会话还积压着、上一次为什么失败"。
+    只返回跑过攒批的会话(没跑过的没有进度行,自然是"还没到总结条件")。
+    """
+    rows = get_connection().execute(
+        "SELECT * FROM memory_batches ORDER BY last_run_at DESC LIMIT ?",
+        (max(1, int(limit)),),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
 def save_progress(
     conversation_id: str,
     *,
@@ -889,21 +902,49 @@ def parse_notes(text: Any) -> list[BatchNote]:
 
     容错: 模型偶发在 JSON 外套一层解释文字或代码块 —— 取最外层的 [...] 再解析。
     """
+    notes, _unparsed = parse_notes_with_diagnostics(text)
+    return notes
+
+
+# ---------------------------------------------------------------------------
+# 总结器健康度(防"静默丢批次")
+# ---------------------------------------------------------------------------
+# 为什么需要: 解析失败时返回空列表 → 业务上等于"这批没值得记的" →
+# 水位线照常推进 → 那批消息**永远不再被总结**。
+# 也就是说"提示词在真模型上不工作"这种故障，表现是完全静默的记忆缺失。
+# 这里把"模型给了输出但解析不出东西"单独计数并打日志,
+# 供冒烟脚本与健康检查发现。
+_SUMMARY_STATS: dict[str, int] = {"calls": 0, "empty": 0, "unparsed": 0}
+_LAST_UNPARSED_SAMPLE = ""
+
+
+def parse_notes_with_diagnostics(text: Any) -> tuple[list[BatchNote], bool]:
+    """解析模型输出;第二个返回值表示"有输出但解析不出内容"(可疑)。
+
+    三种情况要分清:
+      · 空输出 / 明确返回 []  → (空列表, False)  模型认为没价值,正常;
+      · 合法 JSON 但字段缺失  → (空列表, False)  同上(内容为空的条目会被跳过);
+      · 有输出但压根不是 JSON  → (空列表, True)  **可疑**: 提示词或模型出问题了。
+    """
+    global _LAST_UNPARSED_SAMPLE
     raw = str(text or "").strip()
     if not raw:
-        return []
+        return [], False
     if raw.startswith("```"):
         raw = raw.strip("`")
         raw = raw.split("\n", 1)[1] if "\n" in raw else ""
     start, end = raw.find("["), raw.rfind("]")
     if start < 0 or end <= start:
-        return []
+        _LAST_UNPARSED_SAMPLE = raw[:200]
+        return [], True
     try:
         parsed = json.loads(raw[start : end + 1])
     except json.JSONDecodeError:
-        return []
+        _LAST_UNPARSED_SAMPLE = raw[:200]
+        return [], True
     if not isinstance(parsed, list):
-        return []
+        _LAST_UNPARSED_SAMPLE = raw[:200]
+        return [], True
 
     notes: list[BatchNote] = []
     for item in parsed[:MAX_NOTES_PER_RUN]:
@@ -928,7 +969,27 @@ def parse_notes(text: Any) -> list[BatchNote]:
                 tags=item.get("tags") or (),
             )
         )
-    return notes
+    return notes, False
+
+
+def summary_health() -> dict[str, Any]:
+    """总结器健康度(排障/监控用): 调用次数、空结果、解析失败次数与样本。"""
+    return {
+        **_SUMMARY_STATS,
+        "last_unparsed_sample": _LAST_UNPARSED_SAMPLE,
+        "unparsed_ratio": (
+            round(_SUMMARY_STATS["unparsed"] / _SUMMARY_STATS["calls"], 3)
+            if _SUMMARY_STATS["calls"]
+            else 0.0
+        ),
+    }
+
+
+def reset_summary_stats() -> None:
+    """重置统计(测试用)。"""
+    global _LAST_UNPARSED_SAMPLE
+    _SUMMARY_STATS.update(calls=0, empty=0, unparsed=0)
+    _LAST_UNPARSED_SAMPLE = ""
 
 
 async def _llm_summarize(
@@ -942,4 +1003,15 @@ async def _llm_summarize(
     response = await _fast_model().ainvoke(
         [SystemMessage(content=_SUMMARY_SYSTEM_PROMPT), HumanMessage(content=prompt)]
     )
-    return parse_notes(getattr(response, "content", ""))
+    notes, unparsed = parse_notes_with_diagnostics(getattr(response, "content", ""))
+
+    _SUMMARY_STATS["calls"] += 1
+    if unparsed:
+        _SUMMARY_STATS["unparsed"] += 1
+        print(
+            f"[batches] 总结输出无法解析(已按空处理,这批消息不会再总结): "
+            f"{_LAST_UNPARSED_SAMPLE[:120]}"
+        )
+    elif not notes:
+        _SUMMARY_STATS["empty"] += 1
+    return notes

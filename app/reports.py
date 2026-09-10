@@ -363,6 +363,66 @@ def _now() -> str:
 # 复核器契约: (候选列表) -> 每条一个判定,形如
 #   {"id": "候选ID", "lane": "urgent"|"normal", "summary": "一句话"}
 # 由调用方注入(默认用快模型实现),测试注入假实现 —— 本模块不直接依赖 LLM。
+# ---------------------------------------------------------------------------
+# 快模型复核(默认实现)
+# ---------------------------------------------------------------------------
+# 复核提示词单独放在这里而不是 main.py 的组装闭包里,理由有两个:
+#   1. 可单测: 组装函数里的闭包没法单独调用,提示词改了也没有测试守着;
+#   2. 冒烟脚本(scripts/smoke_llm_paths.py)要验的正是**生产代码路径**——
+#      提示词藏在闭包里就只能验一个复制品,等于没验。
+REVIEW_SYSTEM_PROMPT = """\
+你在帮一个私人助理筛选 QQ 消息,判断哪些值得**立刻打扰号主**。
+对每条消息给出判定,只输出 JSON 数组,不要解释:
+[{"id":"原样返回","lane":"urgent|normal|digest","summary":"一句话摘要(不超过30字)","reason":"为什么"}]
+
+判定标准:
+- urgent: 有时间压力、需要号主尽快回应或决策(约好的事有变、马上要回复的邀请、紧急求助);
+- normal: 重要但不紧急,值得知道(有实质内容的信息、需要回但可以晚点);
+- digest: 只是被规则误命中,可以攒起来一起看(寒暄、群里的泛泛提问);
+拿不准时选 normal(漏报比多报更糟)。"""
+
+
+def parse_review_verdicts(text: Any) -> list[dict[str, Any]]:
+    """解析复核模型的输出(容错: 允许代码块与前后杂讯)。
+
+    解析失败抛 ValueError —— 调用方(flush_candidates)会捕获并**退化为纯规则**,
+    消息照常上报。这里刻意不"静默返回空": 空列表在业务上等于"一条都不用报",
+    会把重要消息悄悄丢掉。
+    """
+    raw = str(text or "").strip()
+    if raw.startswith("```"):
+        raw = raw.strip("`")
+        raw = raw[raw.find("[") :] if "[" in raw else raw
+    start, end = raw.find("["), raw.rfind("]")
+    if start < 0 or end < 0:
+        raise ValueError(f"复核结果不是 JSON 数组: {raw[:120]}")
+    parsed = json.loads(raw[start : end + 1])
+    if not isinstance(parsed, list):
+        raise ValueError("复核结果不是数组")
+    return [item for item in parsed if isinstance(item, dict)]
+
+
+def build_default_reviewer(llm_factory: Callable[[bool], Any]) -> Reviewer:
+    """用主模型工厂的 fast 通道构造复核器(生产用这个)。"""
+
+    async def reviewer(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        items = [
+            {
+                "id": str(item.get("id") or ""),
+                "text": str((item.get("payload") or {}).get("text") or "")[:500],
+                "sender": str((item.get("payload") or {}).get("sender_name") or ""),
+                "rules": (item.get("payload") or {}).get("reasons") or [],
+            }
+            for item in candidates
+        ]
+        prompt = f"{REVIEW_SYSTEM_PROMPT}\n\n消息列表:\n{json.dumps(items, ensure_ascii=False)}"
+        llm = llm_factory(True)
+        response = await llm.ainvoke(prompt)
+        return parse_review_verdicts(getattr(response, "content", ""))
+
+    return reviewer
+
+
 Reviewer = Callable[[list[dict[str, Any]]], Awaitable[list[dict[str, Any]]]]
 
 

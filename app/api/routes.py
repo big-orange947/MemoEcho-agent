@@ -22,10 +22,10 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException
 
-from ..agent.graph import ConversationBusyError
 from ..agent.runtime import get_graph
 from ..config import get_settings
 from ..events import Event, EventKind, EventSource, get_bus
+from .. import memory as memory_layer
 from ..services import conversations as conversations_service
 from ..services import eventlog
 from ..services import goals as goals_service
@@ -254,3 +254,41 @@ def list_events(
 def event_stats() -> dict[str, int]:
     """按事件类别统计条数(快速看系统都在处理什么)。"""
     return eventlog.count_by_kind()
+
+
+# ---------------------------------------------------------------------------
+# 记忆健康度(排障用)
+# ---------------------------------------------------------------------------
+@router.get("/memory/health", dependencies=[Depends(_check_token)])
+def memory_health() -> dict[str, Any]:
+    """长期记忆的健康状况 —— 专门用来发现"静默的记忆缺失"。
+
+    为什么需要这个接口: 攒批总结是长期记忆的**唯一入口**,而它的失效方式是
+    完全静默的 —— 模型输出解析不了时,业务上等同于"这批没值得记的",
+    水位线照常推进,那批消息再也不会被总结。没有这个接口,只能翻服务日志。
+
+    返回:
+      enabled          记忆功能是否启用
+      init_error       Doppel 初始化失败原因(空=正常)
+      summary          总结器统计(调用/空结果/解析失败次数 + 失败样本)
+      batches          各会话的攒批进度(待处理条数、上次状态与错误)
+    """
+    from .. import batches as batches_module
+
+    batches = [
+        {
+            "conversation_id": row["conversation_id"],
+            "pending_count": row["pending_count"],
+            "last_status": row["last_status"],
+            "last_error": row["last_error"],
+            "last_run_at": row["last_run_at"],
+        }
+        for row in batches_module.list_progress(limit=50)
+    ]
+    return {
+        "enabled": memory_layer.is_enabled(),
+        "init_error": memory_layer.init_error(),
+        "summary": batches_module.summary_health(),
+        "batches": batches,
+    }
+

@@ -23,7 +23,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from typing import Any
 
 import uvicorn
@@ -101,43 +100,8 @@ def create_app() -> FastAPI:
     #     为什么批量: 每条候选单独调一次模型成本不可接受;合并成一次调用是成本关键。
     #     失败怎么办: 抛异常会被 reports.flush_candidates 捕获并**退化为纯规则** ——
     #                 宁可多报一条,也不能因为模型抖动把急事漏掉。
-    async def reports_reviewer(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        items = [
-            {
-                "id": str(item.get("id") or ""),
-                "text": str((item.get("payload") or {}).get("text") or "")[:500],
-                "sender": str((item.get("payload") or {}).get("sender_name") or ""),
-                "rules": (item.get("payload") or {}).get("reasons") or [],
-            }
-            for item in candidates
-        ]
-        prompt = (
-            "你在帮一个私人助理筛选 QQ 消息,判断哪些值得**立刻打扰号主**。\n"
-            "对每条消息给出判定,只输出 JSON 数组,不要解释:\n"
-            '[{"id":"原样返回","lane":"urgent|normal|digest",'
-            '"summary":"一句话摘要(不超过30字)","reason":"为什么"}]\n\n'
-            "判定标准:\n"
-            "- urgent: 有时间压力、需要号主尽快回应或决策(约好的事有变、马上要回复的邀请、紧急求助);\n"
-            "- normal: 重要但不紧急,值得知道(有实质内容的信息、需要回但可以晚点);\n"
-            "- digest: 只是被规则误命中,可以攒起来一起看(寒暄、群里的泛泛提问);\n"
-            "拿不准时选 normal(漏报比多报更糟)。\n\n"
-            f"消息列表:\n{json.dumps(items, ensure_ascii=False)}"
-        )
-
-        llm = llm_factory(fast=True)
-        response = await llm.ainvoke(prompt)
-        text = str(getattr(response, "content", "") or "").strip()
-        # 模型偶尔会带 markdown 代码块,剥掉再解析
-        if text.startswith("```"):
-            text = text.strip("`")
-            text = text[text.find("[") :] if "[" in text else text
-        start, end = text.find("["), text.rfind("]")
-        if start < 0 or end < 0:
-            raise ValueError(f"复核结果不是 JSON 数组: {text[:120]}")
-        parsed = json.loads(text[start : end + 1])
-        if not isinstance(parsed, list):
-            raise ValueError("复核结果不是数组")
-        return [item for item in parsed if isinstance(item, dict)]
+    #     实现见 app/reports.py(提示词与解析都在那里,便于单测与冒烟验证)。
+    reports_reviewer = reports_service.build_default_reviewer(llm_factory)
 
     # 4c. 上报队列后台 worker
     #     每隔一段时间做三件事(都在 app/reports.py 里,这里只负责定时触发):

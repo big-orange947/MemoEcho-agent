@@ -341,6 +341,19 @@ class TestEventApi:
         stats = client.get("/api/events/stats").json()
         assert stats.get("message", 0) >= 1
 
+    def test_memory_health_endpoint(self, client):
+        """记忆健康度接口: 专门用来发现"静默的记忆缺失"。
+
+        攒批是长期记忆的唯一入口,解析失败时业务上等同于"没值得记的",
+        水位线照常推进 —— 没有这个接口就只能翻日志。
+        """
+        body = client.get("/api/memory/health").json()
+        assert "enabled" in body
+        assert "summary" in body
+        # 统计字段齐全(状态页/排障直接读)
+        assert set(body["summary"]) >= {"calls", "empty", "unparsed", "last_unparsed_sample"}
+        assert isinstance(body["batches"], list)
+
     def test_events_filtered_by_conversation(self, client):
         client.post("/api/conversations/conv-evt-1/messages", json={"text": "测试"})
         events = client.get(
