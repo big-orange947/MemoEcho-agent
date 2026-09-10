@@ -29,6 +29,7 @@ from langgraph.graph import END, START, StateGraph
 
 from ..config import get_settings
 from ..services import conversations as conversations_service
+from ..services import policy as policy_service
 from . import state as state_schema
 from .nodes import act, finalize, ingest, reflect, retrieve, reason
 
@@ -104,9 +105,14 @@ class AgentGraph:
 
         # reason/act/reflect 需要注入外部依赖(llm/tools),用闭包包装
         def _reason(state: dict[str, Any]) -> dict[str, Any]:
-            # 决策用主模型 + bind_tools(让 LLM 原生选择工具)
-            llm = self.llm_factory(fast=False).bind_tools(self.tools)
-            return reason.run(state, llm, self.tools)
+            # 决策用主模型 + bind_tools(让 LLM 原生选择工具)。
+            # 关键: 只把**本会话授权**的工具给模型 —— 未授权的工具它连看都看不到,
+            # 这是权限的第一层(第二层在 act 节点与工具内部)。
+            tools = self._tools_for(state)
+            llm = self.llm_factory(fast=False)
+            if tools:
+                llm = llm.bind_tools(tools)
+            return reason.run(state, llm, tools)
 
         async def _act(state: dict[str, Any]) -> dict[str, Any]:
             # act 是异步节点: 工具可能做异步 IO(如给联系人发消息),
@@ -226,8 +232,9 @@ class AgentGraph:
         流程:
           1. 确保 checkpoint 就绪(首次调用时惰性创建);
           2. 定位会话(查库/新建),得到 conversation_id;
-          3. **会话级排队**: 同一会话的事件串行执行(见下方说明);
-          4. 预置 state → 跑图 → 取最终回复。
+          3. 按会话策略解析**本次可用的工具集**(权限收口,见 _tools_for);
+          4. **会话级排队**: 同一会话的事件串行执行(见下方说明);
+          5. 预置 state → 跑图 → 取最终回复。
 
         为什么要会话级串行化:
           同一会话的所有事件都写同一份 LangGraph checkpoint(thread_id =
@@ -255,7 +262,15 @@ class AgentGraph:
         if event.get("conversation_id"):
             conversations_service.ensure_conversation_by_id(conversation_id)
 
-        # ---- 2. 入队(计数 + 限流) ----
+        # ---- 2. 解析本次可用的工具集(权限) ----
+        # 放在这里而不是节点里: 工具集是"这次执行"的属性,随 state 传下去,
+        # reason 据此 bind_tools、act 据此拒绝未授权调用 —— 两层都在同一条数据上。
+        conversation = conversations_service.get_conversation(conversation_id) or {}
+        allowed_tools = policy_service.resolve_allowed_tools(
+            conversation, {tool.name: set(tool.tags or []) for tool in self.tools}
+        )
+
+        # ---- 3. 入队(计数 + 限流) ----
         # 注意: _inflight 在等待锁**之前**自增,所以它统计的是
         # "正在跑 + 排队中"的总数,这正是限流想要的口径。
         # 以下三行之间没有 await,在事件循环中是原子的,不会被并发打断。
@@ -271,18 +286,34 @@ class AgentGraph:
 
         try:
             async with lock:
-                # ---- 3. 确保 checkpoint 就绪 ----
+                # ---- 4. 确保 checkpoint 就绪 ----
                 # 放在锁内(且在计数之后): 一是并发初始化由 _saver_lock 保护,
                 # 二是计数已经反映了真实排队情况 —— 若放在计数之前 await,
                 # 首次初始化期间 is_busy() 会看不到排队中的任务。
                 await self._ensure_checkpointer()
-                # ---- 4. 跑图(同一会话内串行) ----
-                return await self._run_graph(event, conversation_id)
+                # ---- 5. 跑图(同一会话内串行) ----
+                return await self._run_graph(event, conversation_id, allowed_tools)
         finally:
             self._release_conversation(conversation_id)
 
+    def _tools_for(self, state: dict[str, Any]) -> list[BaseTool]:
+        """按 state 里的授权集合过滤工具(未解析时视为全量,兼容直接调用)。
+
+        授权数据由 run_event 放进 state.allowed_tools。
+        """
+        names = state.get("allowed_tools")
+        if names is None:
+            return self.tools
+        allowed = set(names)
+        return [tool for tool in self.tools if tool.name in allowed]
+
     # ------------------------------------------------------------------ 内部执行
-    async def _run_graph(self, event: dict[str, Any], conversation_id: str) -> str | None:
+    async def _run_graph(
+        self,
+        event: dict[str, Any],
+        conversation_id: str,
+        allowed_tools: set[str] | None = None,
+    ) -> str | None:
         """真正跑一次图(调用方已持有该会话的锁)。
 
         构造初始 state: LangGraph 会以 thread_id 从 checkpoint 恢复
@@ -296,6 +327,8 @@ class AgentGraph:
             "tool_results": [],
             "decision": {},
             "output_text": "",
+            # 本次可用的工具名(权限收口);None = 不限制
+            "allowed_tools": sorted(allowed_tools) if allowed_tools is not None else None,
         }
 
         result = await self.graph.ainvoke(

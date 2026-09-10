@@ -84,6 +84,16 @@ class Settings(BaseSettings):
     # 每次检索注入的长期记忆条数上限(控制 prompt 体积)
     memory_recall_limit: int = 6
 
+    # ---------------------------------------------------------------- 上报成本
+    # 重要消息复核的每日预算(次/天)。复核用快模型,一天最多调用这么多次;
+    # 超限后自动退化为纯规则(消息照常上报,只是不再做模型判断)。
+    # 设为 0 表示不限(不推荐: 失控的群会烧钱)。
+    alert_llm_daily_budget: int = 200
+
+    # 订阅式通知(上游 agent 消费)长轮询单次最长等待秒数。
+    # 上游用 GET /api/reports/subscribe 挂起等待新消息,避免空转轮询。
+    notify_poll_seconds: int = 25
+
     model_config = SettingsConfigDict(
         # 允许从 .env 文件读取(与 local-env.ps1 二选一,二选一即可)
         env_file=".env",

@@ -19,34 +19,25 @@
 #
 # 输入 State: conversation_id, event
 # 输出 State: messages(追加一条归一化消息)/ working_memory(定时唤醒时)
+#
+# 长期记忆: 本节点**不写**。逐条写会把记忆碎成一堆"嗯""好的",所以
+# 长期记忆改由攒批写入 —— 消息先落在 messages 表,由 app/batches.py
+# (调度器低频驱动)按窗口总结后再写入 Doppel。
 # =============================================================================
 
 from __future__ import annotations
 
-import uuid
-from datetime import datetime, timezone
 from typing import Any
 
+from ...recorder import build_message
 from ...services import conversations as conversations_service
-
-# 各 kind 对应的消息角色与来源标记
-# role:   user(对方) / assistant(自己) / system(系统记录)
-# source: inbound / outbound / system
-_KIND_ROLE: dict[str, tuple[str, str]] = {
-    "message": ("user", "inbound"),
-    "instruction": ("user", "inbound"),
-    "command": ("user", "inbound"),
-    "message_sent": ("assistant", "outbound"),
-    "notice": ("system", "system"),
-    "request": ("system", "system"),
-    "system": ("system", "system"),
-}
 
 
 async def run(state: dict[str, Any]) -> dict[str, Any]:
-    """处理当前事件: 分流 → 归一化 → 去重 → 写入历史 + 长期记忆。
+    """处理当前事件: 分流 → 归一化 → 去重 → 写入历史。
 
-    注意: 这是异步节点(记忆写入是异步 IO),LangGraph 原生支持。
+    长期记忆不在这里写(见文件头注释): 本节点只负责把消息落进 messages 表,
+    攒批总结由 app/batches.py 负责。
     """
     event = state.get("event") or {}
     conversation_id = state.get("conversation_id") or ""
@@ -74,29 +65,10 @@ async def run(state: dict[str, Any]) -> dict[str, Any]:
         )
 
     # ---------------------------------------------------------------- 2. 归一化消息
-    # 事件 ID 直接用作消息 ID: 平台重推同一事件时消息 ID 相同 → 天然幂等。
-    msg_id = event.get("event_id") or uuid.uuid4().hex
-
-    # 角色与来源按 kind 决定(未知 kind 按"对方消息"兜底)
-    role, source = _KIND_ROLE.get(kind, ("user", "inbound"))
-
-    # 机器人自己发出的消息一律按 assistant 记
-    # (message_sent 已映射为 assistant;这里兜底其它来源的 is_self 事件)
-    if event.get("is_self"):
-        role, source = "assistant", "outbound"
-
-    message = {
-        "id": msg_id,
-        "role": role,
-        "content": event.get("text", ""),
-        "source": source,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "goal_id": state.get("goal", {}).get("id", "") if state.get("goal") else "",
-        # 结构化内容段原样留存: 供后续"取图片/引用回复"等高级处理,
-        # 也便于事后核对"当时到底收到了什么"(text 是渲染结果,细节会有损失)
-        "content_parts": event.get("content") or [],
-        "sender_name": event.get("sender_name") or "",
-    }
+    # 归一化与"仅记录"路径共用同一实现(app/recorder.py),避免两处形态漂移。
+    goal = state.get("goal") or {}
+    message = build_message(event, goal_id=str(goal.get("id") or ""))
+    msg_id = str(message["id"])
 
     # ---------------------------------------------------------------- 3. 去重 + 落库
     # 幂等的**真正含义**: 同一条消息重复进来(平台重推)时,
@@ -105,7 +77,7 @@ async def run(state: dict[str, Any]) -> dict[str, Any]:
     #
     # 判断依据: 该会话里是否已存在这个 message_id。
     #   · 存在 → 这条消息处理过 → 返回 duplicate=True,由条件边直接结束;
-    #   · 不存在 → 正常流程(落库 → 记忆 → 推理)。
+    #   · 不存在 → 正常流程(落库 → 推理)。
     #
     # 例外: instruction(调度指令)用带随机后缀的 ID,且即便重复也更希望
     # 重新执行(调用方明确要求),所以不参与短路。
@@ -117,15 +89,7 @@ async def run(state: dict[str, Any]) -> dict[str, Any]:
 
     conversations_service.add_message(conversation_id, message)
 
-    # ---------------------------------------------------------------- 4. 写入长期记忆
-    # 把这条消息喂给 Doppel(它会做抽取/合并,形成长期事实)。
-    # 注意: 这里只对**对话消息**调用 —— 通知/请求等系统事件不入记忆,
-    # 否则"好友撤回了一条消息"这种流水会污染记忆语义。
-    # 写入是 best-effort: 失败只记日志,不影响对话。
-    if kind in ("message", "instruction", "message_sent"):
-        await _remember(conversation_id, message)
-
-    # ---------------------------------------------------------------- 5. 更新状态
+    # ---------------------------------------------------------------- 4. 更新状态
     # 返回新的 conversation_id(首次创建时才有值)和追加后的消息列表。
     # add_messages reducer 会自动按 ID 去重,这里直接返回 [message] 即可。
     return {
@@ -133,31 +97,3 @@ async def run(state: dict[str, Any]) -> dict[str, Any]:
         "duplicate": False,
         "messages": [message],
     }
-
-
-async def _remember(conversation_id: str, message: dict[str, Any]) -> None:
-    """把消息写入长期记忆(best-effort)。
-
-    为什么本节点是 async:
-      记忆写入是异步 IO,而同步节点跑在线程池里(拿不到事件循环),
-      无法 await。做成异步节点后可以直接 await,逻辑最直白。
-      代价是写入会稍许拉长这一轮执行 —— Doppel 的 SQLite 写入是毫秒级,
-      相比后面要跑的 LLM 调用可以忽略。
-
-    失败降级: memory.remember_message 内部已吞掉异常并返回 False,
-    这里不再判断返回值 —— 记忆写没写成功,都不该影响这次对话。
-    """
-    from ... import memory
-
-    conversation = conversations_service.get_conversation(conversation_id) or {}
-    if not conversation:
-        return
-    await memory.remember_message(
-        conversation,
-        role=str(message.get("role") or ""),
-        content=str(message.get("content") or ""),
-        created_at=str(message.get("created_at") or ""),
-        message_id=str(message.get("id") or ""),
-        source=str(message.get("source") or ""),
-        parts=message.get("content_parts") or None,
-    )

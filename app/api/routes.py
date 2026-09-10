@@ -1,14 +1,17 @@
 # =============================================================================
 # api/routes.py - 桌面端 HTTP 接口
 # -----------------------------------------------------------------------------
-# 桌面端(前端)通过这里读写数据、下发命令。
+# 桌面端(前端)与上游主 agent 通过这里读写数据、下发命令。
 # 接口设计尽量简单直接,每个接口对应一个明确动作:
 #
-#   GET  /api/conversations                会话列表
-#   GET  /api/conversations/{id}/messages  消息历史
-#   POST /api/conversations/{id}/messages  桌面端发一条消息(触发 agent)
-#   POST /api/conversations/{id}/goal      在会话上挂一个目标(命令)
-#   GET  /api/conversations/{id}/goals     目标列表(进度卡)
+#   GET   /api/conversations                会话列表(含策略)
+#   POST  /api/conversations/resolve        按三元组定位/创建会话(配置前置步骤)
+#   GET   /api/conversations/{id}           单个会话详情(含策略)
+#   PATCH /api/conversations/{id}           改会话配置: 策略开关 + 人设/注意事项
+#   GET   /api/conversations/{id}/messages  消息历史
+#   POST  /api/conversations/{id}/messages  桌面端发一条消息(触发 agent)
+#   POST  /api/conversations/{id}/goal      在会话上挂一个目标(命令)
+#   GET   /api/conversations/{id}/goals     目标列表(进度卡)
 #
 # 鉴权: 本地使用,api_token 为空则放行;非空则要求 Authorization: Bearer <token>。
 # =============================================================================
@@ -26,8 +29,12 @@ from ..events import Event, EventKind, EventSource, get_bus
 from ..services import conversations as conversations_service
 from ..services import eventlog
 from ..services import goals as goals_service
+from ..services import policy as policy_service
 
 router = APIRouter(prefix="/api")
+
+# 会话行里可以改的非策略字段(会话档案)
+PROFILE_FIELDS = ("title", "persona", "model_name")
 
 
 # ---------------------------------------------------------------------------
@@ -42,13 +49,110 @@ def _check_token(authorization: str | None = Header(default=None)) -> None:
         raise HTTPException(status_code=401, detail="unauthorized")
 
 
+def _conversation_view(conversation: dict[str, Any]) -> dict[str, Any]:
+    """会话对外视图: 原始行 + 归一化后的 policy(前端/上游直接可用)。
+
+    为什么要归一化: 库里存的是 monitor=0/1、alert_keywords='["急事"]' 这种原始形态,
+    直接给前端会逼着每个调用方各写一遍解析。这里统一成 bool / 列表 / 字符串枚举。
+    """
+    view = dict(conversation)
+    view["policy"] = policy_service.normalize_policy(conversation)
+    return view
+
+
 # ---------------------------------------------------------------------------
 # 会话
 # ---------------------------------------------------------------------------
 @router.get("/conversations", dependencies=[Depends(_check_token)])
 def list_conversations() -> list[dict[str, Any]]:
-    """返回会话列表(按最近活跃排序),供左侧栏展示。"""
-    return conversations_service.list_conversations()
+    """返回会话列表(按最近活跃排序),供左侧栏展示。每条都带归一化后的策略。"""
+    return [_conversation_view(c) for c in conversations_service.list_conversations()]
+
+
+@router.post("/conversations/resolve", dependencies=[Depends(_check_token)])
+def resolve_conversation(body: dict[str, Any]) -> dict[str, Any]:
+    """按平台三元组定位会话,不存在则创建,返回会话对象(含策略)。
+
+    为什么需要这个接口:
+      会话策略默认全关 —— 未开启监视的会话**不会有任何消息**,因此前端/主 agent
+      在"配置一个还不存在的会话"时无从下手(没有 ID 可 PATCH)。
+      本接口用 (platform, chat_type, external_id) 直接建行并返回 ID。
+
+    请求体: {"platform":"qq","chat_type":"private","external_id":"2597164807","title":"小号"}
+    """
+    platform = str(body.get("platform") or "").strip()
+    chat_type = str(body.get("chat_type") or "private").strip()
+    external_id = str(body.get("external_id") or "").strip()
+    if not platform or not external_id:
+        raise HTTPException(status_code=400, detail="platform 与 external_id 必填")
+
+    conversation_id = conversations_service.ensure_conversation(platform, chat_type, external_id)
+    title = str(body.get("title") or "").strip()
+    if title:
+        conversations_service.update_profile(conversation_id, title=title)
+
+    conversation = conversations_service.get_conversation(conversation_id) or {}
+    return _conversation_view(conversation)
+
+
+@router.get("/conversations/{conversation_id}", dependencies=[Depends(_check_token)])
+def get_conversation(conversation_id: str) -> dict[str, Any]:
+    """读取单个会话详情(含归一化策略)。"""
+    conversation = conversations_service.get_conversation(conversation_id)
+    if conversation is None:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    return _conversation_view(conversation)
+
+
+@router.patch("/conversations/{conversation_id}", dependencies=[Depends(_check_token)])
+def update_conversation(conversation_id: str, body: dict[str, Any]) -> dict[str, Any]:
+    """修改会话配置: 值守策略 + 会话档案(人设/注意事项)。
+
+    请求体(全可选,只传要改的):
+    ```json
+    {
+      "monitor": true,                    // 监视开关(总开关)
+      "reply_mode": "auto",               // off | draft | auto
+      "alert_enabled": true,              // 重要消息上报
+      "alert_keywords": ["急事","改时间"],
+      "require_human_confirmation": true, // 拿不准必须请示
+      "digest_window_seconds": 1800,      // 攒批窗口
+      "digest_max_messages": 20,          // 攒批条数
+      "allowed_tools": ["send_qq_message"],// 工具授权(空=按会话类型默认)
+      "persona": "注意别答应晚上十点后的活动"   // 注意事项/人设
+    }
+    ```
+
+    返回: {"conversation": 会话视图, "changed": {字段: [旧值,新值]}, "implied": [自动打开的开关]}
+    """
+    if not body:
+        raise HTTPException(status_code=400, detail="请求体不能为空")
+
+    conversation = conversations_service.get_conversation(conversation_id)
+    if conversation is None:
+        raise HTTPException(status_code=404, detail="会话不存在")
+
+    policy_changes = {key: value for key, value in body.items() if key in policy_service.POLICY_FIELDS}
+    profile_changes = {key: value for key, value in body.items() if key in PROFILE_FIELDS}
+    unknown = set(body) - set(policy_changes) - set(profile_changes)
+    if unknown:
+        raise HTTPException(status_code=400, detail=f"不支持的字段: {sorted(unknown)}")
+
+    changed: dict[str, Any] = {}
+    implied: list[str] = []
+    if policy_changes:
+        try:
+            result = policy_service.update_policy(conversation_id, **policy_changes)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        changed.update(result["changed"])
+        implied = result["implied"]
+    if profile_changes:
+        changed.update(conversations_service.update_profile(conversation_id, **profile_changes))
+
+    updated = conversations_service.get_conversation(conversation_id) or {}
+    return {"conversation": _conversation_view(updated), "changed": changed, "implied": implied}
+
 
 
 @router.get("/conversations/{conversation_id}/messages", dependencies=[Depends(_check_token)])

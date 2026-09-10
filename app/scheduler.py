@@ -1,24 +1,32 @@
 # =============================================================================
 # scheduler.py - 定时唤醒调度器(时间驱动的心脏)
 # -----------------------------------------------------------------------------
-# 职责: 每秒扫一次 scheduled_events 表,把到期记录变成 timer 事件发给事件总线。
+# 职责(两条,频率差两个数量级):
+#   1. 每秒扫一次 scheduled_events 表,把到期记录变成 timer 事件发给事件总线;
+#   2. 每 BATCH_SCAN_INTERVAL_SECONDS(60 秒)扫一次"攒批记忆"
+#      (见 app/batches.py),把该总结的会话各总结一轮。
 #
 # 为什么需要它:
 #   - 纯"消息驱动"只能处理"对方说了话才动"的场景;
 #   - "等 10 分钟没回就催一下"这类任务需要"时间驱动":
 #     wait 工具负责登记,这里负责到点唤醒;
 #   - 事件进总线后,AgentGraph 收到 timer 事件,从 checkpoint 恢复会话继续跑图。
+#   - 长期记忆需要"攒一批再总结",而"攒够了/对方不说话了"这两个条件
+#     都只能由时间驱动的定时扫描发现(消息路径不知道"以后还会不会来消息")。
 #
 # 可靠性:
 #   - 状态在 SQLite(pending/fired),服务重启后未到期的记录依然有效;
-#   - 到期但发布失败的记录保持 pending,下个周期重试(至多重复一次)。
+#   - 到期但发布失败的记录保持 pending,下个周期重试(至多重复一次);
+#   - 攒批扫描低频 + 单轮只允许一个在跑(见 _scan_batches 注释)。
 # =============================================================================
 
 from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
+from typing import Any
 
+from . import batches
 from .events import Event, EventKind, EventSource, get_bus
 from .services import schedules as schedules_service
 
@@ -26,14 +34,23 @@ from .services import schedules as schedules_service
 POLL_INTERVAL_SECONDS = 1.0
 # 每轮最多处理多少条到期记录(防积压雪崩,见 _tick 注释)
 MAX_FIRED_PER_TICK = 10
+# 攒批记忆扫描间隔(秒)。刻意比定时唤醒慢两个数量级:
+#   · 单次扫描会调 LLM 总结,成本高;
+#   · 触发条件是"攒够 N 条"或"静止半小时",秒级精度毫无意义;
+#   · 每秒扫库(还带 COUNT/MAX 查询)纯属浪费。
+BATCH_SCAN_INTERVAL_SECONDS = 60.0
 
 
 class Scheduler:
-    """定时唤醒调度器: 后台任务,到期发 timer 事件。"""
+    """定时唤醒调度器: 后台任务,到期发 timer 事件 + 定期攒批记忆。"""
 
     def __init__(self) -> None:
         self._running = False
         self._task: asyncio.Task | None = None
+        # 上次攒批扫描的时刻(单调时钟;0 = 还没扫过,启动后第一轮就补扫一次)
+        self._last_batch_scan = 0.0
+        # 正在跑的攒批任务(一次只允许一个,见 _scan_batches)
+        self._batch_task: asyncio.Task | None = None
 
     # ------------------------------------------------------------ 生命周期
     def start(self) -> None:
@@ -46,6 +63,17 @@ class Scheduler:
     async def stop(self) -> None:
         """停止后台任务(应用退出时调用)。"""
         self._running = False
+        if self._batch_task is not None and not self._batch_task.done():
+            # 攒批任务可能正卡在 LLM 调用上,取消它 —— 它没有不可中断的副作用
+            # (写入只在整轮结束时由 Doppel 提交,检查点没提交就下次重来)。
+            self._batch_task.cancel()
+            try:
+                await self._batch_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:  # noqa: BLE001 - 退出时的清理失败无需打扰用户
+                print(f"[scheduler] 攒批任务退出异常: {type(exc).__name__}: {exc}")
+            self._batch_task = None
         if self._task is not None:
             self._task.cancel()
             try:
@@ -60,6 +88,7 @@ class Scheduler:
         while self._running:
             try:
                 await self._tick()
+                await self._maybe_scan_batches()
             except Exception as exc:  # noqa: BLE001 - 轮询任务不能因单次异常退出
                 print(f"[scheduler] 轮询异常: {type(exc).__name__}: {exc}")
             await asyncio.sleep(POLL_INTERVAL_SECONDS)
@@ -85,6 +114,47 @@ class Scheduler:
             # 若在这里 await,图执行(一次 LLM 调用可能数十秒)会把
             # scheduler 卡死,导致其它到期任务无法及时触发。
             asyncio.create_task(self._publish_timer(record))
+
+    # ------------------------------------------------------------ 攒批记忆
+    async def _maybe_scan_batches(self) -> None:
+        """到点才发起攒批扫描(默认 60 秒一次)。
+
+        用单调时钟(asyncio 的 loop.time)而不是墙上时钟计时:
+        系统时间被改(校时/NTP)不该让扫描停摆或突然连发。
+        """
+        now = asyncio.get_running_loop().time()
+        if now - self._last_batch_scan < BATCH_SCAN_INTERVAL_SECONDS:
+            return
+        self._last_batch_scan = now
+        # 上一轮还没跑完就跳过这一轮: 总结要调 LLM(可能数十秒),
+        # 若允许重叠,同一会话会被并发总结 —— 既浪费 token,
+        # 也可能让两轮各自基于旧水位线写出重复记忆。
+        if self._batch_task is not None and not self._batch_task.done():
+            return
+        self._batch_task = asyncio.create_task(self._scan_batches())
+
+    async def _scan_batches(self) -> None:
+        """跑一轮攒批扫描(后台任务)。
+
+        不 await 进轮询循环的理由与 _publish_timer 一致: 一次总结可能要跑
+        LLM 数十秒,阻塞轮询会让到期的定时唤醒集体迟到。
+        异常在这里就地吞掉 —— 攒批失败只是"这批记忆晚点再写",
+        绝不能影响调度循环(与 _poll_loop 的 try/except 同一原则)。
+        """
+        try:
+            summary = await batches.run_due_batches()
+        except Exception as exc:  # noqa: BLE001 - 攒批失败不能影响调度循环
+            print(f"[scheduler] 攒批记忆扫描失败: {type(exc).__name__}: {exc}")
+            return
+
+        failed = [run for run in summary.get("runs", []) if run.get("status") == "error"]
+        if summary.get("runs"):
+            print(
+                f"[scheduler] 攒批记忆: 处理 {len(summary['runs'])} 个会话,"
+                f"写入 {summary.get('written', 0)} 条记忆"
+            )
+        for run in failed:
+            print(f"[scheduler] 会话 {run.get('conversation_id')} 攒批失败: {run.get('error')}")
 
     async def _publish_timer(self, record: dict[str, Any]) -> None:
         """把一条到期记录转成 timer 事件发布(后台任务)。

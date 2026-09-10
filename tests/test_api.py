@@ -78,6 +78,21 @@ def client(temp_data_dir, monkeypatch):
         yield test_client
 
 
+def enable_policy(platform: str, chat_type: str, external_id: str, **policy) -> str:
+    """测试辅助: 为指定会话开启策略。
+
+    背景: 会话策略**默认全关**(不记录、不回复)—— 所以凡是要验证
+    "收到消息会怎样"的用例,都必须先显式开启对应开关,而不是依赖默认值。
+    返回会话 ID。
+    """
+    from app.services import conversations as conversations_service
+    from app.services import policy as policy_service
+
+    conversation_id = conversations_service.ensure_conversation(platform, chat_type, external_id)
+    policy_service.update_policy(conversation_id, **policy)
+    return conversation_id
+
+
 # ---------------------------------------------------------------------------
 # 基础接口
 # ---------------------------------------------------------------------------
@@ -106,6 +121,8 @@ class TestConversationApi:
 
     def test_message_idempotent(self, client):
         """同一事件重复发布: 消息不重复落库(幂等)。"""
+        # 先开启监视(否则默认不记录任何消息,这条用例就没有意义了)
+        enable_policy("qq", "private", "12345", monitor=1)
         # 通过 webhook 发同一 message_id 两次(更贴近真实重推场景)
         payload = {
             "post_type": "message",
@@ -124,6 +141,48 @@ class TestConversationApi:
         # 入站消息只有一条(第二次被去重)
         inbound = [m for m in msgs if m["source"] == "inbound"]
         assert len(inbound) == 1
+
+    def test_default_policy_silent(self, client):
+        """默认策略(全关): 只留审计,不落库、不回复。"""
+        payload = {
+            "post_type": "message",
+            "message_type": "private",
+            "user_id": 70001,
+            "message_id": 9001,
+            "message": [{"type": "text", "data": {"text": "未配置的会话"}}],
+        }
+        client.post("/qq/webhook", json=payload)
+
+        # 会话行仍会被审计/定位逻辑创建,但**不该有**任何对话消息
+        convs = client.get("/api/conversations").json()
+        target = [c for c in convs if c["external_id"] == "70001"]
+        for conv in target:
+            msgs = client.get(f"/api/conversations/{conv['id']}/messages").json()
+            assert msgs == [], f"默认关闭却记录了消息: {msgs}"
+
+        # 审计里能查到这条消息(排障用)
+        events = client.get("/api/events", params={"kind": "message"}).json()
+        assert any(e["id"] == "qq-message-9001" for e in events)
+
+    def test_monitor_only_records_without_reply(self, client):
+        """只开监视、不开回复: 消息入库,但 QQ 端没有任何回复。"""
+        enable_policy("qq", "private", "70002", monitor=1)
+        client.post(
+            "/qq/webhook",
+            json={
+                "post_type": "message",
+                "message_type": "private",
+                "user_id": 70002,
+                "message_id": 9002,
+                "message": [{"type": "text", "data": {"text": "只监视"}}],
+            },
+        )
+
+        convs = client.get("/api/conversations").json()
+        target = next(c for c in convs if c["external_id"] == "70002")
+        msgs = client.get(f"/api/conversations/{target['id']}/messages").json()
+        assert [m["role"] for m in msgs] == ["user"]
+        assert msgs[0]["content"] == "只监视"
 
     def test_goal_creation(self, client):
         resp = client.post(
@@ -145,6 +204,7 @@ class TestConversationApi:
 class TestQQWebhook:
     def test_array_message_parsed(self, client):
         """核心回归: 数组格式消息解析正确(之前 str() 会把它变成乱码)。"""
+        enable_policy("qq", "private", "20001", monitor=1)
         payload = {
             "post_type": "message",
             "message_type": "private",
@@ -207,7 +267,8 @@ class TestQQWebhook:
         assert events[0]["should_respond"] == 0
 
     def test_group_message_needs_at(self, client):
-        """群聊未 @ 机器人 → 不回复。"""
+        """群聊未 @ 机器人 → 不回复(即使开了自动回复)。"""
+        enable_policy("qq", "group", "55555", reply_mode="auto")
         payload = {
             "post_type": "message",
             "message_type": "group",
@@ -224,7 +285,8 @@ class TestQQWebhook:
             assert [m for m in msgs if m["role"] == "assistant"] == []
 
     def test_group_message_with_at_responds(self, client):
-        """群聊 @ 机器人 → 回复。"""
+        """群聊 @ 机器人 + 开启自动回复 → 回复。"""
+        enable_policy("qq", "group", "55556", reply_mode="auto")
         payload = {
             "post_type": "message",
             "message_type": "group",

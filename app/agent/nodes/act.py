@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from langchain_core.messages import AIMessage, ToolMessage
@@ -38,6 +39,11 @@ async def run(state: dict[str, Any], tools_by_name: dict[str, Any]) -> dict[str,
     conversation_id = state.get("conversation_id") or ""
     tool_config = {"configurable": {"thread_id": conversation_id}}
 
+    # 本会话授权的工具集(由 graph.run_event 解析后放进 state)。
+    # None = 未解析(直接调用/测试) → 不做限制。
+    allowed = state.get("allowed_tools")
+    allowed_set = set(allowed) if allowed is not None else None
+
     # 逐个执行工具调用,收集 ToolMessage
     tool_messages: list[ToolMessage] = []
     for call in latest.tool_calls:
@@ -48,6 +54,11 @@ async def run(state: dict[str, Any], tools_by_name: dict[str, Any]) -> dict[str,
         tool = tools_by_name.get(tool_name)
         if tool is None:
             result_text = f"错误: 工具 {tool_name} 不存在"
+        elif allowed_set is not None and tool_name not in allowed_set:
+            # 第二层权限拦截。正常情况下模型看不到未授权的工具(reason 只 bind 授权集),
+            # 走到这里意味着模型幻觉、历史消息残留或调用被绕过 —— 必须拒绝并留痕。
+            result_text = f"错误: 工具 {tool_name} 在当前会话未授权,已拒绝执行"
+            _audit_denied(conversation_id, tool_name)
         else:
             try:
                 # ainvoke 同时支持同步与异步工具:
@@ -63,3 +74,22 @@ async def run(state: dict[str, Any], tools_by_name: dict[str, Any]) -> dict[str,
         )
 
     return {"messages": tool_messages}
+
+
+def _audit_denied(conversation_id: str, tool_name: str) -> None:
+    """记录一次"越权调用被拒"(排障与安全复盘用)。"""
+    from ...events import Event, EventKind, EventSource
+    from ...services import eventlog
+
+    print(f"[act] 拒绝未授权工具调用: {tool_name} (会话 {conversation_id})")
+    eventlog.log_event(
+        Event(
+            event_id=f"denied-{conversation_id}-{tool_name}-{time.time_ns()}",
+            source=EventSource.SYSTEM,
+            kind=EventKind.SYSTEM,
+            should_respond=False,
+            conversation_id=conversation_id,
+            text=f"拒绝未授权工具调用: {tool_name}",
+        ),
+        conversation_id=conversation_id,
+    )

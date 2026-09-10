@@ -17,12 +17,19 @@
 #                   (适合: "帮我问小号几点上课然后转告 km"这类委托)
 #   note            只记录上下文,不产生任何动作
 #                   (适合: 给会话补充背景信息)
+#   configure       改会话值守配置(监视/回复/**注意事项**),不产生任何对外消息
+#                   (适合: 主 agent 听到"开始自动回复与 XXX 的会话,注意事项是…"
+#                    之后把长期配置落下来 —— 这是"自然语言配置会话"的入口)
 #
 # 关键护栏:
 #   · idempotency_key 幂等 —— 重复投递不重复执行(防"重试导致重复发消息");
 #   · deadline 过期拒绝 —— 迟到的任务不执行;
 #   · 会话拥堵返回 429 —— 调用方稍后重试;
 #   · caller + context 全量留痕 —— 可追溯"谁让发的这条消息"。
+#
+# 优先级(重要): 主 agent 派发的指令**不受会话策略约束** ——
+#   即使目标会话没开自动回复,显式指令照常执行(否则"帮约 km"这类任务
+#   在一个静默会话里根本推进不下去)。判定见 services/policy.decide。
 # =============================================================================
 
 from __future__ import annotations
@@ -35,6 +42,7 @@ from ..agent.runtime import get_graph
 from ..config import get_settings
 from ..events import Event, EventKind, EventSource, get_bus
 from .. import outbox
+from ..api import sse as sse_api
 from ..services import conversations as conversations_service
 from ..services import dispatches as dispatch_service
 
@@ -68,11 +76,13 @@ async def create_dispatch(body: dict[str, Any]) -> dict[str, Any]:
     ```json
     {
       "caller": "main-agent",
-      "kind": "handle_message",              // handle_message|send_message|task|note
+      "kind": "handle_message",              // handle_message|send_message|task|note|configure
       "target": {"conversation_id": "..."}    // 或
               // {"platform":"qq","chat_type":"private","external_id":"1234"},
       "content": [{"type":"text","text":"..."}],  // handle_message/send_message 必填
       "instruction": "把这条转告 km",          // task 必填
+      "policy": {"reply_mode":"auto", "monitor":true, "alert_enabled":true,
+                 "alert_keywords":["急事"], "note":"别提钱"},   // configure 必填(note 等价 persona)
       "context": {"upstream_task_id": "..."},  // 透传留痕
       "idempotency_key": "task-123",           // 强烈建议填(去重)
       "deadline": "2026-09-10T20:00:00+08:00", // 可选
@@ -99,6 +109,11 @@ async def create_dispatch(body: dict[str, Any]) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="该 kind 需要 content(至少一个 text 段)")
     if kind == dispatch_service.KIND_TASK and not str(body.get("instruction") or "").strip():
         raise HTTPException(status_code=400, detail="task 需要 instruction")
+    if kind == dispatch_service.KIND_CONFIGURE and not isinstance(body.get("policy"), dict):
+        raise HTTPException(
+            status_code=400,
+            detail='configure 需要 policy 对象,例如 {"policy": {"reply_mode": "auto", "note": "…"}}',
+        )
 
     # ---- 幂等: 先查重(避免重复执行 + 重复发送) ----
     idempotency_key = str(body.get("idempotency_key") or "").strip()
@@ -118,8 +133,15 @@ async def create_dispatch(body: dict[str, Any]) -> dict[str, Any]:
             return existing
 
     # ---- 拥堵预检(会话已有排队时快速失败,让调用方稍后重试) ----
+    # configure 不跑图、不碰会话串行队列,不该被"会话忙"挡住(否则正忙的时候
+    # 恰好没法紧急改配置,最需要改的时候改不了)。
     graph = get_graph()
-    if graph is not None and conversation_id and graph.is_busy(conversation_id):
+    if (
+        kind != dispatch_service.KIND_CONFIGURE
+        and graph is not None
+        and conversation_id
+        and graph.is_busy(conversation_id)
+    ):
         task = dispatch_service.create_dispatch(
             kind=kind,
             caller=str(body.get("caller") or ""),
@@ -198,9 +220,75 @@ async def create_dispatch(body: dict[str, Any]) -> dict[str, Any]:
             dispatch_service.mark_failed(task["task_id"], result["reason"])
         return task
 
+    if kind == dispatch_service.KIND_CONFIGURE:
+        # 改会话值守配置 —— 这是"主 agent 听到一句自然语言之后,把长期配置落下来"的落点。
+        # 例如主 agent 收到"开始自动回复与 XXX 的会话,注意事项是别提钱":
+        #   → POST /api/dispatch {kind:"configure", target:{...},
+        #                         policy:{reply_mode:"auto", note:"别提钱"}}
+        # 注意: 这里**不产生任何对外消息**;配置改完只写审计 + SSE 推桌面端。
+        outcome = _apply_policy(conversation_id, body.get("policy") or {})
+        if outcome.get("error"):
+            dispatch_service.mark_failed(task["task_id"], str(outcome["error"]))
+            raise HTTPException(status_code=int(outcome.get("status") or 400), detail=str(outcome["error"]))
+
+        dispatch_service.mark_done(task["task_id"], outcome)
+        await sse_api.push(
+            "policy",
+            {"conversation_id": conversation_id, "policy": outcome.get("policy") or {}},
+        )
+        return task
+
     # handle_message / task: 转成事件交给 agent
     await _publish_agent_event(task, text=text, body=body, conversation_id=conversation_id, context=context)
     return task
+
+
+def _apply_policy(conversation_id: str, policy_body: dict[str, Any]) -> dict[str, Any]:
+    """把请求体里的 policy 落到会话上(策略字段 + 注意事项)。
+
+    为什么把"注意事项"也放在这里: 主 agent 用一句自然语言传达的需求通常既有
+    开关(要不要自动回复)也有行为约束("注意别提钱"),拆成两个接口调用方会漏掉一个。
+
+    字段别名: `note` 等价于 `persona`。LLM/上游更自然地说"notes/注意事项",
+    而库里那列叫 persona(它本来就是"这个人怎么说话"的约束)。
+    两个都接受,避免调用方为了一个名字来回试。
+    """
+    from ..services import conversations as conversations_service
+    from ..services import policy as policy_service
+
+    conversation = conversations_service.get_conversation(conversation_id)
+    if conversation is None:
+        return {"error": f"会话不存在: {conversation_id}", "status": 404}
+
+    body = dict(policy_body)
+    if "note" in body and "persona" not in body:
+        body["persona"] = body.pop("note")
+
+    policy_changes = {k: v for k, v in body.items() if k in policy_service.POLICY_FIELDS}
+    profile_changes = {k: v for k, v in body.items() if k in ("persona", "title", "model_name")}
+    unknown = set(body) - set(policy_changes) - set(profile_changes)
+    if unknown:
+        return {"error": f"不支持的配置字段: {sorted(unknown)}", "status": 400}
+
+    changed: dict[str, Any] = {}
+    implied: list[str] = []
+    try:
+        if policy_changes:
+            result = policy_service.update_policy(conversation_id, **policy_changes)
+            changed.update(result["changed"])
+            implied = result["implied"]
+        if profile_changes:
+            changed.update(conversations_service.update_profile(conversation_id, **profile_changes))
+    except ValueError as exc:
+        return {"error": str(exc), "status": 400}
+
+    updated = conversations_service.get_conversation(conversation_id) or {}
+    return {
+        "changed": changed,
+        "implied": implied,
+        "policy": policy_service.normalize_policy(updated),
+        "persona": updated.get("persona") or "",
+    }
 
 
 # ---------------------------------------------------------------------------

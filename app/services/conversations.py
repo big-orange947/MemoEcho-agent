@@ -126,6 +126,41 @@ def touch_conversation(conversation_id: str) -> None:
     conn.commit()  # 必须提交,否则事务一直持有写锁,其他线程写库会 locked
 
 
+def update_profile(conversation_id: str, **changes: Any) -> dict[str, Any]:
+    """更新会话档案字段(title / persona / model_name)。
+
+    返回 {字段: [旧值, 新值]},便于调用方回报"改了什么"。
+    注意: persona 同时承担"值守注意事项"的载体(见 services/policy.py 注释),
+    上游主 agent 说"注意事项是…"时写的就是这里。
+    """
+    allowed = {"title", "persona", "model_name"}
+    unknown = set(changes) - allowed
+    if unknown:
+        raise ValueError(f"不支持的会话字段: {sorted(unknown)}")
+
+    conn = get_connection()
+    row = conn.execute("SELECT * FROM conversations WHERE id=?", (conversation_id,)).fetchone()
+    if row is None:
+        raise ValueError(f"会话不存在: {conversation_id}")
+    current = dict(row)
+
+    changed: dict[str, list[Any]] = {}
+    for field, value in changes.items():
+        if value is None:
+            continue
+        new_value = str(value)
+        if current.get(field) == new_value:
+            continue
+        changed[field] = [current.get(field), new_value]
+        conn.execute(
+            f"UPDATE conversations SET {field}=?, updated_at=? WHERE id=?",
+            (new_value, _now(), conversation_id),
+        )
+    if changed:
+        conn.commit()
+    return changed
+
+
 # ---------------------------------------------------------------------------
 # 消息
 # ---------------------------------------------------------------------------

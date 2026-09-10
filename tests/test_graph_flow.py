@@ -222,7 +222,7 @@ class TestConcurrency:
 
         original_run = graph._run_graph
 
-        async def instrumented(event, conversation_id):
+        async def instrumented(event, conversation_id, allowed_tools=None):
             timeline.append(f"start:{event['text']}")
             # 人为拉长执行时间,确保并发时能观察到交错
             await asyncio.sleep(0.05)
@@ -278,7 +278,7 @@ class TestConcurrency:
         timeline: list[str] = []
         original_run = graph._run_graph
 
-        async def instrumented(event, conversation_id):
+        async def instrumented(event, conversation_id, allowed_tools=None):
             timeline.append(f"start:{conversation_id}")
             await asyncio.sleep(0.05)
             result = await original_run(event, conversation_id)
@@ -326,7 +326,7 @@ class TestConcurrency:
         graph = AgentGraph(llm_factory=factory, tools=[], sender=sender)
 
         # 让每个任务执行得足够慢,堆积到上限
-        async def slow_run(event, conversation_id):
+        async def slow_run(event, conversation_id, allowed_tools=None):
             await asyncio.sleep(0.3)
             return None
 
@@ -368,7 +368,7 @@ class TestConcurrency:
 
         assert graph.is_busy("conv-idle") is False
 
-        async def slow_run(event, conversation_id):
+        async def slow_run(event, conversation_id, allowed_tools=None):
             await asyncio.sleep(0.3)
             return None
 

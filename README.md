@@ -124,5 +124,6 @@ notepad .\scripts\local-env.ps1
 - [工作流说明](./docs/workflows.md)
 - [主控台命令链路](./docs/workspace-commands.md)
 - [会话设定集](./docs/conversation-profiles.md)
+- [会话值守与上报](./docs/conversation-policy.md)
 - [Skill 管理](./docs/skill-management.md)
 - [开发路线图](./ROADMAP.md)

@@ -220,6 +220,101 @@ class TestAgentKinds:
 
 
 # ---------------------------------------------------------------------------
+# configure: 主 agent 用自然语言配置会话值守
+# ---------------------------------------------------------------------------
+class TestConfigure:
+    def test_configure_reply_and_note(self, client):
+        """典型场景: "开始自动回复与 XXX 的会话,注意事项是别提钱"。"""
+        resp = client.post(
+            "/api/dispatch",
+            json={
+                "caller": "main-agent",
+                "kind": "configure",
+                "target": {"platform": "qq", "chat_type": "private", "external_id": "2597164807"},
+                "policy": {"reply_mode": "auto", "note": "别提钱"},
+            },
+        )
+        assert resp.status_code == 202
+        task = client.get(f"/api/dispatch/{resp.json()['task_id']}").json()
+        assert task["status"] == "done"
+
+        result = task["result"]
+        assert result["policy"]["reply_mode"] == "auto"
+        assert result["policy"]["monitor"] is True      # 开回复自动蕴含监视
+        assert result["persona"] == "别提钱"
+
+        # 配置要真的落到会话上(不只是回报一个结果)
+        conv = client.post(
+            "/api/conversations/resolve",
+            json={"platform": "qq", "chat_type": "private", "external_id": "2597164807"},
+        ).json()
+        assert conv["policy"]["reply_mode"] == "auto"
+        assert conv["persona"] == "别提钱"
+
+    def test_configure_monitor_only(self, client):
+        """只监视: 静默收集消息,不回复。"""
+        resp = client.post(
+            "/api/dispatch",
+            json={
+                "caller": "main-agent",
+                "kind": "configure",
+                "target": {"conversation_id": "conv-cfg-monitor"},
+                "policy": {"monitor": True},
+            },
+        )
+        assert resp.status_code == 202
+        task = client.get(f"/api/dispatch/{resp.json()['task_id']}").json()
+        assert task["result"]["policy"]["monitor"] is True
+        assert task["result"]["policy"]["reply_mode"] == "off"
+
+    def test_configure_requires_policy(self, client):
+        resp = client.post(
+            "/api/dispatch",
+            json={"kind": "configure", "target": {"conversation_id": "conv-x"}},
+        )
+        assert resp.status_code == 400
+
+    def test_configure_rejects_unknown_field(self, client):
+        resp = client.post(
+            "/api/dispatch",
+            json={
+                "kind": "configure",
+                "target": {"conversation_id": "conv-x"},
+                "policy": {"whatever": 1},
+            },
+        )
+        assert resp.status_code == 400
+
+    def test_configure_sends_no_message(self, client):
+        """配置动作绝不能顺手对外发消息 —— 这是它和 send_message 的根本区别。"""
+        client.post(
+            "/api/dispatch",
+            json={
+                "kind": "configure",
+                "target": {"platform": "qq", "chat_type": "private", "external_id": "88888"},
+                "policy": {"monitor": True},
+            },
+        )
+        convs = client.get("/api/conversations").json()
+        target = next(c for c in convs if c["external_id"] == "88888")
+        assert client.get(f"/api/conversations/{target['id']}/messages").json() == []
+
+    def test_configure_is_idempotent(self, client):
+        """重复投递同样的配置请求不会重复执行(幂等键)。"""
+        payload = {
+            "caller": "main-agent",
+            "kind": "configure",
+            "target": {"conversation_id": "conv-cfg-idem"},
+            "policy": {"reply_mode": "auto"},
+            "idempotency_key": "cfg-1",
+        }
+        first = client.post("/api/dispatch", json=payload).json()
+        second = client.post("/api/dispatch", json=payload).json()
+        assert first["task_id"] == second["task_id"]
+        assert second.get("duplicated") is True
+
+
+# ---------------------------------------------------------------------------
 # 幂等
 # ---------------------------------------------------------------------------
 class TestIdempotency:

@@ -101,8 +101,17 @@ def init_db() -> None:
             chat_type   TEXT NOT NULL,              -- private / group / thread
             external_id TEXT NOT NULL,              -- 平台侧 ID
             title       TEXT DEFAULT '',            -- 会话标题(桌面端展示)
-            persona     TEXT DEFAULT '',            -- 人设/行为约束
+            persona     TEXT DEFAULT '',            -- 人设/行为约束(含"值守注意事项")
             model_name  TEXT DEFAULT '',            -- 会话级模型绑定(空=全局)
+            -- ---- 会话策略(见 services/policy.py): 默认全关 ----
+            monitor     INTEGER DEFAULT 0,          -- 是否监视(总开关): 关 ⇒ 不落库/不记忆/不上报/不回复
+            reply_mode  TEXT DEFAULT 'off',         -- off 不回复 / draft 草稿待确认 / auto 自动回复
+            alert_enabled INTEGER DEFAULT 0,        -- 是否上报重要消息
+            alert_keywords TEXT DEFAULT '[]',       -- 上报关键词(JSON 数组)
+            require_human_confirmation INTEGER DEFAULT 1,  -- 拿不准时是否必须请示(1=是)
+            digest_window_seconds INTEGER DEFAULT 1800,    -- 攒批窗口(秒): 空闲多久触发总结
+            digest_max_messages INTEGER DEFAULT 20,        -- 攒批条数上限: 满多少条触发总结
+            allowed_tools TEXT DEFAULT '',          -- 允许的工具名(JSON 数组; 空=按会话类型默认)
             created_at  TEXT NOT NULL,
             updated_at  TEXT NOT NULL,
             UNIQUE (platform, chat_type, external_id)  -- 同一会话只存一行
@@ -225,6 +234,55 @@ def init_db() -> None:
             ON dispatches (idempotency_key) WHERE idempotency_key != '';
         CREATE INDEX IF NOT EXISTS idx_dispatches_status
             ON dispatches (status, created_at);
+
+        -- ============================================================
+        -- report_queue: 上报队列(类消息中间件的本地形态)
+        -- 场景: 监视中的会话出现"重要消息"时,把候选投进队列;
+        --       由**上游 agent 自己来取**(claim),取了之后自行决定要不要报给用户。
+        -- 为什么不直接推: 上报的决策权在上游;本服务只负责"发现 + 排队"。
+        -- 语义对齐真 MQ:
+        --   · 至少一次: claim 带租约,超时自动回 pending 重投;
+        --   · 死信: attempts 超限 → dead(可查、可重放);
+        --   · 幂等: 同 (conversation_id, dedup_key) 不重复入队。
+        -- lane: urgent(立即) / normal(进摘要批) / question(HITL 请示) / digest(批量汇总)
+        -- ============================================================
+        CREATE TABLE IF NOT EXISTS report_queue (
+            id              TEXT PRIMARY KEY,
+            lane            TEXT DEFAULT 'normal',   -- urgent / normal / question / digest
+            conversation_id TEXT DEFAULT '',         -- 来源会话(可空: 系统级上报)
+            message_ids     TEXT DEFAULT '',         -- 来源消息 ID(逗号分隔,可追溯)
+            payload         TEXT DEFAULT '',         -- JSON: 摘要/命中规则/原文片段
+            dedup_key       TEXT DEFAULT '',         -- 幂等键(同一批消息不重复入队)
+            status          TEXT DEFAULT 'pending',  -- pending/claimed/acked/dropped/dead
+            attempts        INTEGER DEFAULT 0,       -- 认领次数(超限进 dead)
+            claimed_by      TEXT DEFAULT '',         -- 认领者标识(哪个上游 agent)
+            lease_expires_at TEXT DEFAULT '',        -- 租约到期时间(过期可被重新认领)
+            created_at      TEXT NOT NULL,
+            updated_at      TEXT NOT NULL,
+            acked_at        TEXT DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_report_queue_status
+            ON report_queue (status, created_at);
+        CREATE INDEX IF NOT EXISTS idx_report_queue_lane
+            ON report_queue (lane, status);
+
+        -- ============================================================
+        -- memory_batches: 攒批记忆的处理进度(宿主侧 checkpoint)
+        -- 背景: 长期记忆不再逐条写入(那样碎成一堆"嗯""好的"),
+        --       而是按窗口攒批、由 agent 总结后再写。
+        --       Doppel 明确把"调度与 checkpoint 存储"归宿主,这张表就是那份状态。
+        -- last_message_at: 上次处理的最后一条消息时间(续读游标)
+        -- ============================================================
+        CREATE TABLE IF NOT EXISTS memory_batches (
+            conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+            cursor          TEXT DEFAULT '',         -- 续读游标(Doppel BatchCheckpoint.cursor)
+            last_message_at TEXT DEFAULT '',         -- 已处理到的消息时间(水位线)
+            last_run_at     TEXT DEFAULT '',         -- 上次执行时间
+            last_status     TEXT DEFAULT '',         -- ok / empty / error
+            last_error      TEXT DEFAULT '',
+            pending_count   INTEGER DEFAULT 0,       -- 待处理条数(攒批计数)
+            metadata        TEXT DEFAULT ''          -- 预留: 窗口起止等
+        );
         """
     )
     conn.commit()
@@ -243,6 +301,17 @@ _MIGRATIONS: dict[str, list[tuple[str, str]]] = {
         ("should_respond", "INTEGER DEFAULT 1"),
         ("conversation_id", "TEXT DEFAULT ''"),
         ("summary", "TEXT DEFAULT ''"),
+    ],
+    # conversations 表引入会话策略(值守/监视/上报的开关,默认全关)
+    "conversations": [
+        ("monitor", "INTEGER DEFAULT 0"),
+        ("reply_mode", "TEXT DEFAULT 'off'"),
+        ("alert_enabled", "INTEGER DEFAULT 0"),
+        ("alert_keywords", "TEXT DEFAULT '[]'"),
+        ("require_human_confirmation", "INTEGER DEFAULT 1"),
+        ("digest_window_seconds", "INTEGER DEFAULT 1800"),
+        ("digest_max_messages", "INTEGER DEFAULT 20"),
+        ("allowed_tools", "TEXT DEFAULT ''"),
     ],
 }
 

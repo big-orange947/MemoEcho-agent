@@ -22,6 +22,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 from typing import Any
 
 import uvicorn
@@ -29,7 +31,10 @@ from fastapi import FastAPI, Request
 from langchain_openai import ChatOpenAI
 
 from . import memory as memory_layer
+from . import recorder
+from . import reports as reports_service
 from .api import dispatch as dispatch_api
+from .api import reports as reports_api
 from .api import routes as api_routes
 from .api import sse as sse_api
 from .agent.graph import AgentGraph, ConversationBusyError
@@ -45,10 +50,16 @@ from .services import conversations as conversations_service
 from .services import dispatches as dispatch_service
 from .services import eventlog
 from .services import goals as goals_service
+from .services import policy as policy_service
 from .tools import contacts as contacts_tools
-from .tools import memory as memory_tools
+from .tools import escalate as escalate_tools
 from .tools import messaging as messaging_tools
 from .tools import wait as wait_tools
+
+# 上报队列后台 worker 的轮询间隔(秒)。
+# 复核要"攒批"(省模型调用),所以这里不需要高频;25 秒足以让候选及时上报,
+# 又远低于人类感知阈值。
+REPORTS_WORKER_INTERVAL = 25.0
 
 
 # ---------------------------------------------------------------------------
@@ -75,12 +86,75 @@ def create_app() -> FastAPI:
         )
 
     # 4. 工具集(全部 LangChain @tool)
+    #    注意: 这里注册的是**全集**;每个会话实际能用哪些由策略决定
+    #    (见 services/policy.resolve_allowed_tools 与 graph 的按事件解析)。
     tools = [
         *messaging_tools.create_message_tools(),
         *contacts_tools.create_contact_tools(),
-        *memory_tools.create_memory_tools(),
+        *escalate_tools.create_escalate_tools(),  # 请示号主: 拿不准的事不擅自拍板
         *wait_tools.create_wait_tools(),   # 等待/定时唤醒: "等10分钟再催"这类需求
     ]
+
+    # 4b. 重要消息复核器(上报流水线的第二级)
+    #     规则初筛命中后,用**快模型**把一批候选合并成一次调用,判断值不值得惊动人。
+    #     为什么要复核: 规则会误报("@我"也可能只是打个招呼),而误报会消耗号主的注意力。
+    #     为什么批量: 每条候选单独调一次模型成本不可接受;合并成一次调用是成本关键。
+    #     失败怎么办: 抛异常会被 reports.flush_candidates 捕获并**退化为纯规则** ——
+    #                 宁可多报一条,也不能因为模型抖动把急事漏掉。
+    async def reports_reviewer(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        items = [
+            {
+                "id": str(item.get("id") or ""),
+                "text": str((item.get("payload") or {}).get("text") or "")[:500],
+                "sender": str((item.get("payload") or {}).get("sender_name") or ""),
+                "rules": (item.get("payload") or {}).get("reasons") or [],
+            }
+            for item in candidates
+        ]
+        prompt = (
+            "你在帮一个私人助理筛选 QQ 消息,判断哪些值得**立刻打扰号主**。\n"
+            "对每条消息给出判定,只输出 JSON 数组,不要解释:\n"
+            '[{"id":"原样返回","lane":"urgent|normal|digest",'
+            '"summary":"一句话摘要(不超过30字)","reason":"为什么"}]\n\n'
+            "判定标准:\n"
+            "- urgent: 有时间压力、需要号主尽快回应或决策(约好的事有变、马上要回复的邀请、紧急求助);\n"
+            "- normal: 重要但不紧急,值得知道(有实质内容的信息、需要回但可以晚点);\n"
+            "- digest: 只是被规则误命中,可以攒起来一起看(寒暄、群里的泛泛提问);\n"
+            "拿不准时选 normal(漏报比多报更糟)。\n\n"
+            f"消息列表:\n{json.dumps(items, ensure_ascii=False)}"
+        )
+
+        llm = llm_factory(fast=True)
+        response = await llm.ainvoke(prompt)
+        text = str(getattr(response, "content", "") or "").strip()
+        # 模型偶尔会带 markdown 代码块,剥掉再解析
+        if text.startswith("```"):
+            text = text.strip("`")
+            text = text[text.find("[") :] if "[" in text else text
+        start, end = text.find("["), text.rfind("]")
+        if start < 0 or end < 0:
+            raise ValueError(f"复核结果不是 JSON 数组: {text[:120]}")
+        parsed = json.loads(text[start : end + 1])
+        if not isinstance(parsed, list):
+            raise ValueError("复核结果不是数组")
+        return [item for item in parsed if isinstance(item, dict)]
+
+    # 4c. 上报队列后台 worker
+    #     每隔一段时间做三件事(都在 app/reports.py 里,这里只负责定时触发):
+    #       ① 复核候选并把它们提升为可消费状态(攒够批或超时);
+    #       ② 回收过期租约(上游认领后崩了 → 消息回队列,不丢);
+    #       ③ 清理已处理的历史记录(队列不无限增长)。
+    async def reports_worker() -> None:
+        while True:
+            try:
+                await asyncio.sleep(REPORTS_WORKER_INTERVAL)
+                await reports_service.flush_candidates(reviewer=reports_reviewer)
+                reports_service.reap_expired()
+                reports_service.purge_resolved()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - 后台任务不能因单次异常退出
+                print(f"[reports] worker 异常: {type(exc).__name__}: {exc}")
 
     # 5. 发送器: 把 agent 的回复路由到正确渠道
     async def sender(conversation_id: str, text: str, source: str) -> None:
@@ -131,14 +205,98 @@ def create_app() -> FastAPI:
     # ① 审计处理器: 所有事件都记一笔(含不需要回应的通知/请求/自发回显)。
     #    注册在最前面 —— 保证"先留痕,再处理",即使后续处理器失败也有记录。
     async def audit_handler(event: Event) -> None:
-        eventlog.log_event(event)
+        # 尽量把会话填进审计行: 排障时"这条消息属于哪个会话"是最常用的入口。
+        # 用 find_conversation(只查不建)—— 审计层不该产生副作用;
+        # 首次出现的会话此时还没落库,下一次事件就能关联上了。
+        conversation_id = event.conversation_id
+        if not conversation_id and event.external_id:
+            found = conversations_service.find_conversation(
+                event.platform, event.chat_type, event.external_id
+            )
+            conversation_id = found["id"] if found else ""
+        eventlog.log_event(event, conversation_id=conversation_id)
 
-    # ② agent 处理器: 只处理需要生成输出的事件。
-    async def agent_handler(event: Event) -> None:
-        # 不需要回应的事件(通知/请求/自发回显)到此为止,只留了审计记录
-        if not event.should_respond:
+    # ② agent 处理器: 按会话策略分流 —— 跑图 / 只记录 / 忽略。
+    #
+    #    分流依据是**会话策略**(services/policy.py)而不是平台规则本身:
+    #      · 显式指令(主 agent 派发、桌面端命令)优先级最高,不受开关约束;
+    #      · 任务授权态(该会话有进行中的目标)期间可自由交流;
+    #      · 其余平台消息: reply_mode=auto 才回复;仅监视则只落库(零模型成本);
+    #      · 全关 → 只留审计(由 audit_handler 记录)。
+    async def _evaluate_alert(conversation: dict[str, Any], conversation_id: str, event: Event) -> None:
+        """对**对方发来的**消息做上报评估(规则初筛,零模型成本)。
+
+        只评估"别人说的话": 号主自己发的消息(message_sent)、
+        平台通知、定时唤醒都不该触发上报 —— 那不是"新发生的事"。
+        """
+        if event.kind not in (EventKind.MESSAGE, EventKind.INSTRUCTION):
+            return
+        if event.is_self:
+            return
+        if not policy_service.normalize_policy(conversation).get("alert_enabled"):
             return
 
+        outcome = reports_service.observe(
+            conversation,
+            conversation_id=conversation_id,
+            message_id=event.event_id,   # 与 ingest 落库用的 ID 一致 → 幂等
+            text=event.text,
+            sender_id=event.sender_id,
+            sender_name=event.sender_name,
+        )
+        if outcome.get("matched"):
+            # 桌面端实时可见(只推，不做 UI)：前端据此提示"聊到值得注意的事了"
+            await sse_api.push(
+                "report",
+                {
+                    "conversation_id": conversation_id,
+                    "reasons": outcome.get("reasons") or [],
+                    "text": event.text[:200],
+                },
+            )
+
+    async def agent_handler(event: Event) -> None:
+        # ---- 0. 定位会话(策略是按会话存的,先拿到会话行才能判定) ----
+        conversation_id = event.conversation_id or ""
+        if conversation_id:
+            # 保底建号: dispatch 可以直接给一个尚未落库的会话 ID
+            conversations_service.ensure_conversation_by_id(conversation_id)
+        elif event.external_id:
+            conversation_id = conversations_service.ensure_conversation(
+                event.platform, event.chat_type, event.external_id
+            )
+        conversation = (
+            conversations_service.get_conversation(conversation_id) or {} if conversation_id else {}
+        )
+        has_active_goal = bool(goals_service.get_active_goal(conversation_id)) if conversation_id else False
+
+        decision, reason = policy_service.decide(event, conversation, has_active_goal=has_active_goal)
+        if decision == policy_service.DECISION_IGNORE:
+            return
+
+        event.conversation_id = conversation_id
+
+        # ---- 只记录: 写进对话历史供攒批总结/上报,不跑图、不调模型 ----
+        if decision == policy_service.DECISION_RECORD:
+            result = await recorder.record(conversation_id, event.to_payload())
+            if result.get("recorded"):
+                eventlog.log_event(
+                    Event(
+                        event_id=f"record-{event.event_id}",
+                        source=EventSource.SYSTEM,
+                        kind=EventKind.SYSTEM,
+                        should_respond=False,
+                        conversation_id=conversation_id,
+                        text=f"仅记录({reason}): {event.text[:60]}",
+                    ),
+                    conversation_id=conversation_id,
+                )
+                # 重要消息上报: 规则初筛(零成本)命中的先入队为候选,
+                # 由后台 worker 用快模型批量复核后决定最终去向。
+                await _evaluate_alert(conversation, conversation_id, event)
+            return
+
+        # ---- 以下为跑图路径(记录由图内 ingest 负责,不能在这里预记录) ----
         # 命令/指令类事件: 先把指令变成会话上的目标(goal),再跑图推进
         if event.kind in (EventKind.COMMAND, EventKind.INSTRUCTION) and event.command:
             conv_id = event.conversation_id or conversations_service.ensure_conversation(
@@ -146,6 +304,12 @@ def create_app() -> FastAPI:
             )
             goals_service.create_goal(conv_id, event.command)
             event.conversation_id = conv_id
+
+        # 自动回复的会话同样要做上报评估: 开着上报开关时,
+        # "agent 已经回了"不代表"号主不需要知道" —— 两件事互不替代。
+        # 放在跑图之前: 规则判断是纯字符串操作,不拖慢回复;而且即便回复失败,
+        # 这条重要消息也不会因为异常而漏报。
+        await _evaluate_alert(conversation, conversation_id, event)
 
         # 跑图(内部会持久化消息/更新目标/调用发送器)。
         # 事件转成可序列化字典 —— 它会进 LangGraph State 并被 checkpoint 序列化。
@@ -205,6 +369,7 @@ def create_app() -> FastAPI:
     app.include_router(api_routes.router)
     app.include_router(sse_api.router)
     app.include_router(dispatch_api.router)   # 外部调度入口(主 agent 派活)
+    app.include_router(reports_api.router)    # 上报队列出口(上游消费)
 
     # 定时唤醒调度器: 启动后台任务(每秒轮询 scheduled_events,到点发 timer 事件)
     scheduler = get_scheduler()
@@ -212,6 +377,8 @@ def create_app() -> FastAPI:
     @app.on_event("startup")
     async def _startup() -> None:
         scheduler.start()
+        # 上报队列 worker: 复核候选 / 回收过期租约 / 清理历史
+        app.state.reports_task = asyncio.create_task(reports_worker())
 
     # ------------------------------------------------------------------ QQ webhook
     # NapCat 把事件 POST 到这里(OneBot HTTP 上报)。
@@ -242,8 +409,6 @@ def create_app() -> FastAPI:
         # 所以用后台任务发布,立刻返回 OK。
         # 例外: 测试/调试时希望同步看到结果,可用 settings.webhook_async=False。
         if settings.webhook_async:
-            import asyncio
-
             asyncio.create_task(get_bus().publish(event))
         else:
             await get_bus().publish(event)
@@ -253,6 +418,13 @@ def create_app() -> FastAPI:
     # 关闭时释放资源
     @app.on_event("shutdown")
     async def _shutdown() -> None:
+        reports_task = getattr(app.state, "reports_task", None)
+        if reports_task is not None:
+            reports_task.cancel()
+            try:
+                await reports_task
+            except asyncio.CancelledError:
+                pass
         await scheduler.stop()
         await napcat.close()
         await graph.close()

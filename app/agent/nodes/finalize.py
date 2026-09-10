@@ -9,6 +9,9 @@
 # 为什么单独一个节点: 所有"写库 + 发送"集中在一处,避免业务散落在各节点,
 # 也方便以后接多个渠道(QQ/微信/桌面)时只改这里。
 #
+# 长期记忆: 本节点**不写**。机器人自己的话同样"攒批后才总结"(否则
+# 一句"好的"就是一条记忆),统一由 app/batches.py 按窗口总结写入。
+#
 # 输入 State: output_text(最终回复), goal, decision(含 goal_status)
 # 输出 State: 无特殊字段(副作用节点)
 # =============================================================================
@@ -17,6 +20,9 @@ from __future__ import annotations
 
 from typing import Any, Callable, Coroutine
 
+from langgraph.graph.message import RemoveMessage
+
+from ...config import get_settings
 from ...services import conversations as conversations_service
 from ...services import goals as goals_service
 from ...services import schedules as schedules_service
@@ -63,13 +69,13 @@ async def run(
             output_text = text
         break
     if not output_text:
-        # 没有要回复的内容(例如 agent 决定静默等待对方),直接收尾
-        return {}
+        # 没有要回复的内容(例如 agent 决定静默等待对方): 不发消息,但照样裁剪历史
+        return _trim_update(state)
 
     # ---------------------------------------------------------------- 1. 落库回复
     # 与 ingest 一致的消息形态;role=assistant 表示这是我们说的话。
     if conversation_id:
-        message_id = conversations_service.add_message(
+        conversations_service.add_message(
             conversation_id,
             {
                 "id": None,  # 由 service 自动生成
@@ -80,11 +86,6 @@ async def run(
                 "goal_id": "",
             },
         )
-        # 机器人说的话也写入长期记忆:
-        #   · Doppel 会把 actor 标为 agent,事实权威低于号主/联系人 ——
-        #     模型引用时能区分"这是我说过的话"而不是当成客观事实;
-        #   · 不写的话,下次对话 agent 不记得自己承诺过什么。
-        await _remember_outbound(conversation_id, output_text, message_id)
 
     # ---------------------------------------------------------------- 2. 更新目标
     decision = state.get("decision") or {}
@@ -107,23 +108,52 @@ async def run(
     if output_text and conversation_id:
         await sender(conversation_id, output_text, "reply")
 
-    return {}
+    # ---------------------------------------------------------------- 4. 裁剪历史
+    return _trim_update(state)
 
 
-async def _remember_outbound(conversation_id: str, text: str, message_id: str) -> None:
-    """把机器人发出的这条回复写入长期记忆(best-effort)。
+# ---------------------------------------------------------------------------
+# 历史裁剪(checkpoint 有界,见函数注释)
+# ---------------------------------------------------------------------------
+def _message_id(message: Any) -> str:
+    """取消息 ID(兼容 LangChain 消息对象与普通 dict 两种形态)。"""
+    if isinstance(message, dict):
+        return str(message.get("id") or "")
+    return str(getattr(message, "id", "") or "")
 
-    失败静默: memory 模块内部已吞掉异常 —— 记忆写不进去,不该影响这次回复。
+
+def _is_tool_message(message: Any) -> bool:
+    if isinstance(message, dict):
+        return str(message.get("role") or "") == "tool"
+    return str(getattr(message, "type", "") or "") == "tool"
+
+
+def _trim_update(state: dict[str, Any]) -> dict[str, Any]:
+    """把窗口外的历史消息从 checkpoint 里删掉,返回 state 更新(可能为空)。
+
+    为什么必须做: reason 节点会把 State.messages **全量**拼进提示词,
+    而 checkpoint 是只增不减的 —— 会话越长每轮 token 越多。
+    一旦开启监视(会话永久增长),这条成本曲线会失控,所以在这里封顶。
+
+    安全性(不能切坏配对): 删除区间如果以 ToolMessage 开头,说明它的发起方
+    (那条带 tool_calls 的 AIMessage)被删掉了,模型会收到"孤儿工具结果"而报错。
+    因此把起点往前退到非 ToolMessage 的位置,保证保留区间自包含。
+
+    注意: 只动 checkpoint(模型的短期工作区);数据库 messages 表一条不少 ——
+    retrieve 仍按配置条数读取历史,审计与前端翻旧账都不受影响。
     """
-    from ... import memory
+    window = max(1, int(get_settings().history_max_messages))
+    messages = list(state.get("messages") or [])
+    if len(messages) <= window:
+        return {}
 
-    conversation = conversations_service.get_conversation(conversation_id) or {}
-    if not conversation:
-        return
-    await memory.remember_message(
-        conversation,
-        role="assistant",
-        content=text,
-        message_id=message_id,
-        source="outbound",
-    )
+    keep_from = len(messages) - window
+    while keep_from > 0 and _is_tool_message(messages[keep_from]):
+        keep_from -= 1
+
+    removals = [
+        RemoveMessage(id=message_id)
+        for message_id in (_message_id(m) for m in messages[:keep_from])
+        if message_id
+    ]
+    return {"messages": removals} if removals else {}

@@ -157,6 +157,11 @@ async def remember_message(
 ) -> bool:
     """把一条对话消息写入长期记忆。
 
+    ⚠️ 生产链路**不再调用本函数**:逐条写会把记忆碎成一堆"嗯""好的"。
+    长期记忆统一由攒批总结写入(见 app/batches.py: 攒够条数或消息静止后
+    总结一批再写)。本函数保留给"批量导入/回填"这类一次性场景
+    (app/memory.remember_batch 与 scripts/backfill_memory.py 仍在用)。
+
     返回是否写入成功。任何异常都降级为 False(不抛出)——
     记忆是增强能力,不能因为它失败就让对话流程崩掉。
     """

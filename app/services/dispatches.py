@@ -34,6 +34,7 @@ KIND_HANDLE_MESSAGE = "handle_message"   # 当消息处理(走完整 agent 流�
 KIND_SEND_MESSAGE = "send_message"       # 直接发送(不需要 agent 决策)
 KIND_TASK = "task"                       # 建目标并由 agent 推进
 KIND_NOTE = "note"                       # 仅记录(不改动任何状态)
+KIND_CONFIGURE = "configure"             # 改会话值守配置(不产生任何对外消息)
 
 # ---- 状态 ----
 STATUS_ACCEPTED = "accepted"
@@ -43,7 +44,7 @@ STATUS_FAILED = "failed"
 STATUS_EXPIRED = "expired"
 STATUS_BUSY = "busy"
 
-ALL_KINDS = {KIND_HANDLE_MESSAGE, KIND_SEND_MESSAGE, KIND_TASK, KIND_NOTE}
+ALL_KINDS = {KIND_HANDLE_MESSAGE, KIND_SEND_MESSAGE, KIND_TASK, KIND_NOTE, KIND_CONFIGURE}
 
 
 def _now() -> str:

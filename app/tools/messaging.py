@@ -23,7 +23,10 @@ from __future__ import annotations
 
 from typing import Any, Awaitable, Callable
 
+from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
+
+from ..services.policy import HIGH_RISK_TAG
 
 # 发送器契约: (platform, chat_type, external_id, text) -> 是否成功
 #   platform   qq / desktop
@@ -48,7 +51,9 @@ def init_sender(sender: ContactSender) -> None:
 
 
 @tool
-async def send_qq_message(chat_id: str, text: str, chat_type: str = "private") -> str:
+async def send_qq_message(
+    chat_id: str, text: str, chat_type: str = "private", config: RunnableConfig = None
+) -> str:
     """向指定的 QQ 联系人(或群)发送一条消息。
 
     这是"帮别人传话/帮问事情"的唯一方式 —— 当目标不是当前对话里的人时,
@@ -66,6 +71,19 @@ async def send_qq_message(chat_id: str, text: str, chat_type: str = "private") -
     if not text:
         return "错误: 消息内容为空,未发送"
 
+    # ---- 兜底权限校验(第三层) ----
+    # 前两层在 reason(只 bind 授权工具)与 act(拒绝未授权调用);
+    # 这里再查一次"当前会话是否被允许以号主身份对外发消息",
+    # 防止工具被其它入口绕过调用(群聊默认不授权,需显式开启)。
+    conversation_id = str((config or {}).get("configurable", {}).get("thread_id") or "") if config else ""
+    if conversation_id:
+        from ..services import conversations as conversations_service
+        from ..services import policy as policy_service
+
+        conversation = conversations_service.get_conversation(conversation_id)
+        if conversation and not policy_service.tool_allowed(conversation, "send_qq_message"):
+            return "错误: 当前会话未授权发送消息(群聊默认关闭,需要在会话配置中开启)"
+
     chat_type = chat_type if chat_type in ("private", "group") else "private"
 
     try:
@@ -79,6 +97,11 @@ async def send_qq_message(chat_id: str, text: str, chat_type: str = "private") -
 
     # 失败原因由发送器记录日志;这里给模型一个明确信号,让它决定是否重试或告知用户
     return f"发送失败: 无法送达 {chat_id}(请检查对方是否好友、机器人是否在线)"
+
+
+# 打上"高危"标签: 该工具能以号主身份对外发声,群聊会话默认不授权(见 services/policy.py)。
+# 新工具只要有类似影响,同样打这个标签即可被默认拦下。
+send_qq_message.tags = [HIGH_RISK_TAG]
 
 
 def create_message_tools() -> list[Any]:
