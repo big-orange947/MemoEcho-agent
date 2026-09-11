@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+from datetime import timedelta
 
 import pytest
 from fastapi.testclient import TestClient
@@ -108,6 +109,167 @@ class TestEnqueue:
             )
         items = reports_service.list_reports(conversation_id="conv-1")
         assert len(items) == 1
+
+    def test_high_confidence_goes_straight_to_pending(self, env):
+        """判定层已经足够确定时**不等模型复核** —— 省一次调用,也省掉攒批的延迟。
+
+        排期变更这类事早一分钟知道有意义,而确定性规则已经说清了它是急的。
+        """
+        conv = {"chat_type": "private", "alert_keywords": "[]"}
+        outcome = reports_service.observe(
+            conv,
+            conversation_id="conv-auto",
+            message_id="msg-auto",
+            text="明天组会改到四点",
+        )
+        assert outcome["matched"] is True
+        assert outcome["auto_promoted"] is True
+        assert outcome["event"] == "schedule_change"
+        assert outcome["score"] >= reports_service.AUTO_PROMOTE_SCORE
+
+        pending = reports_service.list_reports(status=reports_service.STATUS_PENDING)
+        assert len(pending) == 1
+        assert pending[0]["lane"] == reports_service.LANE_URGENT
+        assert pending[0]["payload"]["auto_promoted"] is True
+        assert reports_service.list_candidates(limit=5) == []
+
+    def test_medium_score_stays_candidate(self, env):
+        """中等分的事件仍然走复核 —— 直通只留给高置信的那批。"""
+        conv = {"chat_type": "private", "alert_keywords": "[]"}
+        outcome = reports_service.observe(
+            conv, conversation_id="conv-mid", message_id="msg-mid", text="借我50块钱"
+        )
+        assert outcome["matched"] is True
+        assert outcome["auto_promoted"] is False
+        assert reports_service.list_candidates(limit=5)
+
+    def test_same_event_merges_into_cluster(self, env):
+        """同类事件在窗口内合并成一条 —— 群里同一件事说三遍,不该报三条。"""
+        conv = {"chat_type": "group", "alert_keywords": "[]"}
+        first = reports_service.observe(
+            conv, conversation_id="conv-cl", message_id="c1", text="明天组会改到四点"
+        )
+        second = reports_service.observe(
+            conv, conversation_id="conv-cl", message_id="c2", text="改到四点对吧"
+        )
+        third = reports_service.observe(
+            conv, conversation_id="conv-cl", message_id="c3", text="@3969785168 看下这个"
+        )
+
+        assert first.get("merged") is not True
+        assert second.get("merged") is True
+        assert third.get("merged") is not True, "不同类事件不该被并进同一条"
+
+        items = reports_service.list_reports(conversation_id="conv-cl")
+        assert len(items) == 2
+        merged = [
+            item for item in items if (item.get("payload") or {}).get("cluster_count")
+        ]
+        assert len(merged) == 1
+        assert merged[0]["payload"]["cluster_count"] == 2
+        assert merged[0]["payload"]["text"] == "改到四点对吧"
+        assert merged[0]["payload"]["event"] == "schedule_change"
+
+    def test_burst_escalates_quiet_message(self, env):
+        """对方连发几条没人回 → 一条普通的"在吗"也值得知道。"""
+        conv = {"chat_type": "private", "alert_keywords": "[]"}
+        from app.services import conversations as conversations_service
+
+        conversation_id = conversations_service.ensure_conversation("qq", "private", "10001")
+        for index in range(3):
+            conversations_service.add_message(
+                conversation_id,
+                {
+                    "id": f"bf-{index}",
+                    "role": "user",
+                    "content": "在吗",
+                    "source": "inbound",
+                    "created_at": "",
+                    "goal_id": "",
+                },
+            )
+        outcome = reports_service.observe(
+            conv,
+            conversation_id=conversation_id,
+            message_id="bf-3",
+            text="在吗",
+            sender_id="10001",
+        )
+        assert outcome["matched"] is True
+        assert outcome["event"] == "burst"
+        assert outcome["score"] >= 0.55
+
+    @pytest.mark.asyncio
+    async def test_time_advance_escalates_pending(self, env):
+        """异步流水线才做得到的一件事: 事情临近了,压在队里的通知自己变急。
+
+        早上收到的"今晚七点改到八点"是个通知;到傍晚还压着就是"马上要发生"。
+        """
+        from datetime import datetime, timezone
+
+        conv = {"chat_type": "private", "alert_keywords": "[]"}
+        outcome = reports_service.observe(
+            conv,
+            conversation_id="conv-time",
+            message_id="t1",
+            text="明天下午三点见",
+        )
+        assert outcome["lane"] == reports_service.LANE_NORMAL
+        # 候选先按规则放行(不注入复核器 = 退化路径,沿用判定层的通道)
+        await reports_service.flush_candidates(reviewer=None, max_age_seconds=0)
+
+        # 把这条记录的 due_at 改到 30 分钟后,模拟时间流逝
+        from app.db import get_connection
+
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT id, payload FROM report_queue WHERE conversation_id='conv-time'"
+        ).fetchone()
+        payload = json.loads(row["payload"])
+        assert payload.get("due_at"), "判定层应把解析出的时间写进 payload"
+        payload["due_at"] = (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat()
+        conn.execute(
+            "UPDATE report_queue SET payload=? WHERE id=?",
+            (json.dumps(payload, ensure_ascii=False), row["id"]),
+        )
+        conn.commit()
+
+        result = reports_service.rescore_pending()
+        assert result["escalated"] == 1
+        updated = reports_service.get_report(row["id"])
+        assert updated["lane"] == reports_service.LANE_URGENT
+        assert updated["payload"]["escalated"] == "due_soon"
+
+    @pytest.mark.asyncio
+    async def test_time_advance_marks_stale(self, env):
+        """事情已经过去了: 打标,不丢 —— 它可能正是"已经发生"的重要信息。"""
+        from datetime import datetime, timezone
+
+        conv = {"chat_type": "private", "alert_keywords": "[]"}
+        reports_service.observe(
+            conv, conversation_id="conv-stale", message_id="s1", text="明天下午三点见"
+        )
+        await reports_service.flush_candidates(reviewer=None, max_age_seconds=0)
+
+        from app.db import get_connection
+
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT id, payload FROM report_queue WHERE conversation_id='conv-stale'"
+        ).fetchone()
+        payload = json.loads(row["payload"])
+        payload["due_at"] = (datetime.now(timezone.utc) - timedelta(hours=5)).isoformat()
+        conn.execute(
+            "UPDATE report_queue SET payload=? WHERE id=?",
+            (json.dumps(payload, ensure_ascii=False), row["id"]),
+        )
+        conn.commit()
+
+        result = reports_service.rescore_pending()
+        assert result["stale"] == 1
+        updated = reports_service.get_report(row["id"])
+        assert updated["payload"]["stale"] is True
+        assert updated["lane"] == reports_service.LANE_NORMAL, "过期不等于要升级为紧急"
 
 
 # ---------------------------------------------------------------------------
@@ -211,7 +373,13 @@ class TestQueueSemantics:
 # 快模型复核
 # ---------------------------------------------------------------------------
 class TestReview:
-    def _make_candidate(self, text: str = "急事找你", message_id: str = "m1"):
+    def _make_candidate(self, text: str = "在吗，想问个事情", message_id: str = "m1"):
+        """造一条**停留在候选**的记录(供复核相关用例使用)。
+
+        注意别用"急事找你"这类文本: 判定层现在会给它高分并**直接放行**
+        (见 AUTO_PROMOTE_SCORE),根本不会停在候选 ——
+        那样测的就不是复核了。这里用一条中等分的事件(疑问)。
+        """
         conv = {"chat_type": "private", "alert_keywords": '["急"]'}
         return reports_service.observe(
             conv, conversation_id="conv-r", message_id=message_id, text=text

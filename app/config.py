@@ -89,6 +89,10 @@ class Settings(BaseSettings):
     # 超限后自动退化为纯规则(消息照常上报,只是不再做模型判断)。
     # 设为 0 表示不限(不推荐: 失控的群会烧钱)。
     alert_llm_daily_budget: int = 200
+    # 是否用快模型复核上报候选。关掉 = 完全走确定性判定(信号→事件→上下文),
+    # 模型成本为零 —— 判定层本身已经能挑出排期变更/截止/金钱这类事件,
+    # 复核只是"最后一道过滤",不是必需。
+    alert_review_enabled: bool = True
 
     # 订阅式通知(上游 agent 消费)长轮询单次最长等待秒数。
     # 上游用 GET /api/reports/subscribe 挂起等待新消息,避免空转轮询。

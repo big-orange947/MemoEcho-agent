@@ -95,28 +95,37 @@ def create_app() -> FastAPI:
         *wait_tools.create_wait_tools(),   # 等待/定时唤醒: "等10分钟再催"这类需求
     ]
 
-    # 4b. 重要消息复核器(上报流水线的第二级)
-    #     规则初筛命中后,用**快模型**把一批候选合并成一次调用,判断值不值得惊动人。
-    #     为什么要复核: 规则会误报("@我"也可能只是打个招呼),而误报会消耗号主的注意力。
+    # 4b. 重要消息复核器(上报流水线的最后一级,可选)
+    #     前三段(信号提取→事件判定→上下文补强)都是零模型成本的确定性判断,
+    #     本段是**可选的**最后一道: 把一批候选合并成一次快模型调用,判值不值得惊动人。
+    #     为什么要复核: 规则会误报("@我"也可能只是打个招呼),而误报消耗号主的注意力。
     #     为什么批量: 每条候选单独调一次模型成本不可接受;合并成一次调用是成本关键。
-    #     失败怎么办: 抛异常会被 reports.flush_candidates 捕获并**退化为纯规则** ——
+    #     关掉会怎样: 完全走确定性判定(alert_review_enabled=false)——
+    #                 通道由事件判定层给出,不再有模型参与,成本为零。
+    #     失败怎么办: 抛异常会被 reports.flush_candidates 捕获并**沿用判定层结论** ——
     #                 宁可多报一条,也不能因为模型抖动把急事漏掉。
     #     实现见 app/reports.py(提示词与解析都在那里,便于单测与冒烟验证)。
-    reports_reviewer = reports_service.build_default_reviewer(llm_factory)
+    reports_reviewer = (
+        reports_service.build_default_reviewer(llm_factory)
+        if get_settings().alert_review_enabled
+        else None
+    )
 
     # 4c. 上报队列后台 worker
-    #     每隔一段时间做四件事(前三件在 app/reports.py、第四件在 app/sinks.py,
+    #     每隔一段时间做五件事(前四件在 app/reports.py、第五件在 app/sinks.py,
     #     这里只负责定时触发):
     #       ① 复核候选并把它们提升为可消费状态(攒够批或超时);
     #       ② 回收过期租约(上游认领后崩了 → 消息回队列,不丢);
-    #       ③ 清理已处理的历史记录(队列不无限增长);
-    #       ④ 把待投递的记录送到配置的出口(qq 转发;未配置时什么也不做)。
+    #       ③ 按时间推进重新评估在队记录(临近的事升级为紧急、过期的事打标);
+    #       ④ 清理已处理的历史记录(队列不无限增长);
+    #       ⑤ 把待投递的记录送到配置的出口(qq 转发;未配置时什么也不做)。
     async def reports_worker() -> None:
         while True:
             try:
                 await asyncio.sleep(REPORTS_WORKER_INTERVAL)
                 await reports_service.flush_candidates(reviewer=reports_reviewer)
                 reports_service.reap_expired()
+                reports_service.rescore_pending()
                 await sinks_service.deliver_pending(send=alert_forward_sender)
                 reports_service.purge_resolved()
             except asyncio.CancelledError:
@@ -219,8 +228,14 @@ def create_app() -> FastAPI:
     #      · 任务授权态(该会话有进行中的目标)期间可自由交流;
     #      · 其余平台消息: reply_mode=auto 才回复;仅监视则只落库(零模型成本);
     #      · 全关 → 只留审计(由 audit_handler 记录)。
-    async def _evaluate_alert(conversation: dict[str, Any], conversation_id: str, event: Event) -> None:
-        """对**对方发来的**消息做上报评估(规则初筛,零模型成本)。
+    async def _evaluate_alert(
+        conversation: dict[str, Any],
+        conversation_id: str,
+        event: Event,
+        *,
+        active_goal: bool = False,
+    ) -> None:
+        """对**对方发来的**消息做上报评估(确定性流水线,零模型成本)。
 
         只评估"别人说的话": 号主自己发的消息(message_sent)、
         平台通知、定时唤醒都不该触发上报 —— 那不是"新发生的事"。
@@ -239,6 +254,7 @@ def create_app() -> FastAPI:
             text=event.text,
             sender_id=event.sender_id,
             sender_name=event.sender_name,
+            active_goal=active_goal,
         )
         if outcome.get("matched"):
             # 桌面端实时可见(只推，不做 UI)：前端据此提示"聊到值得注意的事了"
@@ -247,6 +263,8 @@ def create_app() -> FastAPI:
                 {
                     "conversation_id": conversation_id,
                     "reasons": outcome.get("reasons") or [],
+                    "event": outcome.get("event") or "",
+                    "score": outcome.get("score") or 0.0,
                     "text": event.text[:200],
                 },
             )
@@ -290,9 +308,9 @@ def create_app() -> FastAPI:
                     ),
                     conversation_id=conversation_id,
                 )
-                # 重要消息上报: 规则初筛(零成本)命中的先入队为候选,
-                # 由后台 worker 用快模型批量复核后决定最终去向。
-                await _evaluate_alert(conversation, conversation_id, event)
+                # 重要消息上报: 确定性流水线(信号→事件→上下文)判定命中的先入队,
+                # 高置信的直接可消费,其余由后台 worker 批量复核(或直接用判定结论)。
+                await _evaluate_alert(conversation, conversation_id, event, active_goal=has_active_goal)
             return
 
         # ---- 以下为跑图路径(记录由图内 ingest 负责,不能在这里预记录) ----
@@ -306,9 +324,9 @@ def create_app() -> FastAPI:
 
         # 自动回复的会话同样要做上报评估: 开着上报开关时,
         # "agent 已经回了"不代表"号主不需要知道" —— 两件事互不替代。
-        # 放在跑图之前: 规则判断是纯字符串操作,不拖慢回复;而且即便回复失败,
+        # 放在跑图之前: 判定是纯字符串 + 本地查询,不拖慢回复;而且即便回复失败,
         # 这条重要消息也不会因为异常而漏报。
-        await _evaluate_alert(conversation, conversation_id, event)
+        await _evaluate_alert(conversation, conversation_id, event, active_goal=has_active_goal)
 
         # 跑图(内部会持久化消息/更新目标/调用发送器)。
         # 事件转成可序列化字典 —— 它会进 LangGraph State 并被 checkpoint 序列化。
