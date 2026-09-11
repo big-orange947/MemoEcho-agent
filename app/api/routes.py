@@ -292,3 +292,37 @@ def memory_health() -> dict[str, Any]:
         "batches": batches,
     }
 
+
+# ---------------------------------------------------------------------------
+# 存储占用与保留策略(排障用)
+# ---------------------------------------------------------------------------
+@router.get("/storage", dependencies=[Depends(_check_token)])
+async def storage_status(plan: bool = False) -> dict[str, Any]:
+    """存储占用 + 保留策略。
+
+    参数 plan=true 时额外返回"如果现在清理会删什么"(只读盘点,不执行删除)——
+    供人工核对,等价于 scripts/retention.py plan 的接口版。
+
+    为什么要暴露出来: 监视中的群聊会持续写入,磁盘是**缓慢**被吃掉的 ——
+    不主动看一眼,等发现时往往是服务写不进去了。
+    """
+    from .. import retention as retention_module
+
+    status = retention_module.storage_overview()
+    status["policy"] = {
+        "enabled": bool(get_settings().retention_enabled),
+        "messages_days": int(get_settings().message_retention_days),
+        "messages_keep_min": int(get_settings().message_keep_min),
+        "events_days": int(get_settings().event_retention_days),
+        "dispatches_days": int(get_settings().dispatch_retention_days),
+        "schedules_days": int(get_settings().schedule_retention_days),
+        "reports_days": int(get_settings().report_retention_days),
+        "checkpoints_days": int(get_settings().checkpoint_retention_days),
+    }
+    if plan:
+        # 只盘点数据库侧;checkpoint 精简需要图实例,留给定时任务处理
+        planned = await retention_module.plan()
+        planned.pop("_message_ids", None)
+        status["plan"] = planned
+    return status
+

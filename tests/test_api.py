@@ -354,6 +354,29 @@ class TestEventApi:
         assert set(body["summary"]) >= {"calls", "empty", "unparsed", "last_unparsed_sample"}
         assert isinstance(body["batches"], list)
 
+    def test_storage_endpoint(self, client):
+        """存储占用接口: 磁盘被慢慢吃掉时能主动看见,而不是等写不进去。"""
+        body = client.get("/api/storage").json()
+        assert "files" in body and "rows" in body
+        assert "memo-echo.db" in body["files"]
+        assert body["policy"]["messages_days"] >= 0
+
+    def test_storage_plan_is_readonly(self, client):
+        """plan=true 只盘点不删除(查询接口不该有副作用)。"""
+        from app.services import conversations as conversations_service
+
+        conversation_id = conversations_service.ensure_conversation("qq", "private", "70007")
+        conversations_service.add_message(
+            conversation_id,
+            {"role": "user", "content": "很久以前的一条", "created_at": "2020-01-01T00:00:00+00:00"},
+        )
+
+        body = client.get("/api/storage", params={"plan": "true"}).json()
+        assert "plan" in body
+        # 只读: 消息还在
+        msgs = client.get(f"/api/conversations/{conversation_id}/messages").json()
+        assert len(msgs) == 1
+
     def test_events_filtered_by_conversation(self, client):
         client.post("/api/conversations/conv-evt-1/messages", json={"text": "测试"})
         events = client.get(

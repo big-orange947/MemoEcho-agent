@@ -27,6 +27,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from . import batches
+from .config import get_settings
 from .events import Event, EventKind, EventSource, get_bus
 from .services import schedules as schedules_service
 
@@ -42,7 +43,7 @@ BATCH_SCAN_INTERVAL_SECONDS = 60.0
 
 
 class Scheduler:
-    """定时唤醒调度器: 后台任务,到期发 timer 事件 + 定期攒批记忆。"""
+    """定时唤醒调度器: 后台任务,到期发 timer 事件 + 定期攒批记忆 + 定期清理存储。"""
 
     def __init__(self) -> None:
         self._running = False
@@ -51,6 +52,9 @@ class Scheduler:
         self._last_batch_scan = 0.0
         # 正在跑的攒批任务(一次只允许一个,见 _scan_batches)
         self._batch_task: asyncio.Task | None = None
+        # 上次存储清理的时刻(单调时钟;0 = 还没跑过,启动后第一轮就补跑一次)
+        self._last_retention_run = 0.0
+        self._retention_task: asyncio.Task | None = None
 
     # ------------------------------------------------------------ 生命周期
     def start(self) -> None:
@@ -63,6 +67,17 @@ class Scheduler:
     async def stop(self) -> None:
         """停止后台任务(应用退出时调用)。"""
         self._running = False
+        if self._retention_task is not None and not self._retention_task.done():
+            # 清理任务可能正卡在 checkpoint 精简上;取消它 ——
+            # 删除是分批提交的,已删的不会回滚,未删的下次继续
+            self._retention_task.cancel()
+            try:
+                await self._retention_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:  # noqa: BLE001 - 退出时的清理失败无需打扰用户
+                print(f"[scheduler] 存储清理任务退出异常: {type(exc).__name__}: {exc}")
+            self._retention_task = None
         if self._batch_task is not None and not self._batch_task.done():
             # 攒批任务可能正卡在 LLM 调用上,取消它 —— 它没有不可中断的副作用
             # (写入只在整轮结束时由 Doppel 提交,检查点没提交就下次重来)。
@@ -89,6 +104,7 @@ class Scheduler:
             try:
                 await self._tick()
                 await self._maybe_scan_batches()
+                await self._maybe_run_retention()
             except Exception as exc:  # noqa: BLE001 - 轮询任务不能因单次异常退出
                 print(f"[scheduler] 轮询异常: {type(exc).__name__}: {exc}")
             await asyncio.sleep(POLL_INTERVAL_SECONDS)
@@ -132,6 +148,43 @@ class Scheduler:
         if self._batch_task is not None and not self._batch_task.done():
             return
         self._batch_task = asyncio.create_task(self._scan_batches())
+
+    # ------------------------------------------------------------ 存储清理
+    async def _maybe_run_retention(self) -> None:
+        """到点才跑一次存储清理(默认 24 小时一次)。
+
+        为什么低频: 这是维护动作,不产生用户可见的效果 ——
+        频繁扫库只会白占 IO,而且删数据间隔太短也看不出"删了哪些"。
+        用单调时钟计时,与攒批扫描同理(系统时间被改不影响节奏)。
+        """
+        interval = max(1, int(get_settings().retention_interval_hours)) * 3600
+        now = asyncio.get_running_loop().time()
+        if self._last_retention_run and now - self._last_retention_run < interval:
+            return
+        self._last_retention_run = now
+        if self._retention_task is not None and not self._retention_task.done():
+            return
+        self._retention_task = asyncio.create_task(self._run_retention())
+
+    async def _run_retention(self) -> None:
+        """跑一轮存储清理(后台任务)。
+
+        需要 checkpoint 精简时得拿到图实例 —— 它由 main.py 组装后登记在
+        agent.runtime 的全局访问点里(这里延迟导入,避免模块级循环依赖)。
+
+        异常就地吞掉: 清理是维护动作,失败只是"这次没清",
+        绝不能让调度循环停摆。
+        """
+        from . import retention
+        from .agent.runtime import get_graph
+
+        try:
+            result = await retention.apply(graph=get_graph())
+        except Exception as exc:  # noqa: BLE001 - 清理失败不能影响调度循环
+            print(f"[scheduler] 存储清理失败: {type(exc).__name__}: {exc}")
+            return
+        if result.get("total_deleted") or result.get("checkpoints_pruned"):
+            print(f"[scheduler] 存储清理: 共删除 {result.get('total_deleted', 0)} 行")
 
     async def _scan_batches(self) -> None:
         """跑一轮攒批扫描(后台任务)。

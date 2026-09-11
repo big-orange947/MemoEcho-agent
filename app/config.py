@@ -107,6 +107,30 @@ class Settings(BaseSettings):
     # 防话痨群刷屏;超限的**暂缓**而不是丢弃,下一轮继续送。
     alert_max_per_hour: int = 10
 
+    # ---------------------------------------------------------------- 存储保留
+    # 监视中的群聊会持续写入,不设上界迟早把磁盘啃满(而且是静默地啃)。
+    # 删数据是危险动作,所以规则是"宁可不删,不可误删"(详见 app/retention.py):
+    #   · 消息只在**已总结进长期记忆**之后才可能被删(没有水位线就一条不删);
+    #   · 每个会话始终保留最近 message_keep_min 条(上下文安全垫);
+    #   · 有进行中目标的会话跳过。
+    retention_enabled: bool = True
+    # 消息保留天数(0 = 永久保留,不清理)
+    message_retention_days: int = 90
+    # 每个会话无条件保留的最近消息条数
+    message_keep_min: int = 200
+    # 事件审计保留天数(0 = 永久)
+    event_retention_days: int = 30
+    # 外部调度记录保留天数(只删已结束的)
+    dispatch_retention_days: int = 30
+    # 定时唤醒记录保留天数(只删已触发/已取消的)
+    schedule_retention_days: int = 30
+    # 已处理的上报记录保留天数
+    report_retention_days: int = 30
+    # 休眠超过这么多天的会话,其 checkpoint 只保留最新一份(0 = 不精简)
+    checkpoint_retention_days: int = 30
+    # 清理扫描间隔(小时)。默认 24 小时 —— 这是维护动作,不需要频繁跑。
+    retention_interval_hours: int = 24
+
     model_config = SettingsConfigDict(
         # 允许从 .env 文件读取(与 local-env.ps1 二选一,二选一即可)
         env_file=".env",

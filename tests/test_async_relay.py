@@ -16,6 +16,8 @@
 """
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 from fastapi.testclient import TestClient
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -165,9 +167,6 @@ class TestAskOthers:
 class TestReplyComesBack:
     def test_reply_from_contact_reaches_agent(self, env):
         """核心: agent 问出去之后,对方的回复要能回到 agent 手里。"""
-        from app.services import conversations as conversations_service
-        from app.services import goals as goals_service
-
         ScriptedModel.script = [
             {"tool": "send_qq_message", "args": {"chat_id": "20001", "text": "今晚几点上课?"}},
             "已经帮你问了",
