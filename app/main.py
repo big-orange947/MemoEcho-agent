@@ -38,7 +38,7 @@ from .api import reports as reports_api
 from .api import routes as api_routes
 from .api import sse as sse_api
 from .agent.graph import AgentGraph, ConversationBusyError
-from .agent.runtime import set_graph, set_sender
+from .agent.runtime import set_graph, set_notifier, set_sender
 from .bridge import onebot
 from .bridge.napcat import NapcatBridge
 from .config import get_settings
@@ -194,6 +194,8 @@ def create_app() -> FastAPI:
     # 登记到全局访问点: API 路由/outbox 等模块通过 get_graph()/get_sender() 取用
     set_graph(graph)
     set_sender(sender)
+    # 事件推送器: 核心层(如 finalize 产出草稿)用它推 SSE —— 核心层不直接依赖 api 层
+    set_notifier(sse_api.push)
 
     # ------------------------------------------------------------------ 事件处理器
     # ① 审计处理器: 所有事件都记一笔(含不需要回应的通知/请求/自发回显)。

@@ -192,7 +192,14 @@ async def deliver_pending(
 
     # 认领即"接管": 本地 sink 一旦启用就是队列的消费者,
     # 认领后上游取不到这些记录 —— 避免同一件事被报两遍。
-    records = reports_service.claim(limit=limit, claimed_by="sink:qq")
+    #
+    # 但**待确认草稿必须排除**: 它是"我们还没发出去的话",
+    # 而 sink 的职责是"把通知送到号主手上"。若草稿被当作上报转发出去,
+    # 既会污染通知(号主以为收到的是提醒),又会让这条草稿被标记成已处理 ——
+    # 真正要发的时候反而没了。草稿只能由人显式确认后发(/api/reports/{id}/send)。
+    records = reports_service.claim(
+        limit=limit, claimed_by="sink:qq", exclude_lanes=(reports_service.LANE_DRAFT,)
+    )
     if not records:
         return result
     result["enabled"] = True

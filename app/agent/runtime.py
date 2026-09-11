@@ -23,6 +23,12 @@ _graph: "AgentGraph | None" = None
 # 由 main.create_app 注入;outbox 用它投递出站消息。
 _sender: Callable[[str, str, str], Awaitable[Any]] | None = None
 
+# 事件推送器(SSE): (event_type, payload) -> None
+# 由 main.create_app 注入。核心层(agent 节点)用它把**面向界面**的通知
+# (如"拟好了一条待确认草稿")发出去 —— 核心层不直接依赖 api 层,
+# 推送是尽力而为: 没登记或推送失败都不影响业务(队列才是权威通道)。
+_notifier: Callable[[str, dict[str, Any]], Awaitable[Any]] | None = None
+
 
 def set_graph(graph: "AgentGraph") -> None:
     """登记全局图实例(由 main.create_app 在组装时调用)。"""
@@ -44,3 +50,23 @@ def set_sender(sender: Callable[[str, str, str], Awaitable[Any]]) -> None:
 def get_sender() -> Callable[[str, str, str], Awaitable[Any]] | None:
     """返回全局消息发送器(未初始化时为 None)。"""
     return _sender
+
+
+def set_notifier(notifier: Callable[[str, dict[str, Any]], Awaitable[Any]]) -> None:
+    """登记全局事件推送器(由 main.create_app 在组装时调用)。"""
+    global _notifier
+    _notifier = notifier
+
+
+async def notify(event_type: str, payload: dict[str, Any]) -> None:
+    """尽力推送一条面向界面的通知。
+
+    刻意**不**向上抛异常: 推送只是"让人早点看见",丢了还有队列兜底
+    (消费者可以 claim / 长轮询)。让通知失败拖垮一次业务执行是本末倒置。
+    """
+    if _notifier is None:
+        return
+    try:
+        await _notifier(event_type, payload)
+    except Exception as exc:  # noqa: BLE001 - 通知不是关键路径
+        print(f"[notify] 推送失败 {event_type}: {type(exc).__name__}: {exc}")

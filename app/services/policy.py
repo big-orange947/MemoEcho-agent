@@ -277,6 +277,38 @@ def resolve_hitl(conversation: dict[str, Any]) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# 回复的投递方式: 直接发出,还是先存成草稿
+# ---------------------------------------------------------------------------
+# 与决定"跑不跑图"的 decide() 分开: 这里回答的是**跑完之后**怎么处理产出的回复。
+DELIVERY_SEND = "send"      # 直接发给对方
+DELIVERY_DRAFT = "draft"    # 存成待确认草稿,等号主点"发"
+
+
+def resolve_reply_delivery(event: Any, conversation: dict[str, Any]) -> str:
+    """本轮生成的回复该直接发出,还是存成草稿。
+
+    规则(与 decide() 共用同一份"显式指令"口径,避免两处口径漂移):
+
+      · 显式指令(主 agent 派发 / 桌面端命令)→ 直接发。
+        权威规则"显式指令 > 会话策略":那是人当场要求做的事,
+        再套一层草稿等于把命令降级成了建议。
+      · 其余(对方消息、任务授权态、定时唤醒 + reply_mode=draft)→ 草稿。
+        任务授权态也**不**豁免草稿: 草稿是"我们这边怎么发"的设置,
+        授权态是"要不要参与"的设置 —— 号主既然要求先过目,
+        就不能因为某个任务在跑而让消息悄悄发出去。
+      · 其它情况 → 直接发(auto / off 下由 decide() 决定跑不跑)。
+    """
+    source = getattr(event, "source", None)
+    if source is None and isinstance(event, dict):
+        source = event.get("source")
+    if source in _EXPLICIT_SOURCES:
+        return DELIVERY_SEND
+    if str(conversation.get("reply_mode") or "off") == "draft":
+        return DELIVERY_DRAFT
+    return DELIVERY_SEND
+
+
+# ---------------------------------------------------------------------------
 # 工具权限
 # ---------------------------------------------------------------------------
 def is_high_risk(tool_name: str, tags: Any = ()) -> bool:
@@ -345,16 +377,21 @@ def decide(
     if event.kind == EventKind.TIMER:
         if has_active_goal:
             return DECISION_REPLY, "timer-active-goal"
-        if conversation.get("reply_mode") == "auto":
+        if str(conversation.get("reply_mode") or "off") in ("auto", "draft"):
             return DECISION_REPLY, "timer-reply-mode-auto"
         return DECISION_IGNORE, "timer-no-context"
 
     # ---- 2. 跑图 ----
+    reply_mode = str(conversation.get("reply_mode") or "off")
     if event.should_respond and (
-        explicit or has_active_goal or conversation.get("reply_mode") == "auto"
+        explicit or has_active_goal or reply_mode in ("auto", "draft")
     ):
         if explicit:
             return DECISION_REPLY, "explicit-instruction"
+        if reply_mode == "draft":
+            # 与 auto 一样跑图,区别在**发不发**: 跑完存成草稿等号主确认
+            # (见 resolve_reply_delivery 与 nodes/finalize.py)。
+            return DECISION_REPLY, "reply-mode-draft"
         if has_active_goal:
             return DECISION_REPLY, "task-authorization"
         return DECISION_REPLY, "reply-mode-auto"

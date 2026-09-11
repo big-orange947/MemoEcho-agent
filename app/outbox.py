@@ -25,19 +25,30 @@ from .services import conversations as conversations_service
 Sender = Callable[[str, str, str], Awaitable[None]]
 
 
-async def deliver(conversation_id: str, text: str, *, source: str = "outbound") -> dict[str, Any]:
+async def deliver(
+    conversation_id: str,
+    text: str,
+    *,
+    source: str = "outbound",
+    record_first: bool = True,
+) -> dict[str, Any]:
     """把一条出站消息投递给会话: 先落库,再发送。
 
     参数:
       conversation_id: 目标会话
       text:            消息文本(非空才处理)
       source:          消息来源标记(默认 outbound;直接发送可传 "manual"/"dispatch")
+      record_first:    是否"先落库,再发送"(默认,见下面的注意)。
+                       传 False 表示**发成功才落库**,用于人确认后发送的场景 ——
+                       发送失败时历史里不该出现一条"我说过"的记录,
+                       否则下一轮模型会以为话已经带到了,而对方什么都没收到。
 
     返回: {"ok": bool, "message_id": str, "reason": str}
       ok=False 的典型原因: 会话不存在、文本为空、发送器未初始化。
 
-    注意: 落库在发送**之前** —— 即使发送失败,历史里也有记录
-    (调用方可通过 ok 字段判断是否需要重试)。
+    注意: 默认落库在发送**之前** —— 即使发送失败,历史里也有记录
+    (调用方可通过 ok 字段判断是否需要重试);对"agent 自己决定要说的话"
+    这是对的: 它确实说了,平台抖动不该让 agent 忘掉自己说过什么。
     """
     text = (text or "").strip()
     if not text:
@@ -50,17 +61,7 @@ async def deliver(conversation_id: str, text: str, *, source: str = "outbound") 
         return {"ok": False, "message_id": "", "reason": f"会话不存在: {conversation_id}"}
 
     # ---- 1. 落库(assistant 身份,因为这是"我们说的话") ----
-    message_id = conversations_service.add_message(
-        conversation_id,
-        {
-            "id": None,          # 由 service 生成
-            "role": "assistant",
-            "content": text,
-            "source": source,
-            "created_at": "",    # 由 service 填充
-            "goal_id": "",
-        },
-    )
+    message_id = _archive(conversation_id, text, source) if record_first else ""
 
     # ---- 2. 发送 ----
     sender = get_sender()
@@ -83,7 +84,28 @@ async def deliver(conversation_id: str, text: str, *, source: str = "outbound") 
                 "message_id": message_id,
                 "reason": str(outcome.get("error") or "发送失败"),
             }
-    if platform_message_id:
+
+    # ---- 4. record_first=False: 发送成功了才落库 ----
+    # 放在这里而不是开头: 失败的发送不该在历史里留下"我说过"的痕迹。
+    if not record_first:
+        message_id = _archive(conversation_id, text, source)
+
+    if platform_message_id and message_id:
         conversations_service.set_platform_message_id(message_id, platform_message_id)
 
     return {"ok": True, "message_id": message_id, "reason": ""}
+
+
+def _archive(conversation_id: str, text: str, source: str) -> str:
+    """把出站消息写进会话历史(assistant 身份),返回消息 ID。"""
+    return conversations_service.add_message(
+        conversation_id,
+        {
+            "id": None,          # 由 service 生成
+            "role": "assistant",
+            "content": text,
+            "source": source,
+            "created_at": "",    # 由 service 填充
+            "goal_id": "",
+        },
+    )

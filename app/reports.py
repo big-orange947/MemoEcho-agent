@@ -37,6 +37,7 @@ LANE_URGENT = "urgent"      # 立即上报(上游应尽快取走)
 LANE_NORMAL = "normal"      # 普通候选(可进摘要批)
 LANE_QUESTION = "question"  # HITL 请示: agent 拿不准,回来问号主
 LANE_DIGEST = "digest"      # 批量汇总(一段时间的 normal 合并成一条)
+LANE_DRAFT = "draft"        # 待确认草稿: agent 拟好但**没发出去**的回复
 
 # 队列状态。candidate = 已过规则、等快模型复核(比 pending 早一步)。
 STATUS_CANDIDATE = "candidate"
@@ -186,6 +187,60 @@ def enqueue(
 
 
 # ---------------------------------------------------------------------------
+# 待确认草稿(draft lane)
+# ---------------------------------------------------------------------------
+def upsert_draft(
+    *,
+    conversation_id: str,
+    text: str,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """把一条"待确认草稿"放进队列(同一会话只保留最新一条未处理的)。
+
+    为什么是覆盖而不是追加: 草稿是**基于当前上下文**拟出来的,
+    对方再发一句,旧草稿就已过时 —— 留着只会让号主在一堆过期版本里挑。
+    已处理过的(acked/dropped/dead)不动: 那些是历史,审计要留。
+
+    返回 {"id": str, "updated": bool}。updated=True 表示覆盖了旧草稿。
+    """
+    conn = get_connection()
+    now = _now()
+    body = dict(payload or {})
+    body["kind"] = "draft"
+    body["text"] = text
+    body.setdefault("summary", text[:200])
+
+    existing = conn.execute(
+        "SELECT id FROM report_queue WHERE conversation_id=? AND lane=? AND status=?",
+        (conversation_id, LANE_DRAFT, STATUS_PENDING),
+    ).fetchone()
+    if existing is not None:
+        conn.execute(
+            "UPDATE report_queue SET payload=?, attempts=0, claimed_by='',"
+            " lease_expires_at='', updated_at=? WHERE id=?",
+            (json.dumps(body, ensure_ascii=False), now, existing["id"]),
+        )
+        conn.commit()
+        return {"id": existing["id"], "updated": True}
+
+    created = enqueue(
+        lane=LANE_DRAFT,
+        conversation_id=conversation_id,
+        payload=body,
+        status=STATUS_PENDING,
+    )
+    return {"id": created["id"], "updated": False}
+
+
+def get_report(record_id: str) -> dict[str, Any] | None:
+    """按 ID 取一条记录(不存在返回 None)。"""
+    row = get_connection().execute(
+        "SELECT * FROM report_queue WHERE id=?", (record_id,)
+    ).fetchone()
+    return _decode(dict(row)) if row is not None else None
+
+
+# ---------------------------------------------------------------------------
 # 消费(claim / ack / drop)
 # ---------------------------------------------------------------------------
 def claim(
@@ -194,6 +249,7 @@ def claim(
     lane: str = "",
     lease_seconds: int = DEFAULT_LEASE_SECONDS,
     claimed_by: str = "upstream",
+    exclude_lanes: Iterable[str] = (),
 ) -> list[dict[str, Any]]:
     """认领待处理记录(至少一次投递语义)。
 
@@ -202,6 +258,9 @@ def claim(
 
     上游拿到后必须 ack(处理完了)或 drop(决定不报);
     若中途挂了,租约到期后这条会重新变成 pending 供别人取走。
+
+    exclude_lanes: 不认领这些通道。本地 sink 用它挡掉待确认草稿 ——
+    草稿是"没发出去的东西",绝不能被当上报自动转发(见 app/sinks.py)。
     """
     reap_expired()
     conn = get_connection()
@@ -213,6 +272,10 @@ def claim(
     if lane:
         sql += " AND lane=?"
         params.append(lane)
+    skipped = [str(item) for item in exclude_lanes if item]
+    if skipped:
+        sql += f" AND lane NOT IN ({','.join('?' for _ in skipped)})"
+        params.extend(skipped)
     sql += " ORDER BY created_at ASC LIMIT ?"
     params.append(max(1, limit))
 

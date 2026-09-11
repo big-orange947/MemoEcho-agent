@@ -25,7 +25,10 @@ from langgraph.graph.message import RemoveMessage
 from ...config import get_settings
 from ...services import conversations as conversations_service
 from ...services import goals as goals_service
+from ...services import policy as policy_service
 from ...services import schedules as schedules_service
+from ... import reports as reports_service
+from ..runtime import notify
 
 
 async def run(
@@ -79,6 +82,44 @@ async def run(
     # 工具对模型的承诺(本轮不回复对方)必须有代码兜底,不能只靠提示词。
     if state.get("awaiting_owner"):
         print(f"[finalize] 已请示号主,本轮不回复对方(会话 {conversation_id})")
+        return _trim_update(state)
+
+    # ---------------------------------------------------------------- 0c. 草稿模式
+    # reply_mode=draft: 这一轮**照样跑图**(否则没有草稿可看),但回复不发给对方,
+    # 而是存进队列的 draft 通道等号主确认(见 api/reports.py 的 /send)。
+    # 为什么不能只靠提示词让模型"先别说": 模型每轮都会重新决策,
+    # 而"发不发出去"是策略问题,必须由代码在唯一的出口处兜住。
+    conversation = conversations_service.get_conversation(conversation_id) or {}
+    delivery = policy_service.resolve_reply_delivery(state.get("event") or {}, conversation)
+    if delivery == policy_service.DELIVERY_DRAFT and conversation_id:
+        record = reports_service.upsert_draft(
+            conversation_id=conversation_id,
+            text=output_text,
+            payload={"trigger": "reply", "reason": "reply-mode-draft"},
+        )
+        # 目标只标记"在等号主确认",**不**按模型的结论推进状态 ——
+        # 对方还没收到任何东西,这时候把任务标成"完成"就是在骗自己
+        # (与 HITL 那条假承诺同一类问题)。真正的状态推进等发出之后再发生。
+        goal = state.get("goal")
+        if goal:
+            goals_service.update_goal_status(
+                goal_id=str(goal.get("id") or ""),
+                status="active",
+                progress=f"待号主确认草稿: {output_text[:20]}",
+            )
+        # 桌面端实时可见(只推;真正权威的是队列,前端可 claim/长轮询)
+        await notify(
+            "draft",
+            {
+                "conversation_id": conversation_id,
+                "draft_id": str(record.get("id") or ""),
+                "updated": bool(record.get("updated")),
+                "text": output_text[:500],
+            },
+        )
+        print(f"[finalize] 草稿待确认(会话 {conversation_id}): {output_text[:60]}")
+        # 注意: 不落库成 assistant 消息 —— 对方**没有**收到,
+        # 记进历史会让下一轮的模型以为自己已经说过了。
         return _trim_update(state)
 
     # ---------------------------------------------------------------- 1. 落库回复
