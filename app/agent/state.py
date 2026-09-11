@@ -39,6 +39,13 @@ class AgentState(TypedDict, total=False):
     # None 表示"未解析"(直接调用/单测),此时不做限制。
     allowed_tools: list[str] | None
 
+    # ------------------------------------------------------------ 请示暂停
+    # act 检测到"成功请示了号主"时置为 True。
+    # 之后 finalize 不再把本轮的回复发给对方 —— 请示的语义就是"停下等答复",
+    # 而工具返回后 ReAct 还会再跑一轮,模型很可能顺手写一句回复发出去。
+    # 每次 run_event 都会重置为 False(见 graph._run_graph 的初始 state)。
+    awaiting_owner: bool
+
     # ------------------------------------------------------------ 当前事件
     # 本次触发的事件(可能来自 QQ 或桌面端)。节点用它判断"这次进来的是什么"。
     event: dict[str, Any]

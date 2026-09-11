@@ -22,6 +22,7 @@ from typing import Any
 from ...config import get_settings
 from ...services import conversations as conversations_service
 from ...services import goals as goals_service
+from ...services import policy as policy_service
 
 
 async def run(state: dict[str, Any]) -> dict[str, Any]:
@@ -71,6 +72,10 @@ async def run(state: dict[str, Any]) -> dict[str, Any]:
             "goal_text": (goal or {}).get("objective") or "",
             "memory_block": memory_block,       # 长期记忆文本块(可能为空串)
             "history_block": history_block,     # 补全的早前对话(可能为空串)
+            # 是否要求"拿不准先请示"(HITL): 由 reason 拼进提示词,
+            # 决定它遇事是先回来问、还是在目标范围内自主决定。
+            # 注意: 这**只影响授权范围**,底线约束任何情况下都写死在提示词里。
+            "hitl": policy_service.resolve_hitl(conversation),
         }
     )
 

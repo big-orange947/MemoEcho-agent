@@ -21,7 +21,7 @@ from typing import Any
 
 from langchain_core.messages import AIMessage, BaseMessage, SystemMessage
 
-from ..prompts import REASON_SYSTEM_PROMPT
+from ..prompts import HITL_OFF_RULES, HITL_ON_RULES, REASON_SYSTEM_PROMPT
 
 
 def _build_messages(state: dict[str, Any], tools_desc: str) -> list[BaseMessage]:
@@ -30,8 +30,13 @@ def _build_messages(state: dict[str, Any], tools_desc: str) -> list[BaseMessage]
     persona = working.get("persona") or ""
     goal_text = working.get("goal_text") or ""
 
-    # 系统提示: 人设 + 目标 + 工具清单
-    system = REASON_SYSTEM_PROMPT.format(tools_description=tools_desc)
+    # 系统提示: 人设 + 目标 + 工具清单。
+    # HITL 段落按会话配置二选一(只影响"授权范围":遇事要不要先回来问);
+    # 提示词末尾的底线约束任何情况下都在 —— 关掉请示不等于放宽底线。
+    system = REASON_SYSTEM_PROMPT.format(
+        tools_description=tools_desc,
+        hitl_rules=HITL_ON_RULES if working.get("hitl") else HITL_OFF_RULES,
+    )
     if persona:
         system += f"\n\n你在这个会话中的人设: {persona}"
     if goal_text:

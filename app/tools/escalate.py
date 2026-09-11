@@ -28,6 +28,11 @@ from langchain_core.tools import tool
 from .. import reports as reports_service
 from ..services import goals as goals_service
 
+# 成功请示的返回前缀。act 节点靠它判断"这一轮该停下等号主了" ——
+# 用常量而不是在 act 里重写一遍字符串,避免两处漂移后静默失效。
+RESULT_PREFIX = "已请示号主"
+ERROR_PREFIX = "错误:"
+
 
 @tool
 def escalate_to_owner(question: str, options: str = "", config: RunnableConfig = None) -> str:
@@ -79,7 +84,7 @@ def escalate_to_owner(question: str, options: str = "", config: RunnableConfig =
         )
 
     duplicated = " (同一问题已登记过)" if result.get("duplicated") else ""
-    return f"已请示号主,等待答复{duplicated}。本轮先不回复对方,等号主给出指示后再继续。"
+    return f"{RESULT_PREFIX},等待答复{duplicated}。本轮先不回复对方,等号主给出指示后再继续。"
 
 
 def create_escalate_tools() -> list[Any]:

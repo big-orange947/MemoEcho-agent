@@ -329,6 +329,9 @@ class AgentGraph:
             "output_text": "",
             # 本次可用的工具名(权限收口);None = 不限制
             "allowed_tools": sorted(allowed_tools) if allowed_tools is not None else None,
+            # 请示暂停标记必须**每轮重置**: 它是"这一轮"的属性。
+            # 不复位的话,上一次请示的残留会让后续每一轮都拒绝发送(而且无声无息)。
+            "awaiting_owner": False,
         }
 
         result = await self.graph.ainvoke(

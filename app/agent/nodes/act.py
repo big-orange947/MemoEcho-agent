@@ -46,6 +46,8 @@ async def run(state: dict[str, Any], tools_by_name: dict[str, Any]) -> dict[str,
 
     # 逐个执行工具调用,收集 ToolMessage
     tool_messages: list[ToolMessage] = []
+    # "已请示号主"标记: 请求意味着本轮交涉要暂停(见 escalate_to_owner 的承诺)
+    awaiting_owner = False
     for call in latest.tool_calls:
         tool_name = call.get("name") or ""
         tool_args = call.get("args") or {}
@@ -69,11 +71,34 @@ async def run(state: dict[str, Any], tools_by_name: dict[str, Any]) -> dict[str,
             except Exception as exc:  # noqa: BLE001 - 工具异常要反馈给模型而不是中断
                 result_text = f"工具执行出错: {type(exc).__name__}: {exc}"
 
+        # 请示成功 ⇒ 标记本轮暂停。
+        # 为什么必须在这里判: 工具返回后 ReAct 循环还会继续跑一轮,
+        # 模型很可能顺势写一句"我先问问"—— 若不拦,finalize 会把它发给对方,
+        # 而请示的语义是"停下等号主"。工具文档里的承诺必须有代码兜底。
+        if _is_successful_escalation(tool_name, result_text):
+            awaiting_owner = True
+
         tool_messages.append(
             ToolMessage(content=result_text, name=tool_name, tool_call_id=tool_call_id)
         )
 
-    return {"messages": tool_messages}
+    update: dict[str, Any] = {"messages": tool_messages}
+    if awaiting_owner:
+        update["awaiting_owner"] = True
+    return update
+
+
+def _is_successful_escalation(tool_name: str, result_text: str) -> bool:
+    """这次工具调用是否是一次成功的"请示号主"。
+
+    判定用工具模块导出的常量(而不是在别处重写字符串)——
+    提示词、工具返回、暂停判定三处必须一致,否则 HITL 会静默失效。
+    """
+    if tool_name != "escalate_to_owner":
+        return False
+    from ...tools.escalate import RESULT_PREFIX
+
+    return RESULT_PREFIX in result_text
 
 
 def _audit_denied(conversation_id: str, tool_name: str) -> None:
