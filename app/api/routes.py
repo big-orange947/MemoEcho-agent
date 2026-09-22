@@ -272,8 +272,10 @@ def memory_health() -> dict[str, Any]:
       init_error       Doppel 初始化失败原因(空=正常)
       summary          总结器统计(调用/空结果/解析失败次数 + 失败样本)
       batches          各会话的攒批进度(待处理条数、上次状态与错误)
+      consolidation    各会话的记忆整理状态(上次结果里的操作计数与冲突)
     """
     from .. import batches as batches_module
+    from .. import consolidation as consolidation_module
 
     batches = [
         {
@@ -285,11 +287,23 @@ def memory_health() -> dict[str, Any]:
         }
         for row in batches_module.list_progress(limit=50)
     ]
+    consolidation = [
+        {
+            "conversation_id": row["conversation_id"],
+            "last_run_at": row["last_run_at"],
+            "has_checkpoint": row["checkpoint"],
+            "operations": (row["last_result"] or {}).get("operations") or {},
+            "conflicts": len((row["last_result"] or {}).get("conflicts") or []),
+            "errors": (row["last_result"] or {}).get("errors") or [],
+        }
+        for row in consolidation_module.list_state(limit=50)
+    ]
     return {
         "enabled": memory_layer.is_enabled(),
         "init_error": memory_layer.init_error(),
         "summary": batches_module.summary_health(),
         "batches": batches,
+        "consolidation": consolidation,
     }
 
 

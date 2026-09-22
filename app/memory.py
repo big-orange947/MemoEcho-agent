@@ -291,6 +291,11 @@ def query_terms(text: str, *, max_terms: int = 14) -> list[str]:
     return (head + twos + rest)[:max_terms]
 
 
+# 冲突标记的记忆类型(Doppel 整理器写出来的"这件事有矛盾"的记录)。
+# 它不是事实,是给整理/通知环节看的标记 —— 检索时要把它们滤掉。
+CONFLICT_KIND = "memory_conflict"
+
+
 def _dedupe(hits: list[Any]) -> list[Any]:
     """按记忆 ID(退化到内容)去重,保持先后顺序。"""
     seen: set[str] = set()
@@ -336,10 +341,139 @@ async def recall(
         if not hits:
             hits = _dedupe(await client.recall("", [scope], limit=limit))
 
+        # 冲突标记是"给整理环节看的记录",不是事实: 它的内容是
+        # "Unresolved personal-memory conflict in topic X across N active claims."
+        # 混进提示词只会让模型以为号主在说胡话。冲突本身已经通过上报队列
+        # 报给号主确认了(见 app/consolidation.py)。
+        hits = [hit for hit in hits if str(getattr(hit, "kind", "") or "") != CONFLICT_KIND]
         return [_simplify(hit) for hit in hits[:limit]]
     except Exception as exc:  # noqa: BLE001 - 检索失败降级为空
         print(f"[memory] 检索失败(已降级): {type(exc).__name__}: {exc}")
         return []
+
+
+async def known_topic_keys(conversation: dict[str, Any], *, limit: int = 200) -> list[str]:
+    """该会话已有记忆用过的槽位名(供总结器复用,避免同义新造)。
+
+    槽位名是**字符串精确匹配**的: 同一件事这批评成"课表"、下批评成"课程安排",
+    两条记忆就永远不会被比对 —— 过期的那条会一直躺在检索结果里。
+    所以每次总结前把已有槽位名带进提示词,让模型尽量复用。
+
+    读的是"最早的一批"(scan 从旧到新): 槽位往往在早期就定下来了,
+    后面的记录大多在复用它们。失败返回空列表(提示词少一段而已)。
+    """
+    client = await get_client()
+    if client is None:
+        return []
+    try:
+        page = await client.store.scan(build_scope(conversation), limit=max(1, limit))
+    except Exception as exc:  # noqa: BLE001 - 拿不到提示就算了,不影响总结
+        print(f"[memory] 读取已有槽位失败(已忽略): {type(exc).__name__}: {exc}")
+        return []
+
+    keys: list[str] = []
+    for record in getattr(page, "records", []) or []:
+        key = str((getattr(record, "metadata", None) or {}).get("topic_key") or "").strip()
+        if key and key not in keys:
+            keys.append(key)
+    return keys
+
+
+async def consolidate(conversation: dict[str, Any], *, checkpoint: Any = None) -> dict[str, Any]:
+    """对某个会话跑一轮"事实过期/冲突"整理(确定性,零模型成本)。
+
+    用的是 Doppel 的 ConsolidationRunner + DeterministicMemoryConsolidator:
+      · merge   —— 同一槽位上完全相同的重复说法,合并成一条;
+      · correct —— 新说法带**明确的订正标记**(聊天里说了"改了/取消了")时,
+                   把旧说法置为 superseded(它就不再被检索出来了);
+      · conflict —— 同一槽位上说法互相矛盾、又没有明确订正证据时,
+                   保留双方 + 写一条 conflict 标记,并把冲突原样报上去让人确认。
+
+    返回 {"ok", "reason", "operations": {...}, "conflicts": [...], "checkpoint", "complete"}。
+    任何失败都返回 ok=False(记忆是增强能力,整理失败不能影响对话)。
+    """
+    client = await get_client()
+    if client is None:
+        return {"ok": False, "reason": "记忆功能未启用", "operations": {}, "conflicts": []}
+
+    try:
+        from doppel_memory import (
+            ConsolidationCheckpoint,
+            ConsolidationOperation,
+            ConsolidationRunner,
+            DeterministicMemoryConsolidator,
+        )
+    except ImportError as exc:  # pragma: no cover - 取决于 Doppel 版本
+        return {"ok": False, "reason": f"当前 Doppel 版本不支持整理: {exc}", "operations": {}, "conflicts": []}
+
+    bound_checkpoint = None
+    if checkpoint:
+        try:
+            bound_checkpoint = (
+                checkpoint
+                if isinstance(checkpoint, ConsolidationCheckpoint)
+                else ConsolidationCheckpoint.model_validate(checkpoint)
+            )
+        except Exception as exc:  # noqa: BLE001 - 旧检查点不兼容时从头开始,不中断
+            print(f"[memory] 整理检查点不可用,将重新开始: {type(exc).__name__}: {exc}")
+            bound_checkpoint = None
+
+    try:
+        scope = build_scope(conversation)
+        runner = ConsolidationRunner(client.store)
+        result = await runner.run_once(
+            DeterministicMemoryConsolidator(), scope, checkpoint=bound_checkpoint
+        )
+    except Exception as exc:  # noqa: BLE001 - 整理失败降级,不影响其它流程
+        return {
+            "ok": False,
+            "reason": f"{type(exc).__name__}: {exc}",
+            "operations": {},
+            "conflicts": [],
+        }
+
+    operations: dict[str, int] = {}
+    conflicts: list[dict[str, Any]] = []
+    # 注意: run.actions 是**执行结果**(ConsolidationActionResult),
+    # 冲突的细节(槽位、来源)在**计划**里(run.plan.actions)——
+    # 计划里才有 proposal 与 explanation。
+    plan_actions = {str(getattr(item, "decision_id", "")): item for item in result.plan.actions}
+    for action in result.actions:
+        name = str(getattr(action, "operation", "") or "")
+        operations[name] = operations.get(name, 0) + 1
+        if name != ConsolidationOperation.CONFLICT:
+            continue
+        planned = plan_actions.get(str(getattr(action, "decision_id", "")))
+        proposal = getattr(planned, "proposal", None) if planned is not None else None
+        metadata = dict(getattr(proposal, "metadata", None) or {})
+        conflict = dict(metadata.get("conflict") or {})
+        topic = str(conflict.get("topic_key") or "")
+        if not topic:
+            # 兜底: 冲突标记的内容里带着槽位名("...conflict in topic X across N...")
+            content = str(getattr(proposal, "content", "") or "")
+            if " in topic " in content:
+                topic = content.split(" in topic ", 1)[1].split(" across ", 1)[0].strip()
+        conflicts.append(
+            {
+                "topic_key": topic,
+                "reason": str(getattr(planned, "explanation", "") or "") if planned else "",
+                "memory_ids": [
+                    str(item.get("memory_id") or "")
+                    for item in (conflict.get("source_memories") or [])
+                ]
+                or [str(item.memory_id) for item in (getattr(planned, "sources", None) or [])],
+            }
+        )
+
+    return {
+        "ok": True,
+        "reason": "",
+        "operations": operations,
+        "conflicts": conflicts,
+        "checkpoint": result.committable_checkpoint,
+        "complete": result.committable_checkpoint is not None,
+        "errors": [f"{item.stage}: {item.error_type}" for item in (result.errors or [])],
+    }
 
 
 def _simplify(hit: Any) -> dict[str, Any]:

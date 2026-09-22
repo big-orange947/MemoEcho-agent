@@ -72,6 +72,14 @@ SMALL_TALK = [
     {"actor": "contact", "content": "好的好的", "created_at": "2026-09-10T13:00:30+00:00"},
 ]
 
+# "先定后改": 用来验证总结器会不会给出槽位、会不会标出明确订正 ——
+# 事实过期/冲突整理全靠这两个字段(见 app/consolidation.py)。
+SCHEDULE_CHANGE = [
+    {"actor": "contact", "content": "我这学期周三晚上有课", "created_at": "2026-09-10T14:00:00+00:00"},
+    {"actor": "agent", "content": "好，记下了", "created_at": "2026-09-10T14:00:10+00:00"},
+    {"actor": "contact", "content": "对了课表改了，周三那节课调到周五晚上了", "created_at": "2026-09-11T14:00:00+00:00"},
+]
+
 
 async def case_summarizer() -> None:
     from app import batches
@@ -119,6 +127,24 @@ async def case_summarizer() -> None:
         "1.4 纯寒暄 → 一条都不记(且不是解析失败)",
         len(notes_small) == 0 and health_small["unparsed"] == 0,
         f"产出 {len(notes_small)} 条;解析失败 {health_small['unparsed']} 次",
+    )
+
+    # -- 1.5 槽位与修订标记: 事实过期/冲突整理全靠这两个字段 --
+    # 提示词里写了"明说改了才写 correction",但真模型会不会照做只能真跑一次看。
+    # 这里用一段"先定后改"的对话验证: 该给的槽位给了、该标的订正标了。
+    batches.reset_summary_stats()
+    notes_change = await batches._llm_summarize(conversation, SCHEDULE_CHANGE)
+    detail_change = "\n".join(
+        f"· [{n.actor}/{n.kind}] slot={n.topic_key or '-'} revision={n.revision_kind}"
+        f" temporal={n.temporal_status}\n  {n.content}"
+        for n in notes_change
+    ) or "(无)"
+    slotted = [n for n in notes_change if n.topic_key]
+    corrected = [n for n in notes_change if n.revision_kind in ("correction", "retraction")]
+    report(
+        "1.5 槽位/修订: 改了课表 → 至少一条带 slot,且订正被标出来",
+        bool(slotted) and bool(corrected),
+        f"产出 {len(notes_change)} 条(带槽位 {len(slotted)}、标了订正 {len(corrected)}):\n{detail_change}",
     )
 
 

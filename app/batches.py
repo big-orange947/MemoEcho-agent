@@ -39,6 +39,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Mapping, Protocol, Sequence
 
@@ -105,9 +106,29 @@ class BatchNote:
     刻意用与 Doppel 无关的轻量结构:
       · 总结器是"业务逻辑",不该被 Doppel 的数据模型绑住(将来换记忆后端只改本文件);
       · 测试可以注入假实现,完全不联网。
+
+    后四个字段是**给"事实过期/冲突"用的**(见 app/consolidation.py):
+      · topic_key   —— 这条说的是哪个"槽位"(课表 / 口味偏好 / 周末安排)。
+                       同一个槽位上的新旧说法才能被比对、被替换;留空 = 一次性的事。
+      · revision_kind —— assertion 普通陈述 / correction 明确订正 / retraction 撤回。
+                       只有聊天记录里**明说了改了**才算 correction —— 这是 Doppel
+                       的硬要求(不能凭"更新"就覆盖旧事实,那是在替号主改口供)。
+      · temporal_status —— current 现在成立 / planned 将来的安排 / historical 已过去。
+                       现在与将来是**不同槽位**,不能互相替换。
+      · memory_type —— fact/state/preference/relationship/plan/commitment/episode。
     """
 
-    __slots__ = ("content", "kind", "actor", "importance", "tags")
+    __slots__ = (
+        "content",
+        "kind",
+        "actor",
+        "importance",
+        "tags",
+        "topic_key",
+        "revision_kind",
+        "temporal_status",
+        "memory_type",
+    )
 
     def __init__(
         self,
@@ -117,12 +138,65 @@ class BatchNote:
         actor: str = "contact",
         importance: float = 0.5,
         tags: Sequence[str] = (),
+        topic_key: str = "",
+        revision_kind: str = "assertion",
+        temporal_status: str = "unknown",
+        memory_type: str = "",
     ) -> None:
         self.content = str(content).strip()[:MAX_NOTE_CHARS]
         self.kind = str(kind or "fact").strip().lower()
         self.actor = str(actor or "contact").strip().lower()
         self.importance = min(1.0, max(0.0, float(importance)))
         self.tags = tuple(str(tag) for tag in tags if str(tag).strip())
+        self.topic_key = normalize_topic_key(topic_key)
+        self.revision_kind = normalize_revision_kind(revision_kind)
+        self.temporal_status = normalize_temporal_status(temporal_status)
+        # 没给类型时按 kind 推一个: kind 是我们自己的粗分类,Doppel 要的是它那套
+        self.memory_type = normalize_memory_type(memory_type or self.kind)
+
+
+# 槽位名归一化: 模型每次可能写"课表""课程表""上课时间" ——
+# 不做同义归并(那需要词典),但至少统一大小写与空白、去掉标点,
+# 让"同一批里写法一致"的情况能稳定命中同一个槽位。
+_TOPIC_STRIP = re.compile(r"[\s,，。、;；:：\"'“”‘’()（）\[\]【】]+")
+
+
+def normalize_topic_key(raw: Any) -> str:
+    """槽位标识归一化(空 = 没有槽位)。"""
+    text = _TOPIC_STRIP.sub("", str(raw or "").strip().lower())
+    return text[:40]
+
+
+_REVISION_KINDS = {"assertion", "correction", "retraction"}
+_TEMPORAL_STATUSES = {"current", "planned", "historical", "unknown"}
+_MEMORY_TYPES = {
+    "fact", "state", "episode", "preference", "relationship", "plan", "commitment",
+    # 我们自己的 kind 取值 → Doppel 类型名的兜底映射(见下)
+    "relation", "style", "event",
+}
+# 我们总结器的 kind 与 Doppel 的 personal_memory_type 不是一套词表,
+# 这里做一次显式映射: 猜错的代价是"不会被合并/替换"(保守),不是错误替换。
+_MEMORY_TYPE_ALIASES = {
+    "relation": "relationship",
+    "style": "preference",
+    "event": "episode",
+}
+
+
+def normalize_revision_kind(raw: Any) -> str:
+    value = str(raw or "").strip().lower()
+    return value if value in _REVISION_KINDS else "assertion"
+
+
+def normalize_temporal_status(raw: Any) -> str:
+    value = str(raw or "").strip().lower()
+    return value if value in _TEMPORAL_STATUSES else "unknown"
+
+
+def normalize_memory_type(raw: Any) -> str:
+    value = str(raw or "").strip().lower()
+    value = _MEMORY_TYPE_ALIASES.get(value, value)
+    return value if value in _MEMORY_TYPES else "fact"
 
 
 class Summarizer(Protocol):
@@ -410,7 +484,13 @@ class ConversationDigestTask:
                     kind=note.kind,
                     actor=note.actor,
                     importance=note.importance,
-                    tags=list(note.tags),
+                    # personal-memory 标签是 Doppel 整理/治理的**筛选依据**
+                    # (ConsolidationRunner 只读带这个标签的记录,见
+                    #  doppel_memory/consolidation.py 的 _read_all)。
+                    # 少了它,记忆就永远不参与过期/冲突整理。
+                    tags=list(
+                        dict.fromkeys(["personal-memory", note.memory_type, *note.tags])
+                    ),
                     processor=self.name,
                     processor_version=self.version,
                     idempotency_key=f"{TASK_NAME}:{first_id}:{last_id}:{index}",
@@ -422,6 +502,16 @@ class ConversationDigestTask:
                         "message_count": len(rows),
                         "first_message_id": first_id,
                         "last_message_id": last_id,
+                        # ---- 事实过期/冲突所需的槽位元数据 ----
+                        # 字段名刻意与 Doppel 的 personal-memory 管线一致
+                        # (见 doppel_memory/intelligence.py 的 metadata 组装):
+                        # 整理器按 topic_key 分组、按 revision_kind 决定能不能替换,
+                        # 名字写错就等于"这两条永远不会被比对"。
+                        "personal_memory_type": note.memory_type,
+                        "topic_key": note.topic_key,
+                        "revision_kind": note.revision_kind,
+                        "temporal_status": note.temporal_status,
+                        "subject": note.actor,
                     },
                 )
             )
@@ -756,6 +846,14 @@ async def summarize_conversation(
         },
         now=moment,
     )
+
+    # 写过记忆就登记这个会话,交给整理环节处理"过期/冲突"(见 app/consolidation.py)。
+    # 为什么在这里登记而不是让调度器扫全部会话: 没写过记忆的会话没有可整理的,
+    # 而会话数可能很多 —— 用一张表标出"有记忆的会话",调度时只扫这些。
+    if written:
+        from . import consolidation
+
+        consolidation.register_scope(conversation_id, str(getattr(scope, "scope_key", "") or ""))
     return result
 
 
@@ -878,8 +976,33 @@ _SUMMARY_SYSTEM_PROMPT = """你是长期记忆整理器。输入是一段聊天�
 - 最多 5 条;已经无法从记录中确认的内容不要写。
 
 只输出 JSON 数组,不要任何解释文字。元素格式:
-{"content": "记忆内容", "kind": "fact|relation|style|event", "actor": "contact|agent|owner", "importance": 0.0~1.0}
-其中 actor 表示这条记忆主要来自谁: contact=对方说的, agent=机器人自己说的/承诺的, owner=号主。"""
+{"content": "记忆内容", "kind": "fact|relation|style|event", "actor": "contact|agent|owner", "importance": 0.0~1.0,
+ "slot": "槽位名或空串", "revision": "assertion|correction|retraction", "temporal": "current|planned|historical"}
+
+字段说明:
+- actor: contact=对方说的, agent=机器人自己说的/承诺的, owner=号主;
+- slot(槽位): **同一件会反复出现的事**用一个固定的短名字,比如"课表""口味偏好""每周安排""称呼";
+  一次性的事件留空字符串。新旧说法只有落在同一个 slot 上才能被比对和替换 ——
+  写歪了就会出现"课表改到四点了"和"课表是三点"两条互相打架的记忆;
+- revision: 只有聊天记录里**明说改了/换/取消/不是...了**才写 correction 或 retraction,
+  其余一律 assertion。**不能因为"这条更新"就写 correction** —— 那是替号主改口供;
+- temporal: current=现在成立的事实/偏好, planned=将来的安排, historical=已经过去的一次性事件。
+  现在的偏好与将来的安排是两回事,不要互相覆盖。"""
+
+
+def _slot_hint_prompt(slots: Sequence[str]) -> str:
+    """把该会话已有的槽位名附在提示词后面,让模型尽量复用而不是另造一个。
+
+    为什么值得多花这几行 token: 槽位名是**字符串精确匹配**的 ——
+    同一件事这批评成"课表"、下批评成"课程安排",两条记忆就永远不会被比对,
+    过期的那条会一直躺在检索结果里。
+    """
+    if not slots:
+        return ""
+    return (
+        "\n\n该会话已有的槽位(能用就用这些,别另造同义的新名字): "
+        + "、".join(slots[:20])
+    )
 
 
 def _build_digest_prompt(messages: Sequence[Mapping[str, Any]]) -> str:
@@ -967,6 +1090,10 @@ def parse_notes_with_diagnostics(text: Any) -> tuple[list[BatchNote], bool]:
                 actor=str(item.get("actor") or "contact"),
                 importance=importance,
                 tags=item.get("tags") or (),
+                topic_key=item.get("slot") or item.get("topic_key") or "",
+                revision_kind=item.get("revision") or item.get("revision_kind") or "assertion",
+                temporal_status=item.get("temporal") or item.get("temporal_status") or "unknown",
+                memory_type=item.get("memory_type") or "",
             )
         )
     return notes, False
@@ -1000,6 +1127,8 @@ async def _llm_summarize(
     from langchain_core.messages import HumanMessage, SystemMessage
 
     prompt = _build_digest_prompt(messages)
+    # 已有槽位提示: 让模型复用同一个槽位名(字符串精确匹配,写歪了就永远比不了)
+    prompt += _slot_hint_prompt(await memory_layer.known_topic_keys(conversation))
     response = await _fast_model().ainvoke(
         [SystemMessage(content=_SUMMARY_SYSTEM_PROMPT), HumanMessage(content=prompt)]
     )

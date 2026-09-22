@@ -27,6 +27,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from . import batches
+from . import consolidation
 from .config import get_settings
 from .events import Event, EventKind, EventSource, get_bus
 from .services import schedules as schedules_service
@@ -208,6 +209,27 @@ class Scheduler:
             )
         for run in failed:
             print(f"[scheduler] 会话 {run.get('conversation_id')} 攒批失败: {run.get('error')}")
+
+        # 刚写过记忆 → 顺手跑一轮"过期/冲突"整理(确定性,零模型成本)。
+        # 放在攒批之后: 整理要看的正是刚写进去的这批说法。
+        await self._consolidate_memories()
+
+    async def _consolidate_memories(self) -> None:
+        """跑一轮记忆整理: 合并重复、应用明确订正、标记并上报冲突。
+
+        异常就地吞掉 —— 整理失败只是"过期事实晚点再清",
+        绝不能影响调度循环(与 _scan_batches 同一原则)。
+        """
+        try:
+            summary = await consolidation.run_due()
+        except Exception as exc:  # noqa: BLE001 - 整理失败不能影响调度循环
+            print(f"[scheduler] 记忆整理失败: {type(exc).__name__}: {exc}")
+            return
+        if summary.get("consolidated") or summary.get("conflicts"):
+            print(
+                f"[scheduler] 记忆整理: 处理 {summary['consolidated']} 个会话,"
+                f"发现 {summary['conflicts']} 处冲突"
+            )
 
     async def _publish_timer(self, record: dict[str, Any]) -> None:
         """把一条到期记录转成 timer 事件发布(后台任务)。

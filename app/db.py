@@ -288,6 +288,25 @@ def init_db() -> None:
             metadata        TEXT DEFAULT ''          -- 预留: 窗口起止等
         );
         -- ============================================================
+        -- memory_consolidation: 长期记忆的"过期/冲突整理"状态(每会话一行)
+        -- 为什么需要: 事实会过期(课表改了)、说法会互相矛盾。整理要能
+        --   · 合并同一槽位的重复说法;
+        --   · 在聊天里**明说改了**时,把旧说法置为 superseded(不再被检索);
+        --   · 矛盾且无明确订正时,标记冲突并报给号主确认。
+        -- Doppel 把"调度与 checkpoint 持久化"归宿主,这张表就是那份状态。
+        -- checkpoint: Doppel ConsolidationCheckpoint 的 JSON(重放/幂等用)
+        -- last_result: 最近一次整理的统计与冲突明细(排障用)
+        -- 只登记"写过记忆的会话"—— 没记忆可整理的会话不必出现在扫描里。
+        -- ============================================================
+        CREATE TABLE IF NOT EXISTS memory_consolidation (
+            scope_key       TEXT PRIMARY KEY,        -- Doppel scope 标识(隔离的边界)
+            conversation_id TEXT DEFAULT '',         -- 对应会话(排障/回溯用)
+            checkpoint      TEXT DEFAULT '',         -- 整理检查点(JSON)
+            last_run_at     TEXT DEFAULT '',         -- 上次整理时间(节流依据)
+            last_result     TEXT DEFAULT '{}',       -- 上次结果(操作计数/冲突明细)
+            updated_at      TEXT DEFAULT ''
+        );
+        -- ============================================================
         -- goal_conversations: 目标涉及的会话(一次任务可能横跨几个会话)
         -- 场景: 号主说"帮我问 km 今晚几点上课,然后转告小号"——
         --       目标挂在**下指令的会话**上,但 agent 会主动去联系 km。
