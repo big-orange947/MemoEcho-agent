@@ -20,10 +20,22 @@
 # 降级策略(重要):
 #   记忆是**增强能力**,不是主链路。Doppel 不可用(未安装/初始化失败/查询异常)
 #   时必须降级为"没有记忆",绝不能因此让对话失败。
+#
+# 检索的现实(SQLite 后端,实测于 doppel 0.8.3):
+#   Doppel 的检索是**字面子串匹配** —— 先试 FTS 短语 AND,失败回落
+#   `LIKE '%整串%'`。而我们的调用方拿的是**对方刚说的整句话**
+#   ("明天组会几点?"),它永远不可能恰好是某条记忆的子串 ⇒ 检索恒为空,
+#   而且失败是静默的(空列表 = "没有记忆")。所以本模块在 recall() 里做了两件事:
+#     · 拆词: 把整句拆成若干片段分别检索再合并,让"组会"这类实词能命中;
+#     · 兜底: 仍无结果时,取该 scope **最近的记忆** —— 同一会话最近的记忆
+#       本来就跟当前话题最相关,总好过一条都不给。
+#   语义检索(向量)是 Doppel 更高版本的能力(需要宿主实现 SemanticIndex),
+#   不是本适配层能单方面解决的 —— 见 docs/conversation-policy.md §6。
 # =============================================================================
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from typing import Any
 
@@ -178,9 +190,9 @@ async def remember_message(
             message_id=message_id,
             parts=parts or None,   # v2 的内容段可原样传入(Doppel 有对应的 parts)
         )
-        result = await client.ingest(scope, message)
         # Doppel 的写入结果带状态: created/updated/duplicate/...
         # duplicate 不算失败(幂等),这里统一按成功处理。
+        await client.ingest(scope, message)
         return True
     except Exception as exc:  # noqa: BLE001 - 记忆写入失败必须降级
         print(f"[memory] 写入失败(已降级): {type(exc).__name__}: {exc}")
@@ -223,6 +235,75 @@ async def remember_batch(
 # ---------------------------------------------------------------------------
 # 检索
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 检索词拆分(应对"字面子串匹配"的检索后端)
+# ---------------------------------------------------------------------------
+# 全角/标点/空白都当分隔符;中文没有空格,所以按"片段"处理而不是按词。
+_SPLIT = re.compile(r"[^\w\u4e00-\u9fff]+")
+# 全是这些字的片段没有检索价值("的""了吗""这就要"). 注意: 只用来过滤
+# **整段都是虚词**的片段,不做分词 —— 我们没有分词器,也不该在这里造一个。
+_STOP_CHARS = frozenset(
+    "的了呢吗吧啊呀哦嗯是在有我你他她它们和跟给把被这那个就都也还要不没很太会能可以点几多少什么怎哪时上下中们之与及或者然后所以如果因为"
+)
+# 不会出现在实词**首尾**的字: 语气助词 + 第一/二人称代词。
+# 用来砍掉跨词边界的碎片("们明""午的""的组"这些都不是词,却会占检索名额)。
+#
+# 这个集合**刻意收得很窄**: 每砍一个字符就可能误杀实词 ——
+# "会"砍掉会连"组会/开会/机会"一起砍,"在"砍掉会误伤"现在/存在",
+# "要"砍掉会误伤"重要","能"砍掉会误伤"功能"。漏掉一个实词 = 那条记忆找不回来,
+# 而多留一个碎片只是多一次本地查询。所以宁可留噪声。
+_EDGE_STOP = frozenset("的了呢吗吧啊呀哦嗯们我你他她它")
+
+
+def query_terms(text: str, *, max_terms: int = 14) -> list[str]:
+    """把一句话拆成若干"可能命中"的检索词。
+
+    顺序: 整段 → 二字片段 → 三字片段。中文实词以二字为主("组会""明天""课表"),
+    所以二字片段优先于三字片段 —— 否则长消息里那几个三字片段会把名额占满。
+
+    纯本地字符串处理,零模型成本;检索是本地 SQLite 查询,多查几次也不花钱。
+    名额给得比较宽(默认 14): 多试几个片段只是多几次本地查询,
+    而漏掉一个实词就意味着这条记忆找不回来。真正花时间的是模型,不是这里。
+    """
+    terms: list[str] = []
+    for run in _SPLIT.split(text or ""):
+        if not run or all(ch in _STOP_CHARS for ch in run):
+            continue
+        terms.append(run)
+        for size in (2, 3):
+            for start in range(len(run) - size + 1):
+                gram = run[start : start + size]
+                if all(ch in _STOP_CHARS for ch in gram):
+                    continue
+                if gram[0] in _EDGE_STOP or gram[-1] in _EDGE_STOP:
+                    continue      # 跨词边界的碎片,不是词
+                terms.append(gram)
+    ordered: list[str] = []
+    for term in terms:
+        if term and term not in ordered:
+            ordered.append(term)
+    if not ordered:
+        return []
+    # 顺序: 整段 → 二字片段 → 三字片段(理由见 docstring)
+    head = [ordered[0]]
+    twos = [item for item in ordered[1:] if len(item) == 2]
+    rest = [item for item in ordered[1:] if len(item) != 2]
+    return (head + twos + rest)[:max_terms]
+
+
+def _dedupe(hits: list[Any]) -> list[Any]:
+    """按记忆 ID(退化到内容)去重,保持先后顺序。"""
+    seen: set[str] = set()
+    unique: list[Any] = []
+    for hit in hits:
+        key = str(getattr(hit, "memory_id", "") or getattr(hit, "fact", ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(hit)
+    return unique
+
+
 async def recall(
     conversation: dict[str, Any],
     query: str,
@@ -233,15 +314,29 @@ async def recall(
 
     返回简化后的结果列表: [{"fact": ..., "actor": ..., "authority": ..., "at": ...}]
     检索失败或无结果都返回空列表(调用方按"没有记忆"处理)。
+
+    策略见模块头"检索的现实": 拆词多查 + 最近记忆兜底。
+    两类结果**先命中后兜底**排序 —— 与查询相关的排在前面。
     """
     client = await get_client()
-    if client is None or not query.strip():
+    if client is None or not (query or "").strip():
         return []
 
     try:
         scope = build_scope(conversation)
-        hits = await client.recall(query, [scope], limit=limit)
-        return [_simplify(hit) for hit in hits]
+        hits: list[Any] = []
+        for term in query_terms(query):
+            if len(hits) >= limit:
+                break
+            hits.extend(await client.recall(term, [scope], limit=limit))
+        hits = _dedupe(hits)
+
+        # 兜底: 拆词也没命中时,给"这个会话最近的记忆" ——
+        # 宁可给几条相关的旧事,也好过让模型以为什么都不记得。
+        if not hits:
+            hits = _dedupe(await client.recall("", [scope], limit=limit))
+
+        return [_simplify(hit) for hit in hits[:limit]]
     except Exception as exc:  # noqa: BLE001 - 检索失败降级为空
         print(f"[memory] 检索失败(已降级): {type(exc).__name__}: {exc}")
         return []
@@ -256,14 +351,23 @@ def _simplify(hit: Any) -> dict[str, Any]:
       authority 事实权威等级
       at        时间(用于时序判断)
       score     相关度(有则带上)
+
+    时间字段名要跟着 Doppel 走: RecallResult 上是 `valid_at`(事实生效时间)与
+    `extracted_at`(抽取时间),**没有** `at` —— 之前取 `at` 恒为空,
+    于是"课表变更"这类时效信息在提示词里从来没带过时间。
     """
+    at = getattr(hit, "valid_at", None) or getattr(hit, "extracted_at", None)
+    if hasattr(at, "astimezone"):
+        # Doppel 存 UTC;提示词里给人看的时间要转成本机时区 ——
+        # 模型要拿它跟"明天下午三点"这类本地时间做比较,差 8 小时会算错。
+        at = at.astimezone()
     return {
         "fact": getattr(hit, "fact", "") or "",
         "actor": getattr(hit, "actor", "") or "",
         "authority": str(getattr(hit, "authority", "") or ""),
-        "at": str(getattr(hit, "at", "") or ""),
+        "at": at.isoformat() if hasattr(at, "isoformat") else str(at or ""),
         "memory_id": getattr(hit, "memory_id", "") or "",
-        "score": getattr(hit, "score", None),
+        "score": getattr(hit, "score", None) or getattr(hit, "similarity", None),
     }
 
 

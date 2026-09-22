@@ -167,6 +167,134 @@ class TestWriteAndRecall:
 
 
 # ---------------------------------------------------------------------------
+# 检索的现实: 后端是字面子串匹配(踩过的坑)
+# ---------------------------------------------------------------------------
+class TestRecallMatching:
+    """Doppel 的 SQLite 检索按**字面子串**匹配,而调用方给的是整句话。
+
+    这条链路上失败是静默的(空列表 = "没有记忆"),所以必须用测试钉住:
+    曾经的实现直接把"明天组会几点?"整句丢给检索,结果恒为空 ——
+    长期记忆在真实对话里从来没有进过提示词。
+    """
+
+    @pytest.mark.asyncio
+    async def test_full_sentence_query_still_matches(self, memory_env, monkeypatch):
+        """整句当查询也要能命中 —— 这是真实链路的样子(对方刚说的那句话)。"""
+        monkeypatch.setenv("MEMO_ECHO_OWNER_USER_ID", "owner-term")
+        monkeypatch.setenv("MEMO_ECHO_AGENT_ID", "bot-term")
+        monkeypatch.setenv("MEMO_ECHO_DOPPEL_DB_NAME", "mem-term.sqlite3")
+
+        from app import config as config_module
+
+        config_module._settings = None
+
+        conv = _conv(external_id="30001")
+        await memory_layer.remember_message(
+            conv, role="user", content="明天下午的组会改到四点了", source="inbound", message_id="t1"
+        )
+
+        hits = await memory_layer.recall(conv, "明天组会几点?")
+        assert hits, "整句查询一条都没命中 —— 拆词逻辑失效了"
+        assert any("组会" in h["fact"] for h in hits)
+
+        await memory_layer.close_client()
+
+    @pytest.mark.asyncio
+    async def test_no_match_falls_back_to_recent(self, memory_env, monkeypatch):
+        """完全不相关的查询也不该返回空 —— 兜底给这个会话最近的记忆。"""
+        monkeypatch.setenv("MEMO_ECHO_OWNER_USER_ID", "owner-fallback")
+        monkeypatch.setenv("MEMO_ECHO_AGENT_ID", "bot-fallback")
+        monkeypatch.setenv("MEMO_ECHO_DOPPEL_DB_NAME", "mem-fallback.sqlite3")
+
+        from app import config as config_module
+
+        config_module._settings = None
+
+        conv = _conv(external_id="30002")
+        await memory_layer.remember_message(
+            conv, role="user", content="我更喜欢喝冰美式，不加糖", source="inbound", message_id="f1"
+        )
+
+        hits = await memory_layer.recall(conv, "今天天气不错")
+        assert hits, "没有任何命中时应该兜底给最近的记忆"
+        assert any("美式" in h["fact"] for h in hits)
+
+        await memory_layer.close_client()
+
+    @pytest.mark.asyncio
+    async def test_hit_carries_time(self, memory_env, monkeypatch):
+        """召回结果必须带时间 —— 课表变更这类事全靠它判断时效。"""
+        monkeypatch.setenv("MEMO_ECHO_OWNER_USER_ID", "owner-time")
+        monkeypatch.setenv("MEMO_ECHO_AGENT_ID", "bot-time")
+        monkeypatch.setenv("MEMO_ECHO_DOPPEL_DB_NAME", "mem-time.sqlite3")
+
+        from app import config as config_module
+
+        config_module._settings = None
+
+        conv = _conv(external_id="30003")
+        await memory_layer.remember_message(
+            conv, role="user", content="下周三的课调到周五了", source="inbound", message_id="tm1"
+        )
+
+        hits = await memory_layer.recall(conv, "课")
+        assert hits
+        assert hits[0]["at"], "时间是空的 —— 提示词里就看不到'这是什么时候的事'"
+        assert "T" in hits[0]["at"]
+
+        prompt = memory_layer.format_for_prompt(hits)
+        assert "20" in prompt      # 年份出现在拼好的提示词里
+
+        await memory_layer.close_client()
+
+
+class TestQueryTerms:
+    """拆词逻辑(纯函数,不依赖 Doppel)。"""
+
+    def test_bigrams_come_before_trigrams(self):
+        """中文实词以二字为主,长句里三字片段更多 —— 不能让它们把名额占满。"""
+        terms = memory_layer.query_terms("我们明天下午的组会改到四点了")
+        assert terms[0] == "我们明天下午的组会改到四点了"      # 整段先试
+        assert "组会" in terms[:8]
+        assert "下午" in terms[:8]
+        twos = [index for index, term in enumerate(terms) if len(term) == 2]
+        threes = [index for index, term in enumerate(terms) if len(term) == 3]
+        assert twos and threes and max(twos) < min(threes)
+
+    def test_short_run_kept_whole(self):
+        assert memory_layer.query_terms("组会") == ["组会"]
+
+    def test_stopword_only_grams_dropped(self):
+        terms = memory_layer.query_terms("的了是在我你")
+        assert terms == [], "整句都是虚词时不产生任何检索词"
+
+    def test_boundary_fragments_dropped(self):
+        """跨词边界的**助词碎片**("的组""午的")不该占检索名额。"""
+        terms = memory_layer.query_terms("组会改到四点了")
+        assert "的组" not in terms
+        assert "点了" not in terms
+        assert "改到" in terms
+
+    def test_keeps_grams_with_ambiguous_chars(self):
+        """带"会""在""要"这类字的片段要**保留** —— 它们是实词的一部分。
+
+        过滤集收窄是刻意的: "会"砍掉会连"组会/开会/机会"一起砍,
+        漏掉实词就等于那条记忆永远找不回来,而多留一个碎片只是多一次本地查询。
+        """
+        terms = memory_layer.query_terms("组会改到四点了")
+        assert "组会" in terms
+
+    def test_empty_input(self):
+        assert memory_layer.query_terms("") == []
+        assert memory_layer.query_terms("？！") == []
+
+    def test_terms_are_unique_and_capped(self):
+        terms = memory_layer.query_terms("明天" * 20)
+        assert len(terms) == len(set(terms))
+        assert len(terms) <= 10
+
+
+# ---------------------------------------------------------------------------
 # 多租户隔离(本模块最重要的保证)
 # ---------------------------------------------------------------------------
 class TestIsolation:
