@@ -1,0 +1,5 @@
+# 前端构建与依赖（产物由 FastAPI 托管，不入库）
+node_modules/
+dist/
+*.tsbuildinfo
+.vite/

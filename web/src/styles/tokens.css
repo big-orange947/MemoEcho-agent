@@ -1,0 +1,77 @@
+/* =============================================================================
+ * tokens.css - 设计变量（唯一改颜色的地方）
+ * -----------------------------------------------------------------------------
+ * 风格取向（对着 Codex 那种"安静的深色工作台"来的）：
+ *   · 近黑底 + 极低透明度的白做层次，不靠彩色分区；
+ *   · 单一强调色（冷紫蓝），彩色只用于**状态**（急事/请示/草稿…）；
+ *   · 等宽字体只用于元信息（ID、时间、计数），正文用系统 UI 字体；
+ *   · 圆角小而统一，描边 1px、透明度极低 —— 层次靠玻璃与阴影，不靠粗边框。
+ * ========================================================================== */
+
+:root {
+  /* ---- 底色层次：越靠前越亮一点点 ---- */
+  --bg: #08090b;            /* 页面底 */
+  --bg-elev: #0d0e11;       /* 抬升面（弹层/输入） */
+  --surface: rgba(255, 255, 255, 0.055);   /* 玻璃面板底 */
+  --surface-hover: rgba(255, 255, 255, 0.085);
+  --surface-active: rgba(255, 255, 255, 0.115);
+
+  /* ---- 描边：极低透明度，靠它而不是阴影划分区域 ---- */
+  --line: rgba(255, 255, 255, 0.075);
+  --line-strong: rgba(255, 255, 255, 0.14);
+
+  /* ---- 文字 ---- */
+  --text: #e9eaee;
+  --text-dim: #a7a9b4;
+  --text-mute: #6f727e;
+
+  /* ---- 强调色（只有一个） ---- */
+  --accent: #8b9dff;
+  --accent-soft: rgba(139, 157, 255, 0.14);
+  --accent-line: rgba(139, 157, 255, 0.35);
+
+  /* ---- 状态色：与上报通道一一对应，不要随意复用 ---- */
+  --urgent: #ffb26b;        /* 急事 */
+  --normal: #8b9dff;        /* 重要不紧急 */
+  --question: #c9a6ff;      /* 请示 / 记忆冲突 */
+  --draft: #74d3c4;         /* 待确认草稿 */
+  --digest: #8d909c;        /* 攒着看 */
+  --ok: #6ee7a8;            /* 健康 */
+  --warn: #ffcf70;          /* 注意 */
+  --danger: #ff8b8b;        /* 失败 / 死信 */
+
+  /* ---- 排版 ---- */
+  --font: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei UI",
+    "PingFang SC", "Hiragino Sans GB", sans-serif;
+  --mono: ui-monospace, "Cascadia Mono", "SFMono-Regular", Consolas,
+    "Liberation Mono", monospace;
+  --fs-base: 13px;
+  --fs-sm: 12px;
+  --fs-xs: 11px;
+  --fs-title: 15px;
+
+  /* ---- 尺寸与节奏 ---- */
+  --r-sm: 6px;
+  --r: 10px;
+  --r-lg: 14px;
+  --gap: 10px;
+  --pad: 14px;
+  --topbar-h: 46px;
+  --statusbar-h: 28px;
+  --sidebar-w: 252px;
+  --inspector-w: 330px;
+
+  /* ---- 毛玻璃 ---- */
+  --blur: blur(24px) saturate(165%);
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 12px 32px rgba(0, 0, 0, 0.28);
+  --shadow-inset: inset 0 1px 0 rgba(255, 255, 255, 0.055);
+
+  --t-fast: 130ms cubic-bezier(0.2, 0.7, 0.3, 1);
+}
+
+/* 系统偏好减少动态效果时，把过渡与动画关掉（毛玻璃保留，它不是动效） */
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --t-fast: 0ms;
+  }
+}

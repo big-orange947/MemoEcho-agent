@@ -10,14 +10,14 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from ..db import get_connection
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def create_goal(conversation_id: str, objective: str) -> dict[str, Any]:
@@ -121,6 +121,33 @@ def list_goals(conversation_id: str, limit: int = 20) -> list[dict[str, Any]]:
         "SELECT * FROM goals WHERE conversation_id=? ORDER BY created_at DESC LIMIT ?",
         (conversation_id, limit),
     ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def list_recent_goals(limit: int = 50, status: str = "") -> list[dict[str, Any]]:
+    """列出**跨会话**的最近目标(按 updated_at 倒序),供前端"任务进度"面板。
+
+    与 list_goals 的区别: 后者回答"**这个会话**的目标历史",服务于会话详情页;
+    而"我托 agent 办的事都到哪一步了"是**全局**问题 ——
+    没有这个函数,前端就得先拉全部会话再逐个查目标(N+1 次请求)。
+
+    为什么按 updated_at 而不是 created_at 排序: 面板关心的是"最近有动静的事",
+    一个挂了三天、刚刚才被推进的旧目标,比五分钟前刚建但没进展的更该被看见。
+
+    参数:
+      limit:  返回条数(调用方负责给出上界,API 层限制 1~200)
+      status: 只看某个状态(active/done/abandoned);空 = 全部
+
+    只返回原始行(不做字段裁剪/视图投影)—— 对外字段由 API 层决定。
+    """
+    sql = "SELECT * FROM goals"
+    params: list[Any] = []
+    if status:
+        sql += " WHERE status=?"
+        params.append(status)
+    sql += " ORDER BY updated_at DESC LIMIT ?"
+    params.append(int(limit))
+    rows = get_connection().execute(sql, tuple(params)).fetchall()
     return [dict(r) for r in rows]
 
 

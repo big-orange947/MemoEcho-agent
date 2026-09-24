@@ -23,28 +23,30 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import Any
 
 import uvicorn
 from fastapi import FastAPI, Request
+from fastapi.staticfiles import StaticFiles
 from langchain_openai import ChatOpenAI
 
 from . import memory as memory_layer
-from . import recorder
+from . import outbox, recorder
 from . import reports as reports_service
 from . import sinks as sinks_service
+from .agent.graph import AgentGraph, ConversationBusyError
+from .agent.runtime import set_graph, set_notifier, set_sender
 from .api import dispatch as dispatch_api
 from .api import reports as reports_api
 from .api import routes as api_routes
 from .api import sse as sse_api
-from .agent.graph import AgentGraph, ConversationBusyError
-from .agent.runtime import set_graph, set_notifier, set_sender
+from .api import ui as ui_api
 from .bridge import onebot
 from .bridge.napcat import NapcatBridge
 from .config import get_settings
 from .db import close_connections, init_db
 from .events import Event, EventKind, EventSource, get_bus, reset_bus
-from . import outbox
 from .scheduler import get_scheduler
 from .services import conversations as conversations_service
 from .services import dispatches as dispatch_service
@@ -60,6 +62,11 @@ from .tools import wait as wait_tools
 # 复核要"攒批"(省模型调用),所以这里不需要高频;25 秒足以让候选及时上报,
 # 又远低于人类感知阈值。
 REPORTS_WORKER_INTERVAL = 25.0
+
+# 前端(Vite)构建产物的目录,相对仓库根。
+# 抽成模块级常量有两个原因: "要不要挂载前端"这个判断只在一处;
+# 测试可以替换它来覆盖"目录存在/不存在"两个分支(不必真的去构建前端)。
+WEB_DIST_DIR = Path(__file__).resolve().parents[1] / "web" / "dist"
 
 
 # ---------------------------------------------------------------------------
@@ -387,6 +394,7 @@ def create_app() -> FastAPI:
     app.include_router(sse_api.router)
     app.include_router(dispatch_api.router)   # 外部调度入口(主 agent 派活)
     app.include_router(reports_api.router)    # 上报队列出口(上游消费)
+    app.include_router(ui_api.router)         # 前端控制台接口(工具清单/配置/跨会话目标)
 
     # 定时唤醒调度器: 启动后台任务(每秒轮询 scheduled_events,到点发 timer 事件)
     scheduler = get_scheduler()
@@ -448,6 +456,23 @@ def create_app() -> FastAPI:
         # 关闭记忆客户端(Doppel 的 SQLite 连接)
         await memory_layer.close_client()
         close_connections()
+
+    # ------------------------------------------------------------------ 前端静态资源
+    # 前端源码在 web/(Vite + React + TS)。构建命令: cd web && npm run build
+    # → 产物落在 web/dist,由这里直接托管(同源,不需要 CORS)。
+    # 开发时**不用**构建: 跑 Vite dev server(npm run dev,端口 5173),
+    # 它把 /api 代理到本机的 8000(见 web/vite.config.ts)——
+    # 两条路径的请求 URL 完全一致,不会出现"开发能跑、构建后 404"。
+    #
+    # 两个要点:
+    #   1. **仅当目录存在时才挂载**。纯后端部署、跑测试、CI 里通常没有 web/dist,
+    #      此时直接跳过 —— 让服务因为"前端还没构建"起不来(或打一堆日志)是无谓的。
+    #   2. **必须放在所有 router 与 webhook 注册之后**。Starlette 按注册顺序匹配:
+    #      先看显式路由,再看 mount。挂在 "/" 上的 StaticFiles 是个兜底,
+    #      如果放在前面,它会先吃掉 /api/*、/qq/webhook、/api/stream。
+    #      换句话说: 新增路由一律加在这段**之前**,本段始终是最后一步。
+    if WEB_DIST_DIR.is_dir():
+        app.mount("/", StaticFiles(directory=str(WEB_DIST_DIR), html=True), name="web")
 
     return app
 
