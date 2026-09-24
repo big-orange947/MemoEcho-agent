@@ -5,19 +5,22 @@
 
 ## 跑起来
 
+所有命令都**先 cd 到仓库根**（下面用绝对路径写，直接复制即可）：
+
 ```powershell
 # 生产（推荐日常用）：构建产物由 FastAPI 托管，和接口同源
-cd web
-npm install
+cd D:\project\memo-echo-v2\web
+npm install          # 首次；之后改前端只需 npm run build
 npm run build
-cd ..
+
+cd D:\project\memo-echo-v2
 uv run uvicorn app.main:app --host 127.0.0.1 --port 8000
 # 浏览器打开 http://127.0.0.1:8000/
 ```
 
 ```powershell
 # 开发：Vite dev server（5173），接口代理到 8000，改完即时热更
-cd web
+cd D:\project\memo-echo-v2\web
 npm run dev          # 另开一个终端跑 runtime
 ```
 
