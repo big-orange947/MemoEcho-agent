@@ -101,6 +101,31 @@ export interface StorageStatus {
   policy?: Record<string, any>;
 }
 
+/** 通讯录里的一条：QQ 里的人 + 他在本系统里的值守状态（没建会话时为 null） */
+export interface ContactEntry {
+  external_id: string;
+  title: string;
+  chat_type: string;
+  raw: Record<string, any>;
+  conversation: {
+    conversation_id: string;
+    title: string;
+    monitor: boolean;
+    reply_mode: ReplyMode;
+    alert_enabled: boolean;
+    require_human_confirmation: boolean;
+  } | null;
+}
+
+export interface ContactsResponse {
+  ok: boolean;
+  error: string;
+  bot: { user_id?: string; nickname?: string };
+  friends: ContactEntry[];
+  groups: ContactEntry[];
+  counts: { friends: number; groups: number; managed: number };
+}
+
 /* ------------------------------------------------------------------ 底层 */
 function token(): string {
   try {
@@ -242,6 +267,9 @@ export const sendDraft = (id: string, text?: string) =>
 
 /* ------------------------------------------------------------------ 工具与配置 */
 export const listTools = () => request<ToolInfo[]>("/api/tools");
+
+/** QQ 通讯录（好友/群 + 各自在本地的值守状态）。NapCat 未连上时 ok=false。 */
+export const getContacts = () => request<ContactsResponse>("/api/contacts");
 
 export const listConfigs = () =>
   request<{ configs: Record<string, string> }>("/api/configs");

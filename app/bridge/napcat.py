@@ -127,6 +127,40 @@ class NapcatBridge:
             return data
         return []
 
+    async def get_group_list(self) -> list[dict[str, Any]]:
+        """获取群列表(含群名与人数,用于"通讯录"页展示)。"""
+        result = await self.call("get_group_list")
+        data = result["data"] if result["ok"] else None
+        if isinstance(data, list):
+            return data
+        return []
+
+    async def get_contacts(self) -> dict[str, Any]:
+        """好友 + 群 + 自己的登录信息,一次拿全(供"通讯录"页)。
+
+        返回 {"ok", "error", "bot", "friends": [...], "groups": [...]}。
+        **不抛异常**: NapCat 没起时 ok=False,页面照常渲染并提示去启动它 ——
+        通讯录是"看看有哪些人"的功能,不该因为没连上就白屏。
+        """
+        health = await self.health()
+        if not health.get("ok"):
+            return {
+                "ok": False,
+                "error": str(health.get("error") or "无法连接 NapCat"),
+                "bot": {},
+                "friends": [],
+                "groups": [],
+            }
+        friends = await self.get_friend_list()
+        groups = await self.get_group_list()
+        return {
+            "ok": True,
+            "error": "",
+            "bot": {"user_id": str(health.get("qq") or ""), "nickname": str(health.get("nickname") or "")},
+            "friends": friends,
+            "groups": groups,
+        }
+
     async def health(self) -> dict[str, Any]:
         """健康检查: 能否连通 NapCat(供状态页/启动脚本使用)。"""
         info = await self.get_login_info()

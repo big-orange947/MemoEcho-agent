@@ -12,12 +12,13 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Awaitable, Callable
+from collections.abc import Awaitable, Callable
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:  # 仅类型检查时导入,避免模块循环依赖
     from .graph import AgentGraph
 
-_graph: "AgentGraph | None" = None
+_graph: AgentGraph | None = None
 
 # 消息发送器: (conversation_id, text, source) -> None
 # 由 main.create_app 注入;outbox 用它投递出站消息。
@@ -30,13 +31,13 @@ _sender: Callable[[str, str, str], Awaitable[Any]] | None = None
 _notifier: Callable[[str, dict[str, Any]], Awaitable[Any]] | None = None
 
 
-def set_graph(graph: "AgentGraph") -> None:
+def set_graph(graph: AgentGraph) -> None:
     """登记全局图实例(由 main.create_app 在组装时调用)。"""
     global _graph
     _graph = graph
 
 
-def get_graph() -> "AgentGraph | None":
+def get_graph() -> AgentGraph | None:
     """返回全局图实例(未初始化时为 None)。"""
     return _graph
 
@@ -50,6 +51,24 @@ def set_sender(sender: Callable[[str, str, str], Awaitable[Any]]) -> None:
 def get_sender() -> Callable[[str, str, str], Awaitable[Any]] | None:
     """返回全局消息发送器(未初始化时为 None)。"""
     return _sender
+
+
+# QQ 桥(NapCat):由 main.create_app 组装时登记。
+# 需要它的是"读取类"接口 —— 例如通讯录页要拉好友/群列表。
+# 不各建一个桥实例的原因: 桥内部持有 httpx 连接池,重复创建等于重复建连;
+# 而且从一处取,将来换 OneBot 实现只改组装处。
+_bridge: Any = None
+
+
+def set_bridge(bridge: Any) -> None:
+    """登记全局 QQ 桥(由 main.create_app 在组装时调用)。"""
+    global _bridge
+    _bridge = bridge
+
+
+def get_bridge() -> Any:
+    """返回全局 QQ 桥(未初始化时为 None)。"""
+    return _bridge
 
 
 def set_notifier(notifier: Callable[[str, dict[str, Any]], Awaitable[Any]]) -> None:

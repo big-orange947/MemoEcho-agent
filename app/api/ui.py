@@ -8,6 +8,7 @@
 #   GET  /api/tools           可用工具清单(含高危标记 + 私聊/群聊默认授权)
 #   GET  /api/configs         全局配置(设置页)
 #   PUT  /api/configs/{key}   写单个配置(**白名单**,见下)
+#   GET  /api/contacts        QQ 通讯录(好友/群 + 各自在本地的值守状态)
 #   GET  /api/goals           跨会话目标列表("任务进度"面板)
 #
 # 三条刻意的设计(都不是风格问题):
@@ -165,6 +166,132 @@ def put_config(key: str, body: dict[str, Any]) -> dict[str, Any]:
 
     configs_service.set_config(key, value)
     return {"key": key, "value": value}
+
+
+# ---------------------------------------------------------------------------
+# 通讯录(QQ 好友 / 群 ↔ 本地值守状态)
+# ---------------------------------------------------------------------------
+def _qq_conversation_index() -> dict[tuple[str, str], dict[str, Any]]:
+    """把本地已有的 QQ 会话按 (chat_type, external_id) 建索引。
+
+    用途: 通讯录页要回答"这个好友在我这边是什么状态"——
+    只拉 NapCat 的好友列表是不够的,那只能告诉你"QQ 里有这个人"。
+    """
+    from ..db import get_connection
+
+    rows = get_connection().execute(
+        "SELECT id, chat_type, external_id, title, monitor, reply_mode, alert_enabled,"
+        " require_human_confirmation"
+        " FROM conversations WHERE platform='qq'"
+    ).fetchall()
+    index: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in rows:
+        item = dict(row)
+        index[(str(item.get("chat_type") or ""), str(item.get("external_id") or ""))] = {
+            "conversation_id": item["id"],
+            "title": item.get("title") or "",
+            "monitor": bool(item.get("monitor")),
+            "reply_mode": str(item.get("reply_mode") or "off"),
+            "alert_enabled": bool(item.get("alert_enabled")),
+            "require_human_confirmation": bool(item.get("require_human_confirmation")),
+        }
+    return index
+
+
+def _contact_view(
+    raw: dict[str, Any],
+    *,
+    chat_type: str,
+    id_keys: tuple[str, ...],
+    name_keys: tuple[str, ...],
+    index: dict[tuple[str, str], dict[str, Any]],
+) -> dict[str, Any]:
+    """把一条 NapCat 记录转成前端要的形状,并附上本地值守状态。"""
+    external_id = ""
+    for key in id_keys:
+        if raw.get(key) not in (None, ""):
+            external_id = str(raw[key])
+            break
+    title = ""
+    for key in name_keys:
+        if str(raw.get(key) or "").strip():
+            title = str(raw[key]).strip()
+            break
+    return {
+        "external_id": external_id,
+        "title": title,
+        "chat_type": chat_type,
+        "raw": raw,                     # 原始字段(群人数、备注等)原样带上,前端按需取
+        "conversation": index.get((chat_type, external_id)),
+    }
+
+
+@router.get("/contacts", dependencies=[Depends(_check_token)])
+async def list_contacts() -> dict[str, Any]:
+    """QQ 通讯录: 好友 + 群 + 机器人自己,每条都标出**在本系统里的值守状态**。
+
+    为什么需要它: 会话列表只包含"消息流经过的会话",所以看起来跟 QQ 好友/群
+    **对不上**——没聊过的人根本不会出现。这个接口把两边拼起来:
+    QQ 里有哪些人 + 我这边对谁开了值守。
+
+    NapCat 没连上时不报错,返回 ok=false 与原因: 页面据此提示"去启动 NapCat",
+    而不是白屏或抛异常(通讯录是只读的辅助视图,不该拖垮整个控制台)。
+    """
+    from ..agent.runtime import get_bridge
+    from ..config import get_settings
+
+    bridge = get_bridge()
+    if bridge is None or not hasattr(bridge, "get_contacts"):
+        return {
+            "ok": False,
+            "error": "QQ 桥未初始化(服务可能还没完全启动)",
+            "bot": {},
+            "friends": [],
+            "groups": [],
+            "counts": {"friends": 0, "groups": 0, "managed": 0},
+        }
+
+    payload = await bridge.get_contacts()
+    index = _qq_conversation_index()
+    bot_qq = str(get_settings().bot_qq or "")
+
+    friends = [
+        _contact_view(
+            item,
+            chat_type="private",
+            id_keys=("user_id", "uin", "qq"),
+            name_keys=("remark", "nickname", "nick"),
+            index=index,
+        )
+        for item in payload.get("friends") or []
+        if isinstance(item, dict)
+    ]
+    groups = [
+        _contact_view(
+            item,
+            chat_type="group",
+            id_keys=("group_id", "group_code"),
+            name_keys=("group_name", "name"),
+            index=index,
+        )
+        for item in payload.get("groups") or []
+        if isinstance(item, dict)
+    ]
+
+    # 机器人自己从好友列表里剔掉: NapCat 偶尔会把它带上,而"自己跟自己聊"
+    # 不是一条正常的值守会话(之前它就作为一条会话出现在列表里,让人困惑)。
+    friends = [item for item in friends if item["external_id"] and item["external_id"] != bot_qq]
+    groups = [item for item in groups if item["external_id"]]
+
+    managed = sum(1 for item in friends + groups if item["conversation"])
+    return {
+        "ok": bool(payload.get("ok")),
+        "error": str(payload.get("error") or ""),
+        "bot": payload.get("bot") or {},
+        "friends": friends,
+        "groups": groups,
+        "counts": {"friends": len(friends), "groups": len(groups), "managed": managed},
+    }
 
 
 # ---------------------------------------------------------------------------

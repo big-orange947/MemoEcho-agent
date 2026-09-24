@@ -36,7 +36,7 @@ from . import outbox, recorder
 from . import reports as reports_service
 from . import sinks as sinks_service
 from .agent.graph import AgentGraph, ConversationBusyError
-from .agent.runtime import set_graph, set_notifier, set_sender
+from .agent.runtime import set_bridge, set_graph, set_notifier, set_sender
 from .api import dispatch as dispatch_api
 from .api import reports as reports_api
 from .api import routes as api_routes
@@ -79,6 +79,8 @@ def create_app() -> FastAPI:
 
     # 2. 渠道桥(QQ)
     napcat = NapcatBridge()
+    # 登记到全局: 通讯录页等"读取类"接口要用它拉好友/群列表
+    set_bridge(napcat)
 
     # 3. LLM 工厂: fast=True 用轻量模型(判断/评估),False 用主模型(对话)
     def llm_factory(fast: bool = False) -> ChatOpenAI:

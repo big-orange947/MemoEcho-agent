@@ -15,15 +15,17 @@ import { subscribe } from "./lib/sse";
 import { Sidebar } from "./components/Sidebar";
 import { ConsoleInspector, ConsoleScreen } from "./screens/ConsoleScreen";
 import { QueueScreen } from "./screens/QueueScreen";
+import { ContactsScreen } from "./screens/ContactsScreen";
 import { ProfilesScreen } from "./screens/ProfilesScreen";
 import { HealthScreen } from "./screens/HealthScreen";
 import { Dot, Toast } from "./components/ui";
 
-type Tab = "console" | "queue" | "profiles" | "health";
+type Tab = "console" | "queue" | "contacts" | "profiles" | "health";
 
 const TAB_LABEL: Record<Tab, string> = {
   console: "控制台",
   queue: "上报队列",
+  contacts: "通讯录",
   profiles: "设定集",
   health: "运行状态",
 };
@@ -149,21 +151,19 @@ export default function App() {
       ) : null}
 
       {tab === "queue" ? (
-        <>
-          <QueueScreen conversations={conversations} refreshTick={tick} notify={notify} />
+        <QueueScreen conversations={conversations} refreshTick={tick} notify={notify} />
+      ) : null}
 
-        </>
+      {tab === "contacts" ? (
+        <ContactsScreen notify={notify} onChanged={refreshConversations} />
       ) : null}
 
       {tab === "profiles" ? (
-        <>
-          <ProfilesScreen
-            conversations={conversations}
-            notify={notify}
-            onChanged={refreshConversations}
-          />
-
-        </>
+        <ProfilesScreen
+          conversations={conversations}
+          notify={notify}
+          onChanged={refreshConversations}
+        />
       ) : null}
 
       {tab === "health" ? (
@@ -182,7 +182,7 @@ export default function App() {
           {conversations.filter((item) => item.policy?.alert_enabled).length} 个开了上报
         </span>
         <span className="spacer" style={{ flex: 1 }} />
-        <span>本机 · 127.0.0.1:8000</span>
+        <span>本机 · {window.location.host}</span>
       </div>
 
       <Toast message={toast.message} tone={toast.tone} />

@@ -242,6 +242,145 @@ class TestGoalsApi:
 
 
 # ---------------------------------------------------------------------------
+# GET /api/contacts (通讯录)
+# ---------------------------------------------------------------------------
+# 假 NapCat 的应答: 刻意混进几类真实世界会遇到的脏数据 ——
+# 机器人自己在好友列表里、缺号码的行、有备注名/没备注名。
+_FAKE_CONTACTS: dict[str, Any] = {
+    "ok": True,
+    "error": "",
+    "bot": {"user_id": "3969785168", "nickname": "Memo Echo"},
+    "friends": [
+        {"user_id": 2597164807, "nickname": "km", "remark": ""},
+        {"user_id": 10001, "nickname": "小号", "remark": "另一个号"},
+        {"user_id": 3969785168, "nickname": "Memo Echo", "remark": ""},
+        {"nickname": "缺号码的脏数据"},
+    ],
+    "groups": [
+        {"group_id": 983214567, "group_name": "计科三班", "member_count": 42},
+        {"group_name": "缺号码的群"},
+    ],
+}
+
+
+class FakeNapCatBridge:
+    """假 QQ 桥: 只实现通讯录要用的 get_contacts。"""
+
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self.payload = payload
+        self.calls = 0
+
+    async def get_contacts(self) -> dict[str, Any]:
+        self.calls += 1
+        return self.payload
+
+
+@pytest.fixture()
+def bridge(monkeypatch):
+    """把全局 QQ 桥换成假的; 返回"装桥"函数(用例里再决定喂什么应答)。"""
+    from app.agent import runtime as runtime_module
+
+    def install(payload: dict[str, Any]) -> FakeNapCatBridge:
+        fake = FakeNapCatBridge(payload)
+        monkeypatch.setattr(runtime_module, "_bridge", fake)
+        return fake
+
+    return install
+
+
+class TestContacts:
+    def test_marks_local_policy_state(self, client, bridge):
+        """通讯录要回答"这人在我这边是什么状态",而不只是"QQ 里有这个人"。"""
+        bridge(_FAKE_CONTACTS)
+
+        # 先给一个好友建会话并开监视
+        conversation = client.post(
+            "/api/conversations/resolve",
+            json={
+                "platform": "qq",
+                "chat_type": "private",
+                "external_id": "2597164807",
+                "title": "km",
+            },
+        ).json()
+        client.patch(f"/api/conversations/{conversation['id']}", json={"monitor": True})
+
+        body = client.get("/api/contacts").json()
+        assert body["ok"] is True
+        assert body["bot"]["nickname"] == "Memo Echo"
+
+        by_id = {item["external_id"]: item for item in body["friends"]}
+        # 建过会话的: 带上本地状态
+        assert by_id["2597164807"]["conversation"]["conversation_id"] == conversation["id"]
+        assert by_id["2597164807"]["conversation"]["monitor"] is True
+        # 没建过会话的: 明确是 None,而不是空字典(前端据此显示"未建会话")
+        assert by_id["10001"]["conversation"] is None
+
+        assert body["counts"] == {"friends": 2, "groups": 1, "managed": 1}
+
+    def test_filters_bot_and_idless_rows(self, client, bridge):
+        """机器人自己不能进通讯录; 缺号码的行直接丢(建不出会话)。"""
+        bridge(_FAKE_CONTACTS)
+        body = client.get("/api/contacts").json()
+
+        friend_ids = [item["external_id"] for item in body["friends"]]
+        assert "3969785168" not in friend_ids
+        assert all(item["external_id"] for item in body["friends"])
+        assert all(item["external_id"] for item in body["groups"])
+        assert body["counts"]["friends"] == 2
+        assert body["counts"]["groups"] == 1
+
+    def test_remark_wins_over_nickname(self, client, bridge):
+        """有备注名就用备注名 —— 那才是用户自己起的称呼。"""
+        bridge(_FAKE_CONTACTS)
+        body = client.get("/api/contacts").json()
+        by_id = {item["external_id"]: item for item in body["friends"]}
+        assert by_id["10001"]["title"] == "另一个号"
+        assert by_id["2597164807"]["title"] == "km"
+
+        groups = {item["external_id"]: item for item in body["groups"]}
+        # 群人数等原始字段原样带上(前端按需取)
+        assert groups["983214567"]["title"] == "计科三班"
+        assert groups["983214567"]["raw"]["member_count"] == 42
+
+    def test_napcat_down_is_not_an_error(self, client, bridge):
+        """NapCat 没起: 200 + ok=false + 原因,而不是 500 —— 通讯录不该拖垮控制台。"""
+        bridge(
+            {
+                "ok": False,
+                "error": "无法连接 NapCat(127.0.0.1:3011)",
+                "bot": {},
+                "friends": [],
+                "groups": [],
+            }
+        )
+        resp = client.get("/api/contacts")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["ok"] is False
+        assert "3011" in body["error"]
+        assert body["friends"] == [] and body["groups"] == []
+        assert body["counts"] == {"friends": 0, "groups": 0, "managed": 0}
+
+    def test_bridge_not_initialized(self, client, monkeypatch):
+        """桥没登记(极端情况)时也要给话,而不是抛 AttributeError。"""
+        from app.agent import runtime as runtime_module
+
+        monkeypatch.setattr(runtime_module, "_bridge", None)
+        body = client.get("/api/contacts").json()
+        assert body["ok"] is False
+        assert "未初始化" in body["error"]
+
+    def test_app_registers_bridge(self, client):
+        """组装时确实登记了 QQ 桥 —— 否则接口只会永远返回"未初始化"。"""
+        from app.agent.runtime import get_bridge
+
+        real_bridge = get_bridge()
+        assert real_bridge is not None
+        assert hasattr(real_bridge, "get_contacts")
+
+
+# ---------------------------------------------------------------------------
 # 前端静态产物托管
 # ---------------------------------------------------------------------------
 # main.create_app 里给静态挂载起的名字(Starlette 会把 mount 的 path 归一化成 "",
