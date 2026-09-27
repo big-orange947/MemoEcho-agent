@@ -265,6 +265,73 @@ export const sendDraft = (id: string, text?: string) =>
     { method: "POST", json: text ? { text } : {} }
   );
 
+/* ------------------------------------------------------------------ 控制台对话 */
+/** 控制台的一条对话线程(与 agent 的对话容器,不是 QQ 会话)。 */
+export interface Thread {
+  id: string;
+  title: string;
+  created_at: string;
+  updated_at: string;
+  archived: boolean;
+  /** 正在跑的执行数(>0 时列表上显示"执行中") */
+  running: number;
+}
+
+export type StepKind = "tool_call" | "tool_result" | "note" | "error" | string;
+
+/** 执行过程中的一步(工具调用 / 工具结果 / 错误)。 */
+export interface RunStep {
+  id: string;
+  run_id: string;
+  seq: number;
+  kind: StepKind;
+  name: string;
+  detail: string;
+  ok: boolean;
+  created_at: string;
+}
+
+/** 一次执行 = 一条指令跑一轮 agent。 */
+export interface Run {
+  id: string;
+  conversation_id: string;
+  status: "running" | "done" | "error" | string;
+  instruction: string;
+  reply: string;
+  error: string;
+  event_id: string;
+  started_at: string;
+  finished_at: string;
+  steps: RunStep[];
+}
+
+export const listThreads = (includeArchived = false) =>
+  request<Thread[]>(`/api/threads${includeArchived ? "?include_archived=true" : ""}`);
+
+export const createThread = (title = "") =>
+  request<Thread>("/api/threads", { method: "POST", json: { title } });
+
+export const updateThread = (id: string, patch: { title?: string; archived?: boolean }) =>
+  request<Thread>(`/api/threads/${encodeURIComponent(id)}`, { method: "PATCH", json: patch });
+
+export const deleteThread = (id: string) =>
+  request<{ deleted: string }>(`/api/threads/${encodeURIComponent(id)}`, { method: "DELETE" });
+
+export const listThreadMessages = (id: string) =>
+  request<Message[]>(`/api/threads/${encodeURIComponent(id)}/messages`);
+
+export const listThreadRuns = (id: string) =>
+  request<Run[]>(`/api/threads/${encodeURIComponent(id)}/runs`);
+
+export const getRun = (id: string) => request<Run>(`/api/runs/${encodeURIComponent(id)}`);
+
+/** 发一条自然语言指令: 立即返回 run_id,执行过程走 SSE(step/run)推送。 */
+export const sendInstruction = (threadId: string, text: string) =>
+  request<{ thread_id: string; run_id: string; event_id: string; goal_id: string }>(
+    `/api/threads/${encodeURIComponent(threadId)}/messages`,
+    { method: "POST", json: { text } }
+  );
+
 /* ------------------------------------------------------------------ 工具与配置 */
 export const listTools = () => request<ToolInfo[]>("/api/tools");
 

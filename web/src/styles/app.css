@@ -757,3 +757,152 @@ select.input {
   border-color: rgba(255, 139, 139, 0.35);
   color: #ffd9d9;
 }
+
+/* =============================================================================
+ * 控制台（与 agent 的对话）
+ * -----------------------------------------------------------------------------
+ * 这一屏的主角是"执行过程"：气泡负责说了什么，.run 卡片负责做了什么。
+ * 卡片用等宽小字 + 左边一条竖线，视觉上明确"这是日志，不是聊天"。
+ * ========================================================================== */
+.console-hint {
+  align-self: center;
+  text-align: center;
+  max-width: 460px;
+  margin-top: 8vh;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.console-hint .big {
+  font-size: var(--fs-title);
+  color: var(--text-dim);
+}
+.console-hint .examples {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+}
+.console-hint .examples li {
+  padding: 8px 12px;
+  border-radius: var(--r);
+  border: 1px dashed var(--line-strong);
+  background: var(--surface);
+  color: var(--text-dim);
+  cursor: pointer;
+  transition: border-color var(--t-fast), color var(--t-fast), background var(--t-fast);
+}
+.console-hint .examples li:hover {
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+  color: var(--text);
+}
+
+.run {
+  align-self: stretch;
+  max-width: 100%;
+  border: 1px solid var(--line);
+  border-left: 2px solid var(--line-strong);
+  border-radius: var(--r);
+  background: rgba(255, 255, 255, 0.028);
+  backdrop-filter: var(--blur);
+  overflow: hidden;
+}
+.run[data-status="running"] {
+  border-left-color: var(--accent-line);
+}
+.run[data-status="error"] {
+  border-left-color: rgba(255, 139, 139, 0.6);
+}
+.run-head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 6px 10px;
+  cursor: pointer;
+  font-size: var(--fs-sm);
+  color: var(--text-dim);
+  user-select: none;
+}
+.run-head:hover {
+  background: var(--surface-hover);
+}
+.run .caret {
+  font-size: 10px;
+  color: var(--text-mute);
+}
+.run-title {
+  color: var(--text);
+}
+.run-body {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 4px 10px 8px 10px;
+  border-top: 1px solid var(--line);
+}
+.step {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 3px 0;
+  font: var(--fs-xs) / 1.55 var(--mono);
+  color: var(--text-dim);
+}
+.step-icon {
+  flex: 0 0 12px;
+  text-align: center;
+  color: var(--text-mute);
+}
+.step[data-kind="tool_call"] .step-icon {
+  color: var(--accent);
+}
+.step[data-kind="tool_result"][data-ok="true"] .step-icon {
+  color: var(--ok);
+}
+.step[data-kind="tool_result"][data-ok="false"] .step-icon,
+.step[data-kind="error"] .step-icon {
+  color: var(--danger);
+}
+.step-name {
+  flex: 0 0 auto;
+  color: var(--text);
+}
+.step-detail {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--text-mute);
+  cursor: default;
+}
+.step-detail .more {
+  color: var(--accent);
+  cursor: pointer;
+}
+
+/* 应急口子：手动直接发一条（默认收起，避免看起来像"这就是给好友发消息的地方"） */
+.manual {
+  border-top: 1px solid var(--line);
+  padding-top: 8px;
+}
+.manual > summary {
+  font-size: var(--fs-sm);
+  color: var(--text-mute);
+  cursor: pointer;
+  list-style: none;
+}
+.manual > summary:hover {
+  color: var(--text-dim);
+}
+.manual > summary::before {
+  content: "▸ ";
+  font-size: 10px;
+}
+.manual[open] > summary::before {
+  content: "▾ ";
+}
+.manual .textarea {
+  margin-top: 8px;
+}

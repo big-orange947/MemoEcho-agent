@@ -26,14 +26,22 @@ npm run dev          # 另开一个终端跑 runtime
 
 `web/dist` 不存在时后端会跳过静态托管（不报错），所以没构建过也不影响接口。
 
-## 四屏分别管什么
+## 六个标签页分别管什么
+
+两个空间别搞混：**控制台**是你和 agent 的对话（派活），**会话**是 agent 替你盯着的 QQ 好友/群（值守）。
 
 | 标签页 | 内容 | 对应后端 |
 |---|---|---|
-| 控制台 | 会话列表 + 对话流（实时 SSE）+ 右侧检查器（策略/关键词/人设/目标/攒批） | `/api/conversations*`、`/api/stream` |
+| 控制台 | **自然语言入口**：左侧是"对话"(线程)，中间和 agent 对话 + 每条指令的执行轨迹卡（工具调用/参数/结果/失败），右侧是对话设置 | `/api/threads*`、`/api/runs/*`、`/api/stream`（`step`/`run` 事件） |
+| 会话 | 某个 QQ 好友/群里发生了什么：消息流 + 值守策略检查器（监视/回复/上报/此刻）。手动直接发一句收在底部折叠区 | `/api/conversations*` |
 | 上报队列 | 按通道分组：急事 / 请示 / 待确认草稿 / 重要 / 摘要；草稿可改后一键发出 | `/api/reports*`（含 `{id}/send`） |
+| 通讯录 | QQ 好友/群清单 + 各自在本地的值守状态（未建会话/已建但全关/值守中），勾选后批量建会话套策略 | `/api/contacts`、`/api/conversations/resolve` |
 | 设定集 | 多会话批量策略、按会话的工具授权、全局配置（白名单/别名）、建新会话 | `PATCH /api/conversations/{id}`、`/api/tools`、`/api/configs` |
 | 运行状态 | 记忆健康度（解析失败=静默丢记忆）、攒批进度、整理结果、队列计数、存储占用 | `/api/memory/health`、`/api/storage`、`/api/reports/stats` |
+
+控制台这一屏的形态参照 `docs/workspace-chat-console.md`（Thread 是对话，Task 是执行），
+在 v2 里的落地方式：一条对话就是一个 `platform=desktop/chat_type=thread` 的会话，
+一次执行 = 一条 `agent_runs` + 若干 `agent_steps`。
 
 ## 设计取向（改样式前先读这段）
 
@@ -54,16 +62,18 @@ npm run dev          # 另开一个终端跑 runtime
 ```
 src/
   lib/api.ts       所有 HTTP 调用与类型（唯一与后端说话的地方）
-  lib/sse.ts       /api/stream 订阅（reply / report / draft 三类事件）
+  lib/sse.ts       /api/stream 订阅（reply / report / draft / step / run / progress / policy）
   lib/format.ts    展示层格式化（相对时间、通道名、会话显示名）
-  components/      Sidebar + ui.tsx（徽标/开关/字段/按钮等零件）
-  screens/         ConsoleScreen / QueueScreen / ProfilesScreen / HealthScreen
+  components/      Sidebar（值守会话）+ ThreadSidebar（对话线程）+ ui.tsx 零件
+  screens/         ConsoleScreen（派活）/ ChatScreen（值守）/ QueueScreen / ContactsScreen
+                   / ProfilesScreen / HealthScreen
   App.tsx          外壳与标签页
 ```
 
 **状态管理刻意保持"笨"**：一个 `refreshTick` 计数器 + 各屏自己拉数据，
-SSE 事件到达就 `tick + 1`。这个体量下引状态库只会增加间接层，
-真正麻烦的是"哪些数据什么时候失效"，用 tick 反而看得更清楚。
+SSE 事件到达就 `tick + 1`。唯一例外是控制台的执行轨迹 —— 它是流式追加的，
+由 App 持有的 `liveRun` 状态维护（`step` 追加一步、`run` 更新终态），
+这样"正在跑"的过程不用等重拉，界面也不会闪。
 
 ## 鉴权
 

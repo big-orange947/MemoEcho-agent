@@ -216,7 +216,7 @@ class AgentGraph:
         """看最近一条 AIMessage: 有 tool_calls 就去 act,否则去 reflect。"""
         for message in reversed(state.get("messages") or []):
             if hasattr(message, "tool_calls") and getattr(message, "tool_calls", None):
-                return "act"
+                return "reflect" if state_schema.tool_rounds(state) >= state_schema.MAX_TOOL_ROUNDS_HARD else "act"
             # LangChain 消息对象没有 tool_calls 属性时为 None,视为纯回复
             if hasattr(message, "content") and str(getattr(message, "content", "")).strip():
                 break

@@ -323,6 +323,49 @@ def init_db() -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_goal_conversations_conv
             ON goal_conversations (conversation_id);
+
+        -- ============================================================
+        -- agent_runs: 一次 agent 执行(= 控制台里发一条指令)
+        -- 为什么需要: 控制台要能回答"我让它办的事,它跑成什么样了"——
+        --   既要看结果(回复),也要看过程(调了哪些工具、发给谁)。
+        --   在此之前,一次执行的过程只存在于 LangGraph checkpoint 里
+        --   (无接口可读、还会被裁剪),前端只能看到最后那句回复。
+        -- status: running / done / error
+        -- ============================================================
+        CREATE TABLE IF NOT EXISTS agent_runs (
+            id              TEXT PRIMARY KEY,
+            conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+            status          TEXT NOT NULL,           -- running / done / error
+            instruction     TEXT NOT NULL,           -- 用户原话(回看/对照用)
+            reply           TEXT DEFAULT '',         -- 最终回复文本
+            error           TEXT DEFAULT '',         -- 失败原因(为空即正常)
+            event_id        TEXT DEFAULT '',         -- 触发本次执行的事件 ID
+            started_at      TEXT NOT NULL,
+            finished_at     TEXT DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_agent_runs_conv_time
+            ON agent_runs (conversation_id, started_at);
+
+        -- ============================================================
+        -- agent_steps: 执行过程中的每一步(工具调用/结果/发送/请示/错误)
+        -- 只登记"看得见的行为",不存提示词、不存模型原始输出(见 docs/execution-trace.md
+        -- 的脱敏口径: 这里比它宽松一点 —— 工具参数是本地控制台自己的指令内容,
+        -- 不含密钥;但模型系统提示、API Key 一律不落这里)。
+        -- kind: tool_call / tool_result / reply / note / error
+        -- seq: 同一 run 内递增,保证前端按序渲染(不依赖时间戳精度)
+        -- ============================================================
+        CREATE TABLE IF NOT EXISTS agent_steps (
+            id         TEXT PRIMARY KEY,
+            run_id     TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+            seq        INTEGER NOT NULL,
+            kind       TEXT NOT NULL,
+            name       TEXT DEFAULT '',              -- 工具名(kind=tool_* 时)
+            detail     TEXT DEFAULT '',              -- 参数摘要 / 结果文本
+            ok         INTEGER DEFAULT 1,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_agent_steps_run
+            ON agent_steps (run_id, seq);
         """
     )
     conn.commit()
@@ -352,6 +395,9 @@ _MIGRATIONS: dict[str, list[tuple[str, str]]] = {
         ("digest_window_seconds", "INTEGER DEFAULT 1800"),
         ("digest_max_messages", "INTEGER DEFAULT 20"),
         ("allowed_tools", "TEXT DEFAULT ''"),
+        # 控制台对话线程的归档标记(仅 platform=desktop/chat_type=thread 用;
+        # QQ 会话恒为 0 —— 归档是"收进抽屉",不是"停止值守")
+        ("archived", "INTEGER DEFAULT 0"),
     ],
     # messages 表增加平台消息 ID(出站回显去重)
     "messages": [

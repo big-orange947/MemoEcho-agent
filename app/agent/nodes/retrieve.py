@@ -70,6 +70,11 @@ async def run(state: dict[str, Any]) -> dict[str, Any]:
             "history": history,                 # list[dict] 消息
             "persona": conversation.get("persona") or "",   # 人设约束
             "goal_text": (goal or {}).get("objective") or "",
+            # 会话形态: reason 据此决定用哪套提示词 ——
+            # 控制台线程(desktop/thread)对面是号主本人,值守会话对面是联系人,
+            # 两者"你是谁、该向谁汇报"完全不同,提示词不能共用。
+            "platform": conversation.get("platform") or "",
+            "chat_type": conversation.get("chat_type") or "",
             "memory_block": memory_block,       # 长期记忆文本块(可能为空串)
             "history_block": history_block,     # 补全的早前对话(可能为空串)
             # 是否要求"拿不准先请示"(HITL): 由 reason 拼进提示词,

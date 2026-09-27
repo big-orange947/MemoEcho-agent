@@ -21,7 +21,7 @@ from typing import Any
 
 from langchain_core.messages import AIMessage, BaseMessage, SystemMessage
 
-from ..prompts import HITL_OFF_RULES, HITL_ON_RULES, REASON_SYSTEM_PROMPT
+from ..prompts import CONSOLE_SYSTEM_PROMPT, HITL_OFF_RULES, HITL_ON_RULES, REASON_SYSTEM_PROMPT
 
 
 def _build_messages(state: dict[str, Any], tools_desc: str) -> list[BaseMessage]:
@@ -33,10 +33,15 @@ def _build_messages(state: dict[str, Any], tools_desc: str) -> list[BaseMessage]
     # 系统提示: 人设 + 目标 + 工具清单。
     # HITL 段落按会话配置二选一(只影响"授权范围":遇事要不要先回来问);
     # 提示词末尾的底线约束任何情况下都在 —— 关掉请示不等于放宽底线。
-    system = REASON_SYSTEM_PROMPT.format(
-        tools_description=tools_desc,
-        hitl_rules=HITL_ON_RULES if working.get("hitl") else HITL_OFF_RULES,
-    )
+    if working.get("platform") == "desktop" and working.get("chat_type") == "thread":
+        # 控制台线程: 对面是号主本人 —— 用"办事员"提示词(自己动手 + 如实汇报),
+        # 而不是"替身"提示词(像人一样聊天 + 不暴露身份)。
+        system = CONSOLE_SYSTEM_PROMPT.format(tools_description=tools_desc)
+    else:
+        system = REASON_SYSTEM_PROMPT.format(
+            tools_description=tools_desc,
+            hitl_rules=HITL_ON_RULES if working.get("hitl") else HITL_OFF_RULES,
+        )
     if persona:
         system += f"\n\n你在这个会话中的人设: {persona}"
     if goal_text:

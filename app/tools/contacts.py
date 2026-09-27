@@ -51,6 +51,53 @@ def resolve_contact(name: str) -> str:
     return f"未找到称呼「{name}」,且没有配置任何联系人别名。请直接询问对方的 QQ 号。"
 
 
+@tool
+async def list_contacts() -> str:
+    """列出 QQ 好友与群(昵称/备注名 + 号码),用于把"km"这样的称呼对到 QQ 号。
+
+    什么时候用: 需要给某人/某个群发消息,但不知道对方的 QQ 号时先调它。
+    返回: 一行一个的清单(私聊标注 [好友],群聊标注 [群]),含备注名与昵称;
+          NapCat 未连接时返回提示文本(此时无法确认联系人,应告知用户)。
+    """
+    from ..agent.runtime import get_bridge
+
+    bridge = get_bridge()
+    if bridge is None or not hasattr(bridge, "get_contacts"):
+        return "无法读取联系人: QQ 桥未初始化(服务配置问题)。"
+
+    payload = await bridge.get_contacts()
+    if not payload.get("ok"):
+        reason = payload.get("error") or "NapCat 未连接"
+        return f"无法读取联系人: {reason}。请提示用户先启动 NapCat 并登录 QQ。"
+
+    from ..config import get_settings
+
+    bot_qq = str(get_settings().bot_qq or "")
+    lines: list[str] = []
+    for item in payload.get("friends") or []:
+        if not isinstance(item, dict):
+            continue
+        user_id = str(item.get("user_id") or "")
+        if not user_id or user_id == bot_qq:
+            continue  # 机器人自己不是可联系对象
+        remark = str(item.get("remark") or "").strip()
+        nickname = str(item.get("nickname") or "").strip()
+        name = f"{remark}({nickname})" if remark and nickname and remark != nickname else (remark or nickname)
+        lines.append(f"[好友] {name or '(无备注)'} qq={user_id}")
+    for item in payload.get("groups") or []:
+        if not isinstance(item, dict):
+            continue
+        group_id = str(item.get("group_id") or "")
+        if not group_id:
+            continue
+        name = str(item.get("group_name") or "").strip() or "(无名)"
+        lines.append(f"[群] {name} group={group_id}")
+
+    if not lines:
+        return "联系人清单为空(QQ 里没有好友/群,或 NapCat 未同步)。"
+    return "可用联系人:\n" + "\n".join(lines)
+
+
 def create_contact_tools() -> list[Any]:
     """返回联系人工具列表。"""
-    return [resolve_contact]
+    return [resolve_contact, list_contacts]

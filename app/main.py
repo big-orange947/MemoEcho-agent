@@ -37,6 +37,7 @@ from . import reports as reports_service
 from . import sinks as sinks_service
 from .agent.graph import AgentGraph, ConversationBusyError
 from .agent.runtime import set_bridge, set_graph, set_notifier, set_sender
+from .api import console as console_api
 from .api import dispatch as dispatch_api
 from .api import reports as reports_api
 from .api import routes as api_routes
@@ -397,6 +398,7 @@ def create_app() -> FastAPI:
     app.include_router(dispatch_api.router)   # 外部调度入口(主 agent 派活)
     app.include_router(reports_api.router)    # 上报队列出口(上游消费)
     app.include_router(ui_api.router)         # 前端控制台接口(工具清单/配置/跨会话目标)
+    app.include_router(console_api.router)    # 控制台对话线程 + 自然语言执行入口
 
     # 定时唤醒调度器: 启动后台任务(每秒轮询 scheduled_events,到点发 timer 事件)
     scheduler = get_scheduler()

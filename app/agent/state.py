@@ -17,7 +17,37 @@ from __future__ import annotations
 
 from typing import Annotated, Any, TypedDict
 
+from langchain_core.messages import HumanMessage, ToolMessage
 from langgraph.graph.message import add_messages  # LangGraph 内置的消息追加器
+
+# ---------------------------------------------------------------------------
+# ReAct 循环(工具调用轮次)上限
+# ---------------------------------------------------------------------------
+# 为什么必须有: reason --有 tool_calls--> act --(无条件)--> reason 是一个环。
+# 模型陷入"反复调同一个工具"(工具一直失败、或它误以为没成功)时会无限转下去,
+# 每轮都要一次 LLM 调用,烧钱且把会话卡死 —— 实测假模型能在一秒内转好几圈。
+#   SOFT: 到这里的工具调用不再执行,而是回一条"请直接回复用户"的 ToolMessage,
+#         给模型一次体面收尾的机会(它看到提示后通常会写总结);
+#   HARD: 模型连提示都无视时,直接掐断循环去 reflect/finalize。
+# 放在 state 模块: graph 与 act 节点都要用,而 graph 反过来 import 节点,
+# 常量留在这里才能避免循环导入。
+MAX_TOOL_ROUNDS_SOFT = 8
+MAX_TOOL_ROUNDS_HARD = 10
+
+
+def tool_rounds(state: dict[str, Any]) -> int:
+    """本次执行已经跑了几轮工具(数"最后一条用户消息之后的 ToolMessage")。
+
+    为什么从最后一条 HumanMessage 起算: checkpoint 里存着**历次**执行的
+    ToolMessage,直接数会把上一轮的算进来,导致第二轮刚开口就触发上限。
+    """
+    count = 0
+    for message in reversed(state.get("messages") or []):
+        if isinstance(message, HumanMessage):
+            break
+        if isinstance(message, ToolMessage):
+            count += 1
+    return count
 
 
 class AgentState(TypedDict, total=False):
