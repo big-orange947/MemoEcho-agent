@@ -45,17 +45,20 @@ npm run dev          # 另开一个终端跑 runtime
 
 ## 设计取向（改样式前先读这段）
 
-对着 Codex 那种"安静的深色工作台"做的，三条约束：
+**极简浅色工作台**（Codex / Linear / Vercel 那种安静的浅色台面），四条硬规矩：
 
-1. **层次靠玻璃与描边，不靠颜色**。面板是 `rgba(255,255,255,0.055)` + `backdrop-filter`，
-   描边 1px、透明度 7.5%。彩色只留给**状态**（通道、健康度），不做装饰。
-2. **毛玻璃需要背景有东西可糊**。`body::before` 那几团低饱和光晕是刻意的：
-   纯黑底上 `backdrop-filter` 是看不见的。调色时别把环境光调暗到看不见。
-   另外毛玻璃只用在**几块大面板**上（侧栏/检查器/输入区/卡片），
-   铺满整页会掉帧。
-3. **等宽字体只用于元信息**（ID、时间、计数、通道名）。正文用系统 UI 字体。
+1. **层次靠 1px 描边与底色深浅**。页面 `#f6f7f8`、面板纯白、描边 `#e6e7ea`；
+   不用毛玻璃、不用背景光晕、不堆多层投影（`--shadow` 只有一层很轻的）。
+2. **彩色只用于状态**（急事/请示/草稿/健康/失败），装饰一律灰阶。
+   强调色只有一个蓝 `--accent`；"我"的气泡与主按钮用近黑 `--ink`。
+3. **可点的东西必须是 `button`/`a`**，不是 `div` 挂 `onClick` —— 键盘能 Tab 到、
+   能聚焦、读屏器能念。`:focus-visible` 统一给焦点环，别用 `outline: none` 抹掉。
+4. **数字与时间用等宽 + `tabular-nums`**，正文用系统 UI 字体；
+   长文本一律 `truncate` 或 `overflow-wrap: anywhere`（侧栏名、工具参数最容易撑破）。
 
 改配色只需要动 `src/styles/tokens.css`；组件样式都在 `src/styles/app.css`。
+改完建议按 [Web Interface Guidelines](https://github.com/vercel-labs/web-interface-guidelines)
+过一遍（本机已装同名 skill）。
 
 ## 代码结构
 

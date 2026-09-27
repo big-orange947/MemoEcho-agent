@@ -134,29 +134,24 @@ export function ChatScreen({
       </div>
 
       <div className="composer">
-        {activeGoal ? (
-          <div className="row" style={{ gap: 8 }}>
-            <Badge tone="normal">进行中</Badge>
-            <span style={{ fontSize: 12 }}>{activeGoal.objective}</span>
-            {activeGoal.progress ? (
-              <span className="mono">· {activeGoal.progress}</span>
-            ) : null}
+        <div className="composer-inner">
+          {activeGoal ? (
+            <div className="row" style={{ gap: 8, marginBottom: 8 }}>
+              <Badge tone="normal">进行中</Badge>
+              <span style={{ fontSize: 12 }}>{activeGoal.objective}</span>
+              {activeGoal.progress ? (
+                <span className="mono">· {activeGoal.progress}</span>
+              ) : null}
+            </div>
+          ) : null}
+          <div className="row between">
+            <span className="mono">
+              {policy.monitor ? "监视中" : "未监视"} · {REPLY_MODE_LABEL[policy.reply_mode]}
+            </span>
+            <span className="hint">想让它替你办事？去"控制台"直接说，别在这里手打。</span>
           </div>
-        ) : null}
-        <div className="row between">
-          <span className="mono">
-            {policy.monitor ? "监视中" : "未监视"} · {REPLY_MODE_LABEL[policy.reply_mode]}
-          </span>
-          <span className="hint">
-            想让它替你办事？去"控制台"直接说,别在这里手打。
-          </span>
+          <ManualSend value={draft} onChange={setDraft} onSend={submit} sending={sending} />
         </div>
-        <ManualSend
-          value={draft}
-          onChange={setDraft}
-          onSend={submit}
-          sending={sending}
-        />
       </div>
     </div>
   );

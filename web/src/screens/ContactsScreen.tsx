@@ -176,7 +176,12 @@ export function ContactsScreen({
                 <input
                   className="input"
                   style={{ width: 200 }}
-                  placeholder="按名字或号码筛选"
+                  type="search"
+                  name="contact-filter"
+                  aria-label="按名字或号码筛选联系人"
+                  autoComplete="off"
+                  spellCheck={false}
+                  placeholder="按名字或号码筛选…"
                   value={query}
                   onChange={(event) => setQuery(event.target.value)}
                 />

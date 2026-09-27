@@ -65,10 +65,16 @@ export function Field({
   hint?: string;
   children: React.ReactNode;
 }) {
+  // 把 label 真正**关联**到控件上：点文字能聚焦、读屏器能念出字段名。
+  // 只写一个视觉上的 <label> 是常见的假无障碍 —— 看着像有标签，其实没有。
+  const id = React.useId();
+  const control = React.isValidElement(children)
+    ? React.cloneElement(children as React.ReactElement<{ id?: string }>, { id })
+    : children;
   return (
     <div className="field">
-      <label>{label}</label>
-      {children}
+      <label htmlFor={id}>{label}</label>
+      {control}
       {hint ? <div className="hint">{hint}</div> : null}
     </div>
   );
@@ -109,7 +115,9 @@ export function Toast({
 }) {
   if (!message) return null;
   return (
-    <div className="toast" data-tone={tone}>
+    // role=status + aria-live: 读屏器会把异步提示念出来（否则视障用户永远不知道
+    // "已保存""发送失败"发生过 —— 这类反馈不落到 DOM 焦点上）
+    <div className="toast" data-tone={tone} role="status" aria-live="polite">
       <Dot tone={tone === "danger" ? "danger" : "accent"} />
       {message}
     </div>

@@ -203,15 +203,18 @@ export function ConsoleScreen({
   return (
     <div className="main">
       <div className="scroll">
-        <div className="thread">
+        {/* data-layout=console: 我的指令在右、agent 在左（与值守会话相反） */}
+        <div className="thread" data-layout="console">
           {timeline.length === 0 ? (
             <div className="console-hint">
               <div className="big">这条对话还是空的</div>
               <div className="hint">可以直接说的例子:</div>
               <ul className="examples">
                 {EXAMPLES.map((example) => (
-                  <li key={example} onClick={() => setDraft(example)}>
-                    {example}
+                  <li key={example}>
+                    <button type="button" className="example" onClick={() => setDraft(example)}>
+                      {example}
+                    </button>
                   </li>
                 ))}
               </ul>
@@ -235,25 +238,27 @@ export function ConsoleScreen({
       </div>
 
       <div className="composer">
-        <textarea
-          className="textarea"
-          placeholder="说清楚要办什么（Enter 发送 / Shift+Enter 换行）"
-          value={draft}
-          onChange={(event) => setDraft(event.target.value)}
-          onKeyDown={(event) => {
-            if (event.key === "Enter" && !event.shiftKey) {
-              event.preventDefault();
-              void submit();
-            }
-          }}
-        />
-        <div className="row between">
-          <span className="mono">
-            {busy ? "正在执行…" : "agent 会自己找人、自己发消息，过程显示在上面"}
-          </span>
-          <Button variant="primary" onClick={submit} disabled={sending || busy || !draft.trim()}>
-            {busy ? "执行中…" : "派活"}
-          </Button>
+        <div className="composer-inner">
+          <textarea
+            className="textarea"
+            placeholder="说清楚要办什么（Enter 发送 / Shift+Enter 换行）"
+            value={draft}
+            onChange={(event) => setDraft(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" && !event.shiftKey) {
+                event.preventDefault();
+                void submit();
+              }
+            }}
+          />
+          <div className="row between" style={{ marginTop: 10 }}>
+            <span className="mono">
+              {busy ? "正在执行…" : "agent 会自己找人、自己发消息，过程显示在上面"}
+            </span>
+            <Button variant="primary" onClick={submit} disabled={sending || busy || !draft.trim()}>
+              {busy ? "执行中…" : "派活"}
+            </Button>
+          </div>
         </div>
       </div>
     </div>
@@ -272,11 +277,20 @@ function RunCard({ run }: { run: Run }) {
   }, [run.status]);
 
   const toolCalls = run.steps.filter((step) => step.kind === "tool_call").length;
+  const toolNames = run.steps
+    .filter((step) => step.kind === "tool_call")
+    .map((step) => step.name)
+    .filter(Boolean);
   const failed = run.steps.some((step) => !step.ok);
 
   return (
     <div className="run" data-status={run.status}>
-      <div className="run-head" onClick={() => setOpen(!open)}>
+      <button
+        type="button"
+        className="run-head"
+        aria-expanded={open}
+        onClick={() => setOpen(!open)}
+      >
         <span className="caret">{open ? "▾" : "▸"}</span>
         <span className="run-title">执行过程</span>
         {run.status === "running" ? (
@@ -286,10 +300,12 @@ function RunCard({ run }: { run: Run }) {
         ) : (
           <Badge tone={failed ? "warn" : "ok"}>{failed ? "完成（有失败步骤）" : "完成"}</Badge>
         )}
-        <span className="mono">{toolCalls ? `${toolCalls} 次工具调用` : "未调用工具"}</span>
-        <span className="spacer" />
-        <span className="mono">{elapsed(run)}</span>
-      </div>
+        {/* 收起时把这轮调了哪些工具摊出来 —— 否则这一条又宽又空 */}
+        <span className="run-summary">
+          {toolNames.length ? toolNames.join(" → ") : toolCalls ? `${toolCalls} 次工具调用` : "未调用工具"}
+        </span>
+        <span className="mono run-elapsed">{elapsed(run)}</span>
+      </button>
 
       {open ? (
         <div className="run-body">
@@ -324,9 +340,18 @@ function StepRow({ step }: { step: RunStep }) {
     <div className="step" data-kind={step.kind} data-ok={step.ok}>
       <span className="step-icon">{icon}</span>
       {step.name ? <span className="step-name">{step.name}</span> : null}
-      <span className="step-detail" onClick={() => long && setExpanded(!expanded)}>
+      <span className="step-detail">
         {long && !expanded ? `${step.detail.slice(0, 90)}…` : step.detail}
-        {long ? <span className="more">{expanded ? " 收起" : " 展开"}</span> : null}
+        {long ? (
+          <button
+            type="button"
+            className="more"
+            aria-expanded={expanded}
+            onClick={() => setExpanded(!expanded)}
+          >
+            {expanded ? "收起" : "展开"}
+          </button>
+        ) : null}
       </span>
     </div>
   );
@@ -382,8 +407,10 @@ export function ConsoleInspector({
             <Field label="标题" hint="只是给你自己看的名字">
               <input
                 className="input"
+                name="thread-title"
+                autoComplete="off"
                 value={title}
-                placeholder="例如:组会安排"
+                placeholder="例如：组会安排"
                 onChange={(event) => setTitle(event.target.value)}
                 onBlur={() => {
                   if (title !== thread.title) {

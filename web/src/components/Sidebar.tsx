@@ -55,8 +55,9 @@ export function ThreadSidebar({
           </Empty>
         ) : (
           threads.map((thread) => (
-            <div
+            <button
               key={thread.id}
+              type="button"
               className="conv"
               data-active={thread.id === selectedId}
               onClick={() => onSelect(thread.id)}
@@ -71,7 +72,7 @@ export function ThreadSidebar({
                   {thread.running ? `执行中（${thread.running}）` : thread.archived ? "已归档" : ""}
                 </span>
               </div>
-            </div>
+            </button>
           ))
         )}
       </div>
@@ -122,8 +123,9 @@ export function Sidebar({
             const flags = policyFlags(conversation.policy);
             const preview = previews[conversation.id] || "";
             return (
-              <div
+              <button
                 key={conversation.id}
+                type="button"
                 className="conv"
                 data-active={conversation.id === selectedId}
                 onClick={() => onSelect(conversation.id)}
@@ -159,7 +161,7 @@ export function Sidebar({
                     ))}
                   </span>
                 </div>
-              </div>
+              </button>
             );
           })
         )}
