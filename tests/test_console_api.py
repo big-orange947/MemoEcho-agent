@@ -24,7 +24,7 @@ from pydantic import Field
 class ScriptedChatModel(BaseChatModel):
     """按脚本依次返回消息的假模型(用来构造"先调工具、再汇报"的 ReAct 循环)。
 
-    脚本里的每一项: 字符串 ⇒ 普通回复; 列表 ⇒ 一次工具调用(名字 + 参数)。
+    脚本里的每一项: 字符串 ⇒ 普通回复; 元组 ⇒ 一次工具调用(名字 + 参数)。
     """
 
     script: list[Any] = Field(default_factory=list)
@@ -99,6 +99,28 @@ def make_client(temp_data_dir, monkeypatch):
 
     for client in created:
         client.__exit__(None, None, None)
+
+
+class FakeBridge:
+    """假 QQ 桥: 让 list_contacts / resolve_contact 在不连 NapCat 时也能返回数据。"""
+
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self.payload = payload
+
+    async def get_contacts(self) -> dict[str, Any]:
+        return self.payload
+
+
+FAKE_ROSTER: dict[str, Any] = {
+    "ok": True,
+    "error": "",
+    "bot": {"user_id": "3969785168", "nickname": "Memo Echo"},
+    "friends": [
+        {"user_id": 2597164807, "nickname": "km", "remark": ""},
+        {"user_id": 10001, "nickname": "某人", "remark": "小号"},
+    ],
+    "groups": [{"group_id": 983214567, "group_name": "计科三班", "member_count": 42}],
+}
 
 
 def _wait_run(client: TestClient, run_id: str, timeout: float = 10.0) -> dict[str, Any]:
@@ -186,15 +208,18 @@ class TestConsoleRun:
             ]
         )
 
-        # 假发送器: 工具层的成功路径(真发要靠 NapCat,这里只验证链路与埋点)。
-        # 必须在建 app **之后**打补丁 —— create_app 里会 init_sender 覆盖掉。
+        # 假 QQ 桥 + 假发送器(真发要靠 NapCat)。
+        # 必须在建 app **之后**打补丁 —— create_app 里会登记真桥、init_sender 覆盖发送器。
+        from app.agent import runtime as runtime_module
+        from app.tools import messaging
+
+        monkeypatch.setattr(runtime_module, "_bridge", FakeBridge(FAKE_ROSTER))
+
         sent: list[tuple] = []
 
         async def fake_sender(platform, chat_type, external_id, text, origin):
             sent.append((platform, chat_type, external_id, text, origin))
             return True
-
-        from app.tools import messaging
 
         monkeypatch.setattr(messaging, "_sender", fake_sender)
 
