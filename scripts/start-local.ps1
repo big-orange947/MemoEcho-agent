@@ -47,6 +47,10 @@ $pidFile = Join-Path $runtimeRoot "local-processes.json"
 $venvPython = Join-Path $projectRoot ".venv/Scripts/python.exe"
 $envFile = Join-Path $projectRoot ".env"
 $napCatDir = "D:\napcat"
+# 机器人用的 QQ 客户端(可选): 独立一份,避免与"你日常登录的那个 QQ"互相顶。
+# 存在就用它 —— NapCat 的注入式启动要求启动时挂钩,而系统装的 QQ 一旦自动更新,
+# 注入就会被打回原形(2026-09-27 真机踩过),独立副本能把两边隔开。
+$napCatLauncher = Join-Path (Split-Path -Parent $napCatDir) "napcat-standalone\start-bot-qq.bat"
 
 New-Item -ItemType Directory -Path $logRoot -Force | Out-Null
 
@@ -190,20 +194,29 @@ function Test-NapCatReady {
 if (Test-NapCatReady) {
     Write-Step "NapCat 已就绪(OneBot 接口可用),无需重启。"
 } else {
-    $qqProcesses = @(Get-Process -Name QQ -ErrorAction SilentlyContinue)
-    if ($qqProcesses.Count -gt 0) {
-        # QQ 在运行但 NapCat 接口不可用 → QQ 是普通模式启动的,需要重启才能注入 NapCat
-        Write-Warning "检测到 QQ 正在运行,但 NapCat 未注入(3011 无响应)。"
-        Write-Warning "NapCat 必须由注入方式启动。请手动执行(会重启 QQ):"
-        Write-Warning "  1) .\scripts\stop-local.ps1 -StopNapCat"
-        Write-Warning "  2) 重新运行本脚本,或直接执行 $launcher $NapCatQq"
-        Write-Step "v2 已就绪;桌面端与 API 可用,QQ 通道待 NapCat 就绪。"
-        exit 0
-    }
+    # 优先用"独立 QQ 副本"的启动器(存在时): 它只启动自己的那份 QQ,
+    # 不会顶掉用户日常登录的 QQ —— 也就不需要去杀别人的客户端。
+    $useIsolated = Test-Path -LiteralPath $napCatLauncher
+    if ($useIsolated) {
+        Write-Step "启动 NapCat(独立 QQ 副本,QQ $NapCatQq)..."
+        Start-Process -FilePath $napCatLauncher -ArgumentList $NapCatQq `
+            -WorkingDirectory (Split-Path -Parent $napCatLauncher) -WindowStyle Hidden
+    } else {
+        $qqProcesses = @(Get-Process -Name QQ -ErrorAction SilentlyContinue)
+        if ($qqProcesses.Count -gt 0) {
+            # QQ 在运行但 NapCat 接口不可用 → QQ 是普通模式启动的,需要重启才能注入 NapCat
+            Write-Warning "检测到 QQ 正在运行,但 NapCat 未注入(3011 无响应)。"
+            Write-Warning "NapCat 必须由注入方式启动。请手动执行(会重启 QQ):"
+            Write-Warning "  1) .\scripts\stop-local.ps1 -StopNapCat"
+            Write-Warning "  2) 重新运行本脚本,或直接执行 $launcher $NapCatQq"
+            Write-Step "v2 已就绪;桌面端与 API 可用,QQ 通道待 NapCat 就绪。"
+            exit 0
+        }
 
-    Write-Step "启动 NapCat(QQ $NapCatQq,快速登录)..."
-    Start-Process -FilePath $launcher -ArgumentList $NapCatQq `
-        -WorkingDirectory $napCatDir -WindowStyle Hidden
+        Write-Step "启动 NapCat(QQ $NapCatQq,快速登录)..."
+        Start-Process -FilePath $launcher -ArgumentList $NapCatQq `
+            -WorkingDirectory $napCatDir -WindowStyle Hidden
+    }
 
     # 轮询等待 NapCat 注入完成(QQ 启动 + 登录 + 注入需要时间)
     Write-Step "     已拉起,等待 OneBot 接口就绪(最多 45 秒)..."
