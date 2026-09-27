@@ -263,14 +263,26 @@ class TestConsoleRun:
         assert len(goals) == 1
         assert goals[0]["objective"] == "帮我问一下 km 今晚有没有空打游戏"
 
-    def test_failed_tool_call_is_marked(self, make_client):
-        """工具失败要留痕且标红 —— 不然后端失败在前端看起来像成功。"""
+    def test_failed_tool_call_is_marked(self, make_client, monkeypatch):
+        """工具失败要留痕且标红 —— 不然后端失败在前端看起来像成功。
+
+        失败用**显式注入的失败发送器**造, 不再依赖"测试环境恰好没有 NapCat"——
+        测试隔离之后(见 conftest 的 qq_sends), 桥永远返回成功, 那种依赖已不成立。
+        """
         client = make_client(
             [
                 ("send_qq_message", {"chat_id": "999", "text": "在吗"}),
                 "发失败了,机器人好像没在线。",
             ]
         )
+
+        # 必须建完 app 再打补丁: create_app 里会 init_sender 覆盖掉
+        from app.tools import messaging
+
+        async def failing_sender(*args):
+            return False
+
+        monkeypatch.setattr(messaging, "_sender", failing_sender)
         thread_id = client.post("/api/threads", json={}).json()["id"]
         run_id = client.post(f"/api/threads/{thread_id}/messages", json={"text": "给 999 发个消息"}).json()["run_id"]
 
@@ -379,6 +391,34 @@ class TestConsoleRun:
 # ---------------------------------------------------------------------------
 # 跨会话任务: 外联会话里的回复与"进展回流"
 # ---------------------------------------------------------------------------
+def _link_contact(client: TestClient, contact_qq: str = "3807050597") -> tuple[str, str]:
+    """跑一次"派活 → 联系某人",返回 (thread_id, contact_conversation_id)。
+
+    刻意**不**替换 messaging._sender: "建出对方会话 + 把会话登记到目标上"
+    都发生在 main.contact_sender 里,替换掉它就绕过了被测逻辑。
+    发送本身会失败(测试环境没有 NapCat),不影响这两件事发生。
+    """
+    from app.services import conversations as conversations_service
+    from app.services import goals as goals_service
+
+    thread_id = client.post("/api/threads", json={"title": "问 km"}).json()["id"]
+    run_id = client.post(
+        f"/api/threads/{thread_id}/messages",
+        json={"text": "帮我问一下 km 今晚有没有空打游戏"},
+    ).json()["run_id"]
+    _wait_run(client, run_id)
+
+    # 目标应已建立,且"联系过的那个人"被登记进目标关联(对方的回复才能唤醒任务)
+    goal = goals_service.get_active_goal(thread_id)
+    assert goal is not None, "派活应当建立目标"
+    contact = conversations_service.find_conversation("qq", "private", contact_qq)
+    assert contact is not None, "发消息前应已建出对方的会话"
+    assert contact["id"] in goals_service.list_goal_conversations(goal["id"]), (
+        "联系过的会话必须登记到目标上 —— 否则对方回话无法唤醒任务"
+    )
+    return thread_id, contact["id"]
+
+
 class TestLinkedGoalConversation:
     """真机事故回归: 号主在控制台派活, agent 去联系 km; km 回话后 ——
 
@@ -386,33 +426,6 @@ class TestLinkedGoalConversation:
       · 控制台那边什么都没显示(进展没有回流), 号主以为"没反应"。
     这组用例把两件事都钉住。
     """
-
-    def _link_contact(self, client, contact_qq="3807050597"):
-        """跑一次"派活 → 联系某人",返回 (thread_id, contact_conversation_id)。
-
-        刻意**不**替换 messaging._sender: "建出对方会话 + 把会话登记到目标上"
-        都发生在 main.contact_sender 里,替换掉它就绕过了被测逻辑。
-        发送本身会失败(测试环境没有 NapCat),不影响这两件事发生。
-        """
-        from app.services import conversations as conversations_service
-        from app.services import goals as goals_service
-
-        thread_id = client.post("/api/threads", json={"title": "问 km"}).json()["id"]
-        run_id = client.post(
-            f"/api/threads/{thread_id}/messages",
-            json={"text": "帮我问一下 km 今晚有没有空打游戏"},
-        ).json()["run_id"]
-        _wait_run(client, run_id)
-
-        # 目标应已建立,且"联系过的那个人"被登记进目标关联(对方的回复才能唤醒任务)
-        goal = goals_service.get_active_goal(thread_id)
-        assert goal is not None, "派活应当建立目标"
-        contact = conversations_service.find_conversation("qq", "private", contact_qq)
-        assert contact is not None, "发消息前应已建出对方的会话"
-        assert contact["id"] in goals_service.list_goal_conversations(goal["id"]), (
-            "联系过的会话必须登记到目标上 —— 否则对方回话无法唤醒任务"
-        )
-        return thread_id, contact["id"]
 
     def test_milestone_is_reported_back_to_console(self, make_client):
         """对方回话 → 控制台线程出现一条进展(号主才看得见发生了什么)。"""
@@ -423,7 +436,7 @@ class TestLinkedGoalConversation:
                 "好嘞,那说定了。",
             ]
         )
-        thread_id, _ = self._link_contact(client)
+        thread_id, _ = _link_contact(client)
 
         # 对方回话(走真实入口: NapCat 事件上报)
         resp = client.post(
@@ -485,3 +498,78 @@ class TestLinkedGoalConversation:
         assert memory["goal_is_here"] is True
         system = _build_messages({"working_memory": memory, "messages": []}, "- send_qq_message")[0].content
         assert "当前目标:" in system
+
+
+# ---------------------------------------------------------------------------
+# 两道确定性闸门(提示词之外的安全网)
+# ---------------------------------------------------------------------------
+# 真机第二/第三次事故证明: 提示词管不住的时候必须物理拦住 ——
+#   ① agent 在 km 的会话里用 send_qq_message 又发了一遍(对方收到两条重复的);
+#   ② finalize 把"那行, 我问他几点开始, 等他定个时间"发给了对方(内部口径外泄)。
+class TestOutboundGuards:
+    async def test_cannot_message_the_person_im_chatting_with(self, make_client, monkeypatch):
+        """① 对方就在当前会话 ⇒ 工具直接拒绝, 让他"直接回复"。"""
+        from app.tools import messaging
+
+        client = make_client(["好的"])
+        contact = client.post(
+            "/api/conversations/resolve",
+            json={"platform": "qq", "chat_type": "private", "external_id": "3807050597"},
+        ).json()
+
+        sent: list[tuple] = []
+
+        async def fake_sender(*args):
+            sent.append(args)
+            return True
+
+        monkeypatch.setattr(messaging, "_sender", fake_sender)
+
+        result = await messaging.send_qq_message.ainvoke(
+            {"chat_id": "3807050597", "text": "那今晚几点开?", "chat_type": "private"},
+            config={"configurable": {"thread_id": contact["id"]}},
+        )
+        assert "对方就在当前会话里" in result
+        assert sent == [], "不该真的发出去"
+
+        # 反向: 发给**别人**照旧允许(别把闸门做成"什么都发不了")
+        other = await messaging.send_qq_message.ainvoke(
+            {"chat_id": "2597164807", "text": "帮我带个话", "chat_type": "private"},
+            config={"configurable": {"thread_id": contact["id"]}},
+        )
+        assert "已发送" in other and len(sent) == 1
+
+    def test_internal_wording_is_held_back_from_contact(self, make_client):
+        """② 发给联系人的话命中内部口径 ⇒ 不发出去, 挂回控制台等号主确认。"""
+        client = make_client(
+            [
+                ("send_qq_message", {"chat_id": "3807050597", "text": "今晚有空打游戏吗"}),
+                "已经问过了,等他回。",
+                # 真机泄露原句: 对方是 km, 那个"他"是号主 —— 外人一听就知道有代理
+                "那行，我问他几点开始，等他定个时间。",
+            ]
+        )
+        thread_id, contact_id = _link_contact(client)
+
+        resp = client.post(
+            "/qq/webhook",
+            json={
+                "post_type": "message",
+                "message_type": "private",
+                "user_id": 3807050597,
+                "message_id": 60002,
+                "sender": {"nickname": "㎞"},
+                "message": [{"type": "text", "data": {"text": "有啊"}}],
+            },
+        )
+        assert resp.status_code == 200
+
+        # 那句内部口径**不能**出现在对方会话里
+        contact_messages = client.get(f"/api/conversations/{contact_id}/messages").json()
+        assert not any("等他定" in m["content"] for m in contact_messages), contact_messages
+
+        # 而要挂回控制台等号主确认
+        console_messages = client.get(f"/api/threads/{thread_id}/messages").json()
+        held = [m for m in console_messages if "【需确认】" in m["content"]]
+        assert held, console_messages
+        assert "等他定" in held[-1]["content"]

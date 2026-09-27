@@ -124,6 +124,17 @@ async def run(
 
     # ---------------------------------------------------------------- 1. 落库回复
     # 与 ingest 一致的消息形态;role=assistant 表示这是我们说的话。
+    #
+    # 1b. **内部口径自检(确定性兜底)** —— 发给联系人的话里出现中间人/内部词汇时,
+    #     不发出去,改成挂回控制台等号主确认。
+    #     为什么要有这道闸: 提示词已经写了"别说给号主汇报的话", 但真机上模型
+    #     照样漏过一次("那行,我问他几点开始,等他定个时间"发给了对方)——
+    #     对外泄露"号主有个代理"这种事,不能只靠提示词自觉。
+    #     判据故意保守: 宁可少发一条、让号主点一下,也不让外人看出中间人。
+    if conversation_id and not _is_desktop_thread(conversation_id) and policy_service.contains_internal_wording(output_text):
+        await _hold_for_owner(state, conversation_id, output_text)
+        return _trim_update(state)
+
     message_id = ""
     if conversation_id:
         message_id = conversations_service.add_message(
@@ -182,6 +193,44 @@ def _is_tool_message(message: Any) -> bool:
     if isinstance(message, dict):
         return str(message.get("role") or "") == "tool"
     return str(getattr(message, "type", "") or "") == "tool"
+
+
+# ---------------------------------------------------------------------------
+# 内部口径闸门: 拦下"不该说给联系人听"的话
+# ---------------------------------------------------------------------------
+# 判据(哪些措辞算内部口径)统一定义在 services/policy —— main 的进展回流也用同一份,
+# 两处各写一套迟早会漂移。这里只负责"命中之后怎么办"。
+def _is_desktop_thread(conversation_id: str) -> bool:
+    """控制台对话(desktop/thread)是号主自己的地盘, 不受此闸门约束。"""
+    conversation = conversations_service.get_conversation(conversation_id) or {}
+    return conversation.get("platform") == "desktop"
+
+
+async def _hold_for_owner(state: dict[str, Any], conversation_id: str, text: str) -> None:
+    """把拦下的话挂回目标所属的控制台线程, 等号主定夺。
+
+    刻意**不落库到对方会话**: 对方没收到, 记进历史会让下一轮模型以为自己说过。
+    """
+    goal = state.get("goal") or {}
+    origin_id = str(goal.get("conversation_id") or "")
+    note = (
+        "【需确认】我拟了一句要发给对方的话，里面有内部口径，先拦下没发：\n"
+        f"{text}\n"
+        "（要发就说「按这条发」，要改就说改成什么）"
+    )
+    print(f"[finalize] 拦下疑似内部口径的外发消息(会话 {conversation_id}): {text[:60]}")
+    if origin_id and origin_id != conversation_id:
+        origin = conversations_service.get_conversation(origin_id) or {}
+        if origin.get("platform") == "desktop":
+            conversations_service.add_message(
+                origin_id, {"role": "assistant", "source": "system", "content": note}
+            )
+            await notify("reply", {"conversation_id": origin_id, "text": note})
+            return
+    # 没有控制台线程可挂(目标挂在别的 QQ 会话上): 留在本地, 至少排障时看得到
+    conversations_service.add_message(
+        conversation_id, {"role": "assistant", "source": "system", "content": note}
+    )
 
 
 def _trim_update(state: dict[str, Any]) -> dict[str, Any]:

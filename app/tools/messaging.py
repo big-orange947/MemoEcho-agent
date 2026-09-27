@@ -78,6 +78,7 @@ async def send_qq_message(
     # 这里再查一次"当前会话是否被允许以号主身份对外发消息",
     # 防止工具被其它入口绕过调用(群聊默认不授权,需显式开启)。
     conversation_id = str((config or {}).get("configurable", {}).get("thread_id") or "") if config else ""
+    chat_type = chat_type if chat_type in ("private", "group") else "private"
     if conversation_id:
         from ..services import conversations as conversations_service
         from ..services import policy as policy_service
@@ -86,7 +87,17 @@ async def send_qq_message(
         if conversation and not policy_service.tool_allowed(conversation, "send_qq_message"):
             return "错误: 当前会话未授权发送消息(群聊默认关闭,需要在会话配置中开启)"
 
-    chat_type = chat_type if chat_type in ("private", "group") else "private"
+        # 对方就在当前会话里 ⇒ 要说的话**直接回复**即可,别用本工具再发一遍。
+        # 真机事故: agent 在 km 的会话里既调工具问了一句、finalize 又回了一句,
+        # 对方一下收到两条重复的话 —— "总是发错"的一半原因就在这里。
+        if conversation:
+            same_target = (
+                str(conversation.get("platform") or "") == "qq"
+                and str(conversation.get("chat_type") or "") == chat_type
+                and str(conversation.get("external_id") or "") == str(chat_id)
+            )
+            if same_target:
+                return "错误: 对方就在当前会话里 —— 要跟他说的话直接回复即可,不要用本工具重复发一遍。"
 
     try:
         # 把"当前会话"一并交给发送器: 它据此把这个目标延伸到被联系的会话

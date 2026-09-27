@@ -413,7 +413,8 @@ def create_app() -> FastAPI:
 
             label = event.sender_name or event.external_id or "对方"
             lines = [f"【进展】{label}：{(event.text or '').strip()[:120]}"]
-            if reply and str(reply).strip():
+            # 被内部口径闸门拦下的回复其实**没有发出去**, 别在进展里写成"我回：…"
+            if reply and str(reply).strip() and not policy_service.contains_internal_wording(str(reply)):
                 lines.append(f"我回：{str(reply).strip()[:120]}")
             latest_goal = goals_service.get_goal(str(goal.get("id") or "")) or {}
             status = str(latest_goal.get("status") or "")
