@@ -384,6 +384,53 @@ def create_app() -> FastAPI:
                     {"conversation_id": event.conversation_id, "goal": goal},
                 )
 
+        # 跨会话进展回流: 这一轮如果是在"任务外联的会话"里发生的(号主在控制台
+        # 派活 → agent 去联系别人 → 对方回话 → 在这里继续推进),控制台线程本身
+        # 不会有任何动静,号主看到的就是"没反应"。把进展写回**下指令的那条线程**,
+        # 前端才会显示"对方回了什么、你回了什么、任务到哪一步"。
+        await _report_progress_to_origin(event, active_goal, reply)
+
+    async def _report_progress_to_origin(
+        event: Event, goal: dict[str, Any] | None, reply: str | None
+    ) -> None:
+        """把外联会话里的进展回流到目标所属的控制台线程。
+
+        边界(刻意保守):
+          · 只有"目标挂在别处、本会话是外联方"才回流 —— 本会话自己的进展,
+            那边本来就看得见,不必重复;
+          · 只回流到 **desktop/thread**(控制台对话),真正的 QQ 会话之间不互相写;
+          · 失败只打印,不让它影响已经完成的业务(回流是增强,不是依赖)。
+        """
+        if not goal or not event.conversation_id:
+            return
+        origin_id = str(goal.get("conversation_id") or "")
+        if not origin_id or origin_id == event.conversation_id:
+            return
+        try:
+            origin = conversations_service.get_conversation(origin_id) or {}
+            if origin.get("platform") != "desktop":
+                return
+
+            label = event.sender_name or event.external_id or "对方"
+            lines = [f"【进展】{label}：{(event.text or '').strip()[:120]}"]
+            if reply and str(reply).strip():
+                lines.append(f"我回：{str(reply).strip()[:120]}")
+            latest_goal = goals_service.get_goal(str(goal.get("id") or "")) or {}
+            status = str(latest_goal.get("status") or "")
+            if status in ("done", "abandoned"):
+                lines.append(f"目标{'已完成' if status == 'done' else '已放弃'}：{latest_goal.get('objective') or ''}")
+            elif latest_goal.get("progress"):
+                lines.append(f"进度：{latest_goal['progress']}")
+            note = "\n".join(lines)
+
+            conversations_service.add_message(
+                origin_id,
+                {"role": "assistant", "source": "system", "content": note},
+            )
+            await sse_api.push("reply", {"conversation_id": origin_id, "text": note})
+        except Exception as exc:  # noqa: BLE001 - 回流失败不影响主流程
+            print(f"[agent] 进展回流失败 {event.conversation_id} -> {origin_id}: {type(exc).__name__}: {exc}")
+
     # 注册顺序即执行顺序: 先审计,后处理。
     # 注意: 必须先 reset_bus() —— 处理器注册在全局单例上,create_app 可能被
     # 调用多次(模块级组装 + 测试/重载),不重置会导致事件被重复处理。

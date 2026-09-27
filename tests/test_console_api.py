@@ -374,3 +374,114 @@ class TestConsoleRun:
         qq_system = _build_messages(state, "- send_qq_message: 发消息")[0].content
         assert "正在一个会话中与人聊天" in qq_system
         assert "号主自己" not in qq_system
+
+
+# ---------------------------------------------------------------------------
+# 跨会话任务: 外联会话里的回复与"进展回流"
+# ---------------------------------------------------------------------------
+class TestLinkedGoalConversation:
+    """真机事故回归: 号主在控制台派活, agent 去联系 km; km 回话后 ——
+
+      · 它把**给号主的汇报**("已经帮你问过 km 了, 等他回")原样发给了 km;
+      · 控制台那边什么都没显示(进展没有回流), 号主以为"没反应"。
+    这组用例把两件事都钉住。
+    """
+
+    def _link_contact(self, client, contact_qq="3807050597"):
+        """跑一次"派活 → 联系某人",返回 (thread_id, contact_conversation_id)。
+
+        刻意**不**替换 messaging._sender: "建出对方会话 + 把会话登记到目标上"
+        都发生在 main.contact_sender 里,替换掉它就绕过了被测逻辑。
+        发送本身会失败(测试环境没有 NapCat),不影响这两件事发生。
+        """
+        from app.services import conversations as conversations_service
+        from app.services import goals as goals_service
+
+        thread_id = client.post("/api/threads", json={"title": "问 km"}).json()["id"]
+        run_id = client.post(
+            f"/api/threads/{thread_id}/messages",
+            json={"text": "帮我问一下 km 今晚有没有空打游戏"},
+        ).json()["run_id"]
+        _wait_run(client, run_id)
+
+        # 目标应已建立,且"联系过的那个人"被登记进目标关联(对方的回复才能唤醒任务)
+        goal = goals_service.get_active_goal(thread_id)
+        assert goal is not None, "派活应当建立目标"
+        contact = conversations_service.find_conversation("qq", "private", contact_qq)
+        assert contact is not None, "发消息前应已建出对方的会话"
+        assert contact["id"] in goals_service.list_goal_conversations(goal["id"]), (
+            "联系过的会话必须登记到目标上 —— 否则对方回话无法唤醒任务"
+        )
+        return thread_id, contact["id"]
+
+    def test_milestone_is_reported_back_to_console(self, make_client):
+        """对方回话 → 控制台线程出现一条进展(号主才看得见发生了什么)。"""
+        client = make_client(
+            [
+                ("send_qq_message", {"chat_id": "3807050597", "text": "今晚有空打游戏吗"}),
+                "已经问过了,等他回。",
+                "好嘞,那说定了。",
+            ]
+        )
+        thread_id, _ = self._link_contact(client)
+
+        # 对方回话(走真实入口: NapCat 事件上报)
+        resp = client.post(
+            "/qq/webhook",
+            json={
+                "post_type": "message",
+                "message_type": "private",
+                "user_id": 3807050597,
+                "message_id": 60001,
+                "sender": {"nickname": "㎞"},
+                "message": [{"type": "text", "data": {"text": "有的"}}],
+            },
+        )
+        assert resp.status_code == 200
+
+        messages = client.get(f"/api/threads/{thread_id}/messages").json()
+        progress = [m for m in messages if m["source"] == "system"]
+        assert progress, "对方回话后, 控制台线程应当收到一条进展"
+        note = progress[-1]["content"]
+        assert "有的" in note and "㎞" in note
+        assert note.startswith("【进展】")
+
+    async def test_contact_facing_turn_does_not_leak_owner_report(self, temp_data_dir):
+        """给联系人说话时, 系统提示必须是"当事人"口径, 不能是号主视角的目标原文。
+
+        这条钉的是真机事故的根因: 模型拿到了"当前目标: 帮我问一下 km…"这种
+        号主视角的句子, 又面对着 km, 于是把汇报说了出去。现在改成:
+        本会话是任务外联方 ⇒ 提示词明确"别念给对方、别转述"。
+        """
+        from app.agent.nodes import retrieve as retrieve_node
+        from app.agent.nodes.reason import _build_messages
+        from app.db import init_db
+        from app.services import conversations as conversations_service
+        from app.services import goals as goals_service
+
+        init_db()  # 这条用例不建 app, 表要自己建
+
+        conversation_id = conversations_service.ensure_conversation("qq", "private", "3807050597")
+        origin_id = conversations_service.ensure_conversation("desktop", "thread", "origin-thread")
+        goal = goals_service.create_goal(origin_id, "帮我问一下 km 今晚有没有空打游戏")
+        goals_service.link_conversation(goal["id"], conversation_id)
+
+        # 走真实的 retrieve → 拿到 working_memory, 再交给 reason 组提示词
+        state = {"conversation_id": conversation_id, "event": {"text": "有的"}, "messages": []}
+        memory = (await retrieve_node.run(state))["working_memory"]
+        assert memory["goal_is_here"] is False
+
+        system = _build_messages({"working_memory": memory, "messages": []}, "- send_qq_message")[0].content
+        assert "号主私下交代你办的事" in system
+        assert "不要念给对方" in system
+        assert "对方才是当事人" in system.replace("\n", "")
+        # 关键: 不能出现"当前目标:"这种号主视角的措辞
+        assert "当前目标:" not in system
+
+        # 反向: 目标就挂在本会话时, 仍按"当前目标"给(控制台自己的活)
+        goals_service.create_goal(conversation_id, "在本会话里办的事")
+        state = {"conversation_id": conversation_id, "event": {"text": "在吗"}, "messages": []}
+        memory = (await retrieve_node.run(state))["working_memory"]
+        assert memory["goal_is_here"] is True
+        system = _build_messages({"working_memory": memory, "messages": []}, "- send_qq_message")[0].content
+        assert "当前目标:" in system

@@ -75,6 +75,12 @@ async def run(state: dict[str, Any]) -> dict[str, Any]:
             # 两者"你是谁、该向谁汇报"完全不同,提示词不能共用。
             "platform": conversation.get("platform") or "",
             "chat_type": conversation.get("chat_type") or "",
+            # 本会话与"当前目标"的关系: 目标就挂在本会话,还是本会话只是任务外联
+            # 的一方。这决定模型该以什么身份说话(号主视角的活 vs 当事人),
+            # 真机上正是少了这层区分,才把"给号主的汇报"发给了联系人。
+            "goal_is_here": bool(goal and goal.get("conversation_id") == conversation_id),
+            # 对面是谁(展示名): 用于"号主私下交代你在和「谁」推进这件事"
+            "counterpart": conversation.get("title") or conversation.get("external_id") or "",
             "memory_block": memory_block,       # 长期记忆文本块(可能为空串)
             "history_block": history_block,     # 补全的早前对话(可能为空串)
             # 是否要求"拿不准先请示"(HITL): 由 reason 拼进提示词,

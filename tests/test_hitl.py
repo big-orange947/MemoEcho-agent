@@ -17,7 +17,7 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 
-from app.agent.prompts import HITL_OFF_RULES, HITL_ON_RULES, REASON_SYSTEM_PROMPT
+from app.agent.prompts import GOAL_RULES_NONE, HITL_OFF_RULES, HITL_ON_RULES, REASON_SYSTEM_PROMPT
 from app.services import policy as policy_service
 
 
@@ -109,6 +109,7 @@ class TestPrompt:
 
         prompt = REASON_SYSTEM_PROMPT.format(
             tools_description="- wait: 等一会",
+            goal_rules=GOAL_RULES_NONE,
             hitl_rules=HITL_ON_RULES if policy_service.resolve_hitl(conversation) else HITL_OFF_RULES,
         )
         assert "拿不准的事不要自己拍板" in prompt
@@ -119,6 +120,7 @@ class TestPrompt:
         """关掉请示后: 授权范围变宽,但**底线必须还在**。"""
         prompt = REASON_SYSTEM_PROMPT.format(
             tools_description="- wait: 等一会",
+            goal_rules=GOAL_RULES_NONE,
             hitl_rules=HITL_OFF_RULES,
         )
         # 授权范围: 范围内自主
@@ -132,7 +134,9 @@ class TestPrompt:
     def test_baseline_present_in_both_variants(self):
         """两种变体都要带上底线 —— 这是最容易在改动中丢掉的约束。"""
         for rules in (HITL_ON_RULES, HITL_OFF_RULES):
-            prompt = REASON_SYSTEM_PROMPT.format(tools_description="", hitl_rules=rules)
+            prompt = REASON_SYSTEM_PROMPT.format(
+                tools_description="", goal_rules=GOAL_RULES_NONE, hitl_rules=rules
+            )
             assert "不替号主做超出授权的承诺" in prompt
             assert "不编造" in prompt
 

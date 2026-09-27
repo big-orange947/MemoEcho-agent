@@ -21,7 +21,15 @@ from typing import Any
 
 from langchain_core.messages import AIMessage, BaseMessage, SystemMessage
 
-from ..prompts import CONSOLE_SYSTEM_PROMPT, HITL_OFF_RULES, HITL_ON_RULES, REASON_SYSTEM_PROMPT
+from ..prompts import (
+    CONSOLE_SYSTEM_PROMPT,
+    GOAL_RULES_HERE,
+    GOAL_RULES_LINKED,
+    GOAL_RULES_NONE,
+    HITL_OFF_RULES,
+    HITL_ON_RULES,
+    REASON_SYSTEM_PROMPT,
+)
 
 
 def _build_messages(state: dict[str, Any], tools_desc: str) -> list[BaseMessage]:
@@ -38,14 +46,35 @@ def _build_messages(state: dict[str, Any], tools_desc: str) -> list[BaseMessage]
         # 而不是"替身"提示词(像人一样聊天 + 不暴露身份)。
         system = CONSOLE_SYSTEM_PROMPT.format(tools_description=tools_desc)
     else:
+        # "你在以谁的身份说话"必须和"本会话与目标的关系"对上:
+        #   本会话就是下指令的地方 → 目标仍是号主视角的,别外泄;
+        #   本会话是任务外联的当事人 → 对面才是当事人,汇报的话一个字都不能说。
+        # (真机事故: 少了这层区分,agent 把给号主的汇报发给了联系人。)
+        if not goal_text:
+            goal_rules = GOAL_RULES_NONE
+        elif working.get("goal_is_here"):
+            goal_rules = GOAL_RULES_HERE
+        else:
+            goal_rules = GOAL_RULES_LINKED
         system = REASON_SYSTEM_PROMPT.format(
             tools_description=tools_desc,
+            goal_rules=goal_rules,
             hitl_rules=HITL_ON_RULES if working.get("hitl") else HITL_OFF_RULES,
         )
     if persona:
         system += f"\n\n你在这个会话中的人设: {persona}"
     if goal_text:
-        system += f"\n\n当前目标: {goal_text}"
+        # 目标原文是**号主视角的指令**。本会话就是目标所属会话时,按"当前目标"给;
+        # 本会话是任务外联的一方时,必须点明"这是号主私下交代的、别说给对面",
+        # 否则模型会把汇报/进度当成台词发给当事人(真机出过这个事故)。
+        if working.get("goal_is_here", True):
+            system += f"\n\n当前目标: {goal_text}"
+        else:
+            who = working.get("counterpart") or "对方"
+            system += (
+                f"\n\n号主私下交代你办的事(就在你和「{who}」这个会话里推进): {goal_text}"
+                "\n(这句是号主说给你听的,不是台词 —— 不要念给对方、不要转述)"
+            )
     # 定时唤醒提示: 之前 wait 工具登记的等待到期了,告诉模型为什么继续
     if working.get("wakeup_reason"):
         system += f"\n\n(系统消息: 定时唤醒 —— {working['wakeup_reason']}。请继续推进当前任务。)"
